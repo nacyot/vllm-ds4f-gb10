@@ -473,6 +473,15 @@ class SingleTypeKVCacheManager(ABC):
             kv_cache_group_id=self.kv_cache_group_id,
             block_mask=block_mask,
         )
+        # Windowed groups (block_mask present): their cached blocks
+        # form the retention tail. Blocks skipped by mask=False carry
+        # no hash and are naturally excluded.
+        if block_mask is not None:
+            for _te_blk in self.req_to_blocks[request.request_id][
+                num_cached_blocks:num_full_blocks
+            ]:
+                if _te_blk.block_hash is not None:
+                    self.block_pool.mark_retention_tail(_te_blk)
 
         self.num_cached_block[request.request_id] = num_full_blocks
 

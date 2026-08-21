@@ -1,5 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+import os
 from collections.abc import Iterable, Sequence
 from typing import Any
 
@@ -194,6 +195,26 @@ class BlockPool:
         self.kv_event_queue: list[KVCacheEvent] = []
 
         self.metrics_collector = metrics_collector
+        # Retention-tail bookkeeping: protection counter and budget
+        # (20% of the pool by default; tune via
+        # DSPARK_TAIL_RESERVE_FRAC, 0 disables).
+        self.retention_tail_count = 0
+        self.retention_tail_budget = int(
+            num_gpu_blocks
+            * float(os.environ.get("DSPARK_TAIL_RESERVE_FRAC", "0.2") or 0.2)
+        )
+
+    # Tail marking/clearing must go through these two methods so the
+    # counter stays consistent with the flags.
+    def mark_retention_tail(self, block: KVCacheBlock) -> None:
+        if not block.retention_tail and not block.is_null:
+            block.retention_tail = True
+            self.retention_tail_count += 1
+
+    def clear_retention_tail(self, block: KVCacheBlock) -> None:
+        if block.retention_tail:
+            block.retention_tail = False
+            self.retention_tail_count -= 1
 
     def get_cached_block(
         self, block_hash: BlockHash, kv_cache_group_ids: list[int]
@@ -658,7 +679,36 @@ class BlockPool:
         if num_blocks > self.get_num_free_blocks():
             raise ValueError(f"Cannot get {num_blocks} free blocks from the pool")
 
-        ret: list[KVCacheBlock] = self.free_block_queue.popleft_n(num_blocks)
+        # Within budget, retention-tail blocks are skipped and
+        # requeued at the back (evict-last). Over budget, the oldest
+        # tails are consumed normally (self-regulating). _te_budget
+        # caps the scan at a single pass over the free queue.
+        ret: list[KVCacheBlock] = []
+        _te_deferred: list[KVCacheBlock] = []
+        _te_budget = self.free_block_queue.num_free_blocks
+        while len(ret) < num_blocks:
+            _te_remaining = num_blocks - len(ret)
+            if _te_budget < _te_remaining:
+                for _te_blk in _te_deferred:
+                    self.free_block_queue.append(_te_blk)
+                _te_deferred = []
+                for _te_blk in self.free_block_queue.popleft_n(_te_remaining):
+                    self.clear_retention_tail(_te_blk)
+                    ret.append(_te_blk)
+                break
+            _te_blk = self.free_block_queue.popleft()
+            _te_budget -= 1
+            if (
+                _te_blk.retention_tail
+                and self.retention_tail_count <= self.retention_tail_budget
+                and _te_budget >= _te_remaining
+            ):
+                _te_deferred.append(_te_blk)
+                continue
+            self.clear_retention_tail(_te_blk)
+            ret.append(_te_blk)
+        for _te_blk in _te_deferred:
+            self.free_block_queue.append(_te_blk)
 
         # In order to only iterate the list once, we duplicated code a bit
         if self.enable_caching:
@@ -691,6 +741,9 @@ class BlockPool:
         if self.metrics_collector:
             self.metrics_collector.on_block_evicted(block)
 
+        # Removal from the prefix cache also ends retention-tail
+        # status.
+        self.clear_retention_tail(block)
         evicted_hashes = self._remove_cached_block_hashes(block)
         if not evicted_hashes:
             # The block doesn't have hash, eviction is not needed

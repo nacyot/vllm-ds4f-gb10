@@ -136,6 +136,9 @@ class KVCacheBlock:
 
     # Whether the block is a null block that should never be cached.
     is_null: bool = False
+    # SWA retention tail: preferred to survive eviction within the
+    # pool's retention budget (see BlockPool.retention_tail_budget).
+    retention_tail: bool = False
 
     @property
     def block_hash(self) -> BlockHashWithGroupId | None:
