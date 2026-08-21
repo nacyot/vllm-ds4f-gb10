@@ -39,8 +39,15 @@ def _select_swap_blocks_fn(
     layer_refs_per_group: list[list[CanonicalKVCacheRef]],
     gpu_to_cpu: bool,
 ):
-    """Resolve the swap_blocks function for a handler at init time."""
-    # GPU->CPU is bandwidth-bound; the dedicated copy engine beats Triton.
+    """Resolve the swap_blocks function for a handler at init time.
+
+    The two directions use different engines: GPU->CPU stores keep the
+    csrc batched-DMA path (bandwidth-bound; the dedicated copy engine
+    wins), while CPU->GPU loads use the Triton copy kernel. Submitting
+    very large batches to cuMemcpyBatchAsync collapses the driver
+    frontend on Blackwell (Xid 32/69, vLLM #49276 family); restores of
+    long sessions are exactly such batches, and the Triton path
+    sidesteps the batch submission entirely."""
     if gpu_to_cpu:
         return ops.swap_blocks_batch
     # Fall back to the C++ DMA path on platforms where Triton isn't usable
@@ -50,12 +57,8 @@ def _select_swap_blocks_fn(
     if not HAS_TRITON or current_platform.is_xpu() or current_platform.is_rocm():
         return ops.swap_blocks_batch
     page_sizes = [r.page_size_bytes for g in layer_refs_per_group for r in g]
-    # Triton wins only on small, 8-byte-aligned payloads.
-    if (
-        not page_sizes
-        or max(page_sizes) >= THRESHOLD_BYTES
-        or any(s % 8 for s in page_sizes)
-    ):
+    # The Triton kernel requires 8-byte-aligned payloads.
+    if not page_sizes or any(s % 8 for s in page_sizes):
         return ops.swap_blocks_batch
     chunk = min(triton.next_power_of_2(max(page_sizes)), 8192)
     return functools.partial(swap_blocks_batch, bytes_per_chunk=chunk)
