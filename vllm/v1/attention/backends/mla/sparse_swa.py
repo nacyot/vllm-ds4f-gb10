@@ -484,11 +484,31 @@ class DeepseekSparseSWAMetadataBuilder(AttentionMetadataBuilder):
         # the q-head count to B_TOPK (64/128), which requires the index width to be
         # a multiple of 128.
         self.is_dspark = spec_config is not None and spec_config.use_dspark()
-        self.noncausal_index_width = (
+        # FlashInfer SM12x sparse-MLA decode kernels
+        # are only instantiated for index widths {128, 512, 1024}
+        # (_DECODE_DSV4_DISPATCH / csrc DSV4_DISPATCH). The stock
+        # multiple-of-128 rounding yields 256 for window 128 + k spec
+        # tokens (k in 1..127); the Python dispatcher then falls through to
+        # the prefill orchestrator whose FFI binding rejects decode-sized
+        # batches (TVM_FFI_ICHECK_GT(num_tokens, 64)) -> first spec decode
+        # dies. Round up to the next instantiated width on SM12x; the index
+        # fill kernel writes -1 past swa_len over the full width and
+        # decode_swa_lens caps the active range, so padding is skipped.
+        _noncausal_index_width = (
             cdiv(self.window_size + self.num_speculative_tokens, 128) * 128
             if self.is_dspark
             else 0
         )
+        if (
+            _noncausal_index_width > 0
+            and _noncausal_index_width not in (128, 512, 1024)
+            and current_platform.is_device_capability_family(120)
+        ):
+            for _supported_width in (512, 1024):
+                if _noncausal_index_width < _supported_width:
+                    _noncausal_index_width = _supported_width
+                    break
+        self.noncausal_index_width = _noncausal_index_width
         self.decode_swa_indices_noncausal: torch.Tensor | None = None
         self._max_tokens = max_tokens
 
