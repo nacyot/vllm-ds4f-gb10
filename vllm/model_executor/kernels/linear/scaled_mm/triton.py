@@ -170,6 +170,10 @@ class TritonFp8BlockScaledMMKernel(Fp8BlockScaledMMLinearKernel):
         As: torch.Tensor,
         Bs: torch.Tensor,
     ) -> torch.Tensor:
+        if Bs.dtype == torch.float8_e8m0fnu:
+            # The Triton block-scaled mm has no e8m0 specialization
+            # (KeyError on the scale dtype otherwise); upcast the scales.
+            Bs = Bs.to(torch.float32)
         return torch.ops.vllm.w8a8_triton_block_scaled_mm_func(
             A,
             B,
