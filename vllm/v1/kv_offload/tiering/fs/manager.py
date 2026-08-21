@@ -61,6 +61,25 @@ if TYPE_CHECKING:
 
 logger = init_logger(__name__)
 
+# Per-event KV offload JSONL log (env-gated; no-op when DSPARK_KV_EVENT_LOG
+# is unset).
+import json as _ev_json
+import os as _ev_os
+import time as _ev_time
+
+_EV_PATH = _ev_os.environ.get("DSPARK_KV_EVENT_LOG")
+
+
+def _kv_event(rec):
+    if not _EV_PATH:
+        return
+    try:
+        rec["ts"] = round(_ev_time.time(), 3)
+        with open(_EV_PATH, "a") as _f:
+            _f.write(_ev_json.dumps(rec, separators=(",", ":")) + "\n")
+    except OSError:
+        pass
+
 
 class FsAsyncLookupManager(AsyncLookupManager):
     """Async lookup manager for FileSystemTierManager."""
@@ -266,6 +285,8 @@ class FileSystemTierManager(SecondaryTierManager):
             ),
             self._use_o_direct,
         )
+        _kv_event({"op": "store", "job": job_metadata.job_id,
+                   "chunks": len(job_metadata.keys)})
         self._pool.enqueue_store(job_metadata.job_id, 1, [task])
 
     @override
@@ -280,6 +301,8 @@ class FileSystemTierManager(SecondaryTierManager):
             self._use_o_direct,
         )
 
+        _kv_event({"op": "load", "job": job_metadata.job_id,
+                   "chunks": len(job_metadata.keys)})
         self._pool.enqueue_load(job_metadata.job_id, 1, [task])
 
     @override
@@ -300,6 +323,7 @@ class FileSystemTierManager(SecondaryTierManager):
                             locality=self.locality,
                         )
                     )
+            _kv_event({"op": "done", "job": job_id, "ok": bool(success)})
             results.append(JobResult(job_id=job_id, success=success))
         return results
 
