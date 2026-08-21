@@ -280,6 +280,46 @@ class TieringOffloadingSpec(CPUOffloadingSpec):
                 mmap_region=worker_mmap,
                 canonical_layout=self.config.canonical_layout,
             )
+            # Compact packed multi-node: promoted chunks exist only in the
+            # scheduler node's mmap. When a load spec carries fs paths
+            # (absolute paths on a shared mount), fill this worker's mmap
+            # rows from the files first, then run the normal load.
+            _row = self.kv_bytes_per_chunk
+            _orig_submit_load = _worker.submit_load
+
+            def _fs_submit_load(job_id, src_spec, dst_spec):
+                entries = getattr(src_spec, "fs_paths", None)
+                if entries:
+                    for _bid, _ent in zip(src_spec.block_ids, entries):
+                        if not _ent:
+                            continue
+                        _path, _soff, _ln = _ent
+                        try:
+                            with open(_path, "rb") as _f:
+                                _data = _f.read()
+                            _off = int(_bid) * _row + int(_soff)
+                            # Route the write through the GPU: letting the
+                            # CPU dirty pinned pages that the device then
+                            # reads has produced Xid 13 channel errors on
+                            # GB10, so upload the file bytes and let device
+                            # DMA write them into the pinned mmap.
+                            import torch as _t
+                            _src_gpu = _t.frombuffer(
+                                bytearray(_data), dtype=_t.uint8
+                            ).cuda()
+                            _flat = _t.frombuffer(
+                                memoryview(worker_mmap.mmap_obj), dtype=_t.uint8
+                            )
+                            _flat[_off : _off + len(_data)].copy_(_src_gpu)
+                            _t.cuda.synchronize()
+                        except OSError as _e:
+                            logger.warning(
+                                "fs direct read failed for %s: %s", _path, _e
+                            )
+                return _orig_submit_load(job_id, src_spec, dst_spec)
+
+            _worker.submit_load = _fs_submit_load
+
             if self.config.canonical_layout:
                 # Canonical group-slice sidecar: derive each group's
                 # (row offset, length) from the canonical tensor views and

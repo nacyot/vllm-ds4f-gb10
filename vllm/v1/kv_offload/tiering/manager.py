@@ -205,6 +205,12 @@ class TieringOffloadingManager(OffloadingManager):
             SecondaryTierManager, dict[str, PendingPromotion]
         ] = {}
 
+        # Compact packed multi-node: keys promoted from the fs tier. A
+        # promotion only writes the scheduler node's mmap, so loads of
+        # these keys carry the file path and each worker preads the shared
+        # fs directly to fill its own mmap.
+        self._fs_promoted_keys: set = set()
+
         # Gate for once-per-step execution of _maybe_process_finished_jobs().
         # Reset at the end of each step in on_schedule_end().
         self._processed_jobs_this_step: bool = False
@@ -271,6 +277,8 @@ class TieringOffloadingManager(OffloadingManager):
                         job_metadata.req_context,
                         completed_job.success,
                     )
+                    if completed_job.success and hasattr(tier, "file_mapper"):
+                        self._fs_promoted_keys.update(job_metadata.keys)
                 else:
                     # primary→secondary transfer completed.
                     # Decrement ref_cnt on primary blocks.
@@ -470,7 +478,22 @@ class TieringOffloadingManager(OffloadingManager):
         Returns:
             LoadStoreSpec for reading from primary tier.
         """
-        return self.primary_tier.prepare_load(keys, req_context)
+        spec = self.primary_tier.prepare_load(keys, req_context)
+        if self._fs_promoted_keys:
+            fs_tier = next(
+                (t for t in self.secondary_tiers if hasattr(t, "file_mapper")),
+                None,
+            )
+            if fs_tier is not None:
+                paths = [
+                    fs_tier.direct_read_info(k, None)
+                    if k in self._fs_promoted_keys
+                    else None
+                    for k in keys
+                ]
+                if any(p is not None for p in paths):
+                    spec.fs_paths = paths  # type: ignore[attr-defined]
+        return spec
 
     @override
     def touch(self, keys: Collection[OffloadKey], req_context: ReqContext):

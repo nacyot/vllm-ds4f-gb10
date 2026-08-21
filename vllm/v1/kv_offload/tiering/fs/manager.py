@@ -240,6 +240,17 @@ class FileSystemTierManager(SecondaryTierManager):
             sizes.append(ln)
         return offs, sizes
 
+    def direct_read_info(self, key, block_id):
+        """(path, row_offset, nbytes) for worker-side direct fs read."""
+        self._maybe_load_layout()
+        path = self.file_mapper.get_file_name(key)
+        if not self._group_slices:
+            return (path, 0, self._block_size)
+        from vllm.v1.kv_offload.file_mapper import get_offload_group_idx
+
+        s0, ln = self._group_slices[get_offload_group_idx(key)]
+        return (path, s0, ln)
+
     @override
     def submit_store(self, job_metadata: JobMetadata) -> None:
         if self.events is not None:

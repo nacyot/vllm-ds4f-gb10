@@ -657,7 +657,12 @@ class SingleDirectionOffloadingHandler:
         # from the live GPU KV cache, which the compute stream keeps
         # writing; we must keep STREAM ordering so source reads are gated
         # by the transfer stream's wait_stream(compute) barrier.
-        is_src_access_order_any = not self.gpu_to_cpu
+        # The fs promotion/pread path overwrites host mmap pages
+        # asynchronously; ANY lets the driver read the source after the
+        # API returns, which is undefined against a cross-process writer
+        # (observed as Xid 13 on GB10). Force STREAM ordering for loads
+        # as well.
+        is_src_access_order_any = False
         with current_platform.stream(stream):
             start_event.record(stream)
             if op_idx > 0:
