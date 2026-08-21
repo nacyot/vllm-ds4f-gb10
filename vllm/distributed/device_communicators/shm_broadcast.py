@@ -132,7 +132,7 @@ class SpinCondition:
         is_reader: bool,
         context: zmq.Context,
         notify_address: str,
-        busy_loop_s: float = 1,
+        busy_loop_s: float = 0.002,
     ):
         self.is_reader = is_reader
 
