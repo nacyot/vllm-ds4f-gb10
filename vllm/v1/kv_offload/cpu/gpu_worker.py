@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 import functools
+import os
 import time
 from collections import deque
 from collections.abc import Sequence
@@ -653,10 +654,20 @@ class SingleDirectionOffloadingHandler:
         # channel corruption on GB10).
         stream.wait_stream(current_platform.current_stream())
         if self._transfers:
-            last_transfer: Transfer = self._transfers[-1]
-            last_event = last_transfer.end_event
-            # assure job will start only after the previous one completes
-            stream.wait_event(last_event)
+            # Load transfers may run in a small pipeline window
+            # (DSPARK_LOAD_WINDOW, default 1 = fully serial, the historical
+            # behavior). Load jobs touch disjoint GPU blocks and CPU slots,
+            # so they are independent of each other; stores stay serial.
+            window = 1
+            if not self.gpu_to_cpu:
+                try:
+                    window = max(
+                        1, int(os.environ.get("DSPARK_LOAD_WINDOW", "1"))
+                    )
+                except ValueError:
+                    window = 1
+            if len(self._transfers) >= window:
+                stream.wait_event(self._transfers[-window].end_event)
         # CPU->GPU reads from host pinned memory, which is never written
         # by a concurrent GPU stream, so CU_MEMCPY_SRC_ACCESS_ORDER_ANY is
         # safe and lets the driver pipeline source reads. GPU->CPU reads
