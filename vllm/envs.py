@@ -185,6 +185,10 @@ if TYPE_CHECKING:
     VLLM_V1_USE_OUTLINES_CACHE: bool = False
     VLLM_TPU_USING_PATHWAYS: bool = False
     VLLM_USE_DEEP_GEMM: bool = True
+    VLLM_USE_B12X_MOE: bool = False
+    VLLM_B12X_W4A16_FORCE_BLOCKS_PER_SM: int = 0
+    VLLM_B12X_W4A16_FORCE_BLOCKS_MAX_M: int = 16
+    VLLM_B12X_W4A16_FORCE_TILE_CONFIG: str = ""
     VLLM_MOE_USE_DEEP_GEMM: bool = True
     VLLM_USE_DEEP_GEMM_E8M0: bool = True
     VLLM_USE_DEEP_GEMM_TMA_ALIGNED_SCALES: bool = True
@@ -1492,6 +1496,16 @@ environment_variables: dict[str, Callable[[], Any]] = {
     ),
     # Allow use of DeepGemm kernels for fused moe ops.
     "VLLM_USE_DEEP_GEMM": lambda: bool(int(os.getenv("VLLM_USE_DEEP_GEMM", "1"))),
+    "VLLM_USE_B12X_MOE": lambda: bool(int(os.getenv("VLLM_USE_B12X_MOE", "0"))),
+    "VLLM_B12X_W4A16_FORCE_BLOCKS_PER_SM": lambda: int(
+        os.getenv("VLLM_B12X_W4A16_FORCE_BLOCKS_PER_SM", "0")
+    ),
+    "VLLM_B12X_W4A16_FORCE_BLOCKS_MAX_M": lambda: int(
+        os.getenv("VLLM_B12X_W4A16_FORCE_BLOCKS_MAX_M", "16")
+    ),
+    "VLLM_B12X_W4A16_FORCE_TILE_CONFIG": lambda: os.getenv(
+        "VLLM_B12X_W4A16_FORCE_TILE_CONFIG", ""
+    ),
     # Allow use of DeepGemm specifically for MoE fused ops (overrides only MoE).
     "VLLM_MOE_USE_DEEP_GEMM": lambda: bool(
         int(os.getenv("VLLM_MOE_USE_DEEP_GEMM", "1"))

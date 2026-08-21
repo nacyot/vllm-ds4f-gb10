@@ -107,6 +107,8 @@ class Mxfp4MoeBackend(Enum):
     # Marlin
     BATCHED_MARLIN = "BATCHED_MARLIN"
     MARLIN = "MARLIN"
+    # B12X backend for DeepSeek V4 native MXFP4 weights on SM120/GB10
+    B12X_MXFP4 = "B12X_MXFP4"
     # ROCm AITER backends
     AITER_MXFP4_BF16 = "AITER_MXFP4_BF16"  # W4A16: CK kernel
     # Keep the legacy name as an alias while the ROCm split backend rename settles.
@@ -207,6 +209,13 @@ def backend_to_kernel_cls(
             HummingIndexedExperts,
         ]
 
+    elif backend == Mxfp4MoeBackend.B12X_MXFP4:
+        from vllm.model_executor.layers.fused_moe.experts.b12x_mxfp4_moe import (
+            B12xExperts,
+        )
+
+        return [B12xExperts]
+
     elif backend == Mxfp4MoeBackend.MARLIN:
         from vllm.model_executor.layers.fused_moe.experts.marlin_moe import (
             MarlinExperts,
@@ -288,6 +297,7 @@ def map_mxfp4_backend(runner_backend: MoEBackend) -> list[Mxfp4MoeBackend]:
         "triton_unfused": [Mxfp4MoeBackend.TRITON_UNFUSED],
         "humming": [Mxfp4MoeBackend.HUMMING],
         "marlin": [Mxfp4MoeBackend.MARLIN],
+        "flashinfer_b12x": [Mxfp4MoeBackend.B12X_MXFP4],
         "aiter": [
             Mxfp4MoeBackend.AITER_MXFP4_BF16,
             Mxfp4MoeBackend.AITER_MXFP4_FP8,
@@ -659,6 +669,7 @@ def mxfp4_round_up_hidden_size_and_intermediate_size(
     elif backend in (
         Mxfp4MoeBackend.FLASHINFER_CUTLASS_MXFP4_BF16,
         Mxfp4MoeBackend.FLASHINFER_CUTLASS_MXFP4_MXFP8,
+        Mxfp4MoeBackend.B12X_MXFP4,
     ):
         intermediate_size = round_up(intermediate_size, 128)
         hidden_size = round_up(hidden_size, 128)
@@ -1292,6 +1303,18 @@ def convert_weight_to_mxfp4_moe_kernel_format(
             w2_bias,
         )
 
+    if mxfp4_backend == Mxfp4MoeBackend.B12X_MXFP4:
+        # B12X prepares its W4A16 packed representation from the original
+        # native MXFP4 tensors during expert post-load setup.
+        return (
+            w13_weight,
+            w2_weight,
+            w13_weight_scale,
+            w2_weight_scale,
+            w13_bias,
+            w2_bias,
+        )
+
     if mxfp4_backend == Mxfp4MoeBackend.HUMMING:
         from vllm.model_executor.layers.quantization.utils.humming_utils import (
             convert_to_humming_moe_kernel_format,
@@ -1664,6 +1687,7 @@ def make_mxfp4_moe_quant_config(
             gemm1_clamp_limit=swiglu_limit,
         )
     elif mxfp4_backend in (
+        Mxfp4MoeBackend.B12X_MXFP4,
         Mxfp4MoeBackend.MARLIN,
         Mxfp4MoeBackend.BATCHED_MARLIN,
         Mxfp4MoeBackend.TRITON,
@@ -1757,5 +1781,9 @@ def make_mxfp4_moe_kernel(
         prepare_finalize,
         experts,
     )
+
+    if mxfp4_backend == Mxfp4MoeBackend.B12X_MXFP4:
+        assert layer is not None
+        experts.process_weights_after_loading(layer)
 
     return kernel
