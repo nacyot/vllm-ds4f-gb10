@@ -79,8 +79,10 @@ class FsAsyncLookupManager(AsyncLookupManager):
         paths = [self._tier.file_mapper.get_file_name(k) for k in keys]
         if _HAS_BATCH_LOOKUP_C:
             # C extension: GIL released for the entire faccessat() batch.
-            return batch_lookup_C(paths)
-        return (os.path.exists(p) for p in paths)
+            results = list(batch_lookup_C(paths))
+        else:
+            results = [os.path.exists(p) for p in paths]
+        return results
 
 
 class FileSystemTierManager(SecondaryTierManager):

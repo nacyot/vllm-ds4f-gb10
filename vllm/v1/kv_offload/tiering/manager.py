@@ -346,7 +346,14 @@ class TieringOffloadingManager(OffloadingManager):
                     and req_state.secondary_lookup_start_time is None
                 ):
                     req_state.secondary_lookup_start_time = lookup_start
-                return LookupResult.MISS if not promoted else LookupResult.RETRY
+                # Backport of #51840: return HIT_PENDING when a promotion
+                # was triggered -- the request keeps progressing while
+                # promotion, load and release drain as a pipeline.
+                return (
+                    LookupResult.MISS
+                    if not promoted
+                    else LookupResult.HIT_PENDING
+                )
             if result is LookupResult.RETRY:
                 any_retry = True
 
