@@ -367,6 +367,10 @@ class Parser:
         tool call extraction via internal stream state.
         """
 
+    def count_reasoning_tokens(self, token_ids: Sequence[int]) -> int:
+        """Return the number of reasoning tokens in generated token IDs."""
+        return 0
+
 
 class DelegatingParser(Parser):
     """
@@ -830,6 +834,9 @@ class DelegatingParser(Parser):
 
         # Reasoning extraction
         if self._in_reasoning_phase(state):
+            reasoning_parser = self._reasoning_parser
+            if reasoning_parser is not None and reasoning_parser.engine_based_streaming:
+                reasoning_parser.adjust_request(request)
             delta_message = self.extract_reasoning_streaming(
                 previous_text=state.previous_text,
                 current_text=current_text,
@@ -838,7 +845,6 @@ class DelegatingParser(Parser):
                 current_token_ids=current_token_ids,
                 delta_token_ids=delta_token_ids,
             )
-            reasoning_parser = self._reasoning_parser
             if reasoning_parser is not None and reasoning_parser.engine_based_streaming:
                 should_transition = (
                     reasoning_parser.has_engine_confirmed_reasoning_end()
@@ -938,6 +944,12 @@ class DelegatingParser(Parser):
                 delta_message = None
 
         return delta_message
+
+    def count_reasoning_tokens(self, token_ids: Sequence[int]) -> int:
+        """Count reasoning tokens through the configured reasoning parser."""
+        if self._reasoning_parser is None:
+            return 0
+        return self._reasoning_parser.count_reasoning_tokens(token_ids)
 
     def _flush_engine_parsers(
         self, delta_message: DeltaMessage | None
