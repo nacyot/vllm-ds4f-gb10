@@ -155,6 +155,12 @@ class FileSystemTierManager(SecondaryTierManager):
         )
         self._block_size: int = primary_kv_view.strides[0]
 
+        # Compact packed: when the worker left a canonical-layout sidecar,
+        # store/load only each group's true-byte slice; otherwise fall back
+        # to whole staging rows (legacy layout).
+        self._group_slices: list | None = None
+        self._layout_path: str | None = None
+
         # Opt in; FileMapper enables it only for a parallelism-invariant block.
         self.file_mapper = FileMapper.from_offloading_spec(
             root_dir=root_dir,
@@ -203,6 +209,37 @@ class FileSystemTierManager(SecondaryTierManager):
             return LookupResult.RETRY
         return LookupResult.HIT if result else LookupResult.MISS
 
+    def _maybe_load_layout(self) -> None:
+        if self._group_slices is not None or not self._layout_path:
+            return
+        import json as _json
+        import os as _os
+
+        if _os.path.exists(self._layout_path):
+            try:
+                with open(self._layout_path) as _f:
+                    self._group_slices = _json.load(_f)["group_slices"]
+            except (OSError, ValueError, KeyError):
+                self._group_slices = None
+
+    def _key_offsets_sizes(self, keys, block_ids):
+        self._maybe_load_layout()
+        if not self._group_slices:
+            return (
+                [int(bid) * self._block_size for bid in block_ids],
+                self._block_size,
+            )
+        from vllm.v1.kv_offload.file_mapper import get_offload_group_idx
+
+        offs = []
+        sizes = []
+        for key, bid in zip(keys, block_ids):
+            g = get_offload_group_idx(key)
+            s0, ln = self._group_slices[g]
+            offs.append(int(bid) * self._block_size + s0)
+            sizes.append(ln)
+        return offs, sizes
+
     @override
     def submit_store(self, job_metadata: JobMetadata) -> None:
         if self.events is not None:
@@ -211,8 +248,9 @@ class FileSystemTierManager(SecondaryTierManager):
             batch_store_block,
             [self.file_mapper.get_file_name(key) for key in job_metadata.keys],
             self._primary_kv_view,
-            [int(bid) * self._block_size for bid in job_metadata.block_ids],
-            self._block_size,
+            *self._key_offsets_sizes(
+                list(job_metadata.keys), job_metadata.block_ids
+            ),
             self._use_o_direct,
         )
         self._pool.enqueue_store(job_metadata.job_id, 1, [task])
@@ -223,8 +261,9 @@ class FileSystemTierManager(SecondaryTierManager):
             batch_load_block,
             [self.file_mapper.get_file_name(key) for key in job_metadata.keys],
             self._primary_kv_view,
-            [int(bid) * self._block_size for bid in job_metadata.block_ids],
-            self._block_size,
+            *self._key_offsets_sizes(
+                list(job_metadata.keys), job_metadata.block_ids
+            ),
             self._use_o_direct,
         )
 

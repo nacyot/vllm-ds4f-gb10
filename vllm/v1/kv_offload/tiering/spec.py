@@ -218,6 +218,15 @@ class TieringOffloadingSpec(CPUOffloadingSpec):
             # Create TieringOffloadingManager. GPU↔CPU transfers use the inherited
             # get_worker(). Secondary tier transfers are handled by the
             # secondary tier managers and need no additional workers here.
+            # Point fs tiers at the worker-written layout sidecar so they
+            # can store/load group slices instead of whole staging rows.
+            if self.config.canonical_layout:
+                for _tier in secondary_tiers:
+                    if hasattr(_tier, "file_mapper"):
+                        _tier._layout_path = (
+                            f"/dev/shm/vllm_offload_{self._engine_id}"
+                            ".layout.json"
+                        )
             tiering_manager = TieringOffloadingManager(
                 primary_tier=primary_tier,
                 secondary_tiers=secondary_tiers,
@@ -271,6 +280,37 @@ class TieringOffloadingSpec(CPUOffloadingSpec):
                 mmap_region=worker_mmap,
                 canonical_layout=self.config.canonical_layout,
             )
+            if self.config.canonical_layout:
+                # Canonical group-slice sidecar: derive each group's
+                # (row offset, length) from the canonical tensor views and
+                # persist it. The fs tier stores/loads exactly these
+                # true-byte slices, and the worker-direct pread path fills
+                # the same slices.
+                try:
+                    _views = worker_mmap._views
+                    _slices = []
+                    for _grefs in kv_caches.group_data_refs:
+                        _idxs = sorted({r.tensor_idx for r in _grefs})
+                        _first = _views[_idxs[0]]
+                        _last = _views[_idxs[-1]]
+                        _start = int(_first.storage_offset())
+                        _end = int(_last.storage_offset()) + int(_last.shape[1])
+                        _slices.append([_start, _end - _start])
+                    import json as _json
+                    import os as _os
+
+                    _sc = f"/dev/shm/vllm_offload_{self._engine_id}.layout.json"
+                    _tmp = _sc + ".tmp"
+                    with open(_tmp, "w") as _f:
+                        _json.dump({"group_slices": _slices}, _f)
+                    _os.replace(_tmp, _sc)
+                    logger.info(
+                        "KV offload layout sidecar written: %s %s", _sc, _slices
+                    )
+                except Exception as _e:  # noqa: BLE001
+                    logger.warning(
+                        "KV offload layout sidecar write failed: %s", _e
+                    )
             return _worker
         except Exception:
             worker_mmap.cleanup()

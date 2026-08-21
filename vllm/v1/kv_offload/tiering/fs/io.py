@@ -168,7 +168,7 @@ def batch_store_block(
     paths: list[str],
     view: memoryview,
     offsets: list[int],
-    block_size: int,
+    block_size: int | list[int],
     use_o_direct: bool = True,
 ) -> None:
     """
@@ -176,24 +176,32 @@ def batch_store_block(
 
     Each block buffer[offsets[i] : offsets[i]+block_size] is written atomically
     to dest_paths[i] via a temp-file rename.  Raises on first error.
+    block_size is either one size for all blocks or one size per block.
     """
-    _validate_offsets(view, offsets, block_size)
+    sizes_list = (
+        list(block_size)
+        if isinstance(block_size, (list, tuple))
+        else [block_size] * len(offsets)
+    )
+    _validate_offsets(view, offsets, max(sizes_list) if sizes_list else 0)
 
     if _HAS_FSIO_C:
         view_B = view.cast("B")
-        view_slices = [view_B[x : x + block_size] for x in offsets]
+        view_slices = [
+            view_B[x : x + s] for x, s in zip(offsets, sizes_list)
+        ]
         tmp_paths = [p + _get_tmp_suffix() for p in paths]
         return batch_store_block_C(tmp_paths, paths, view_slices, use_o_direct)
     else:
-        for path, offset in zip(paths, offsets):
-            _store_block(path, view, offset, block_size, use_o_direct)
+        for path, offset, size in zip(paths, offsets, sizes_list):
+            _store_block(path, view, offset, size, use_o_direct)
 
 
 def batch_load_block(
     paths: list[str],
     view: memoryview,
     offsets: list[int],
-    block_size: int,
+    block_size: int | list[int],
     use_o_direct: bool = True,
 ) -> None:
     """
@@ -201,13 +209,21 @@ def batch_load_block(
 
     Block i is read from source_paths[i] into view[offsets[i] : offsets[i]+block_size].
     Raises on first error and removes the offending file.
+    block_size is either one size for all blocks or one size per block.
     """
-    _validate_offsets(view, offsets, block_size)
+    sizes_list = (
+        list(block_size)
+        if isinstance(block_size, (list, tuple))
+        else [block_size] * len(offsets)
+    )
+    _validate_offsets(view, offsets, max(sizes_list) if sizes_list else 0)
 
     if _HAS_FSIO_C:
         view_B = view.cast("B")
-        view_slices = [view_B[x : x + block_size] for x in offsets]
+        view_slices = [
+            view_B[x : x + s] for x, s in zip(offsets, sizes_list)
+        ]
         return batch_load_block_C(paths, view_slices, use_o_direct)
     else:
-        for path, offset in zip(paths, offsets):
-            _load_block(path, view, offset, block_size, use_o_direct)
+        for path, offset, size in zip(paths, offsets, sizes_list):
+            _load_block(path, view, offset, size, use_o_direct)
