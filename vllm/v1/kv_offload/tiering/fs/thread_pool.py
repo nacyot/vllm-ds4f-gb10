@@ -170,6 +170,7 @@ class DualQueueThreadPool:
                     "Job %s block I/O failed: %s",
                     state.job_id,
                     exc,
+                    exc_info=True,
                 )
                 job_finished, success = state.task_done(False)
 

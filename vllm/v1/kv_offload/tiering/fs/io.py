@@ -186,12 +186,28 @@ def batch_store_block(
     _validate_offsets(view, offsets, max(sizes_list) if sizes_list else 0)
 
     if _HAS_FSIO_C:
+        # ensure dirs before C fast path: batch_store_block_C opens dest
+        # files directly and cannot create the per-key hash-prefix dirs.
+        for _p in paths:
+            _ensure_dirs(_p)
         view_B = view.cast("B")
         view_slices = [
             view_B[x : x + s] for x, s in zip(offsets, sizes_list)
         ]
         tmp_paths = [p + _get_tmp_suffix() for p in paths]
-        return batch_store_block_C(tmp_paths, paths, view_slices, use_o_direct)
+        # retry transient fs errors (CIFS reconnect windows and the like)
+        import time as _time
+        for _attempt in range(3):
+            try:
+                return batch_store_block_C(
+                    tmp_paths, paths, view_slices, use_o_direct
+                )
+            except OSError:
+                if _attempt == 2:
+                    raise
+                for _p in paths:
+                    _ensure_dirs(_p)
+                _time.sleep(0.2 * (4 ** _attempt))
     else:
         for path, offset, size in zip(paths, offsets, sizes_list):
             _store_block(path, view, offset, size, use_o_direct)
