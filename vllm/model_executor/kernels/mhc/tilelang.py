@@ -1,5 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+import os
+
 import torch
 
 from vllm.utils.torch_utils import direct_register_custom_op
@@ -164,7 +166,10 @@ def mhc_pre_tilelang(
 
     from vllm.utils.deep_gemm import is_deep_gemm_supported
 
-    use_deep_gemm = is_deep_gemm_supported()
+    use_deep_gemm = (
+        is_deep_gemm_supported()
+        and os.environ.get("DSPARK_MHC_DEEPGEMM", "0") == "1"
+    )
     if use_deep_gemm:
         # these numbers are from deepgemm kernel impl
         block_k = 64
@@ -350,6 +355,15 @@ def mhc_pre_broadcast_tilelang(
 
     n_splits = compute_num_split(64, hidden_size, cdiv(num_tokens, 64))
 
+    from vllm.utils.deep_gemm import is_deep_gemm_supported
+
+    _use_deep_gemm_bcast = (
+        is_deep_gemm_supported()
+        and os.environ.get("DSPARK_MHC_DEEPGEMM", "0") == "1"
+    )
+    if not _use_deep_gemm_bcast:
+        n_splits = 1
+
     residual_out = torch.empty(
         num_tokens, hc_mult, hidden_size, dtype=torch.bfloat16, device=residual.device
     )
@@ -369,15 +383,20 @@ def mhc_pre_broadcast_tilelang(
         n_splits, num_tokens, dtype=torch.float32, device=residual.device
     )
 
-    from vllm.utils.deep_gemm import tf32_hc_prenorm_gemm
+    if _use_deep_gemm_bcast:
+        from vllm.utils.deep_gemm import tf32_hc_prenorm_gemm
 
-    tf32_hc_prenorm_gemm(
-        residual_flat,
-        fn_broadcast,
-        gemm_out_mul,
-        gemm_out_sqrsum,
-        n_splits,
-    )
+        tf32_hc_prenorm_gemm(
+            residual_flat,
+            fn_broadcast,
+            gemm_out_mul,
+            gemm_out_sqrsum,
+            n_splits,
+        )
+    else:
+        _x_f32 = residual_flat.float()
+        torch.matmul(_x_f32, fn_broadcast.t(), out=gemm_out_mul[0])
+        torch.sum(_x_f32 * _x_f32, dim=-1, out=gemm_out_sqrsum[0])
     mhc_pre_big_fuse_broadcast_with_norm_tilelang(
         gemm_out_mul,
         gemm_out_sqrsum,
@@ -514,7 +533,10 @@ def mhc_fused_post_pre_tilelang(
 
     from vllm.utils.deep_gemm import is_deep_gemm_supported
 
-    use_deep_gemm = is_deep_gemm_supported()
+    use_deep_gemm = (
+        is_deep_gemm_supported()
+        and os.environ.get("DSPARK_MHC_DEEPGEMM", "0") == "1"
+    )
     use_small_fma = num_tokens <= 16
     if use_small_fma:
         # TODO(gnovack): investigate autotuning these heuristics
