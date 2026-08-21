@@ -89,7 +89,14 @@ class CPUOffloadingSpec(OffloadingSpec):
         self.cpu_page_size_per_worker = 0
         self.replicated_layout = config.replicated_layout and self._uses_shared_region()
         if config.worker_kv_bytes_per_block > 0 and world_size > 0:
-            num_copies = 1 if self.replicated_layout else world_size
+            # Canonical sharing: all workers write into the same
+            # canonical area, so one copy suffices — the staging slot
+            # shrinks from world_size worker copies to the canonical
+            # size.
+            _canonical = bool(getattr(config, "canonical_layout", False))
+            num_copies = (
+                1 if (self.replicated_layout or _canonical) else world_size
+            )
             kv_bytes_per_block = config.worker_kv_bytes_per_block * num_copies
             kv_bytes_per_chunk = kv_bytes_per_block * self.blocks_per_chunk
 

@@ -1078,6 +1078,16 @@ class OffloadingConnectorScheduler:
                 ):
                     if block_id == 0:
                         continue
+                    # Compact packed: skip chunks with interior zeroed blocks
+                    # (stale SWA entries). Partial chunks violate the
+                    # GPULoadStoreSpec contiguity contract and desync the
+                    # scheduler chunk allocation from the worker block math.
+                    _ck = start_chunk_idx + key_idx
+                    _cb = group_state.block_ids[
+                        _ck * blocks_per_chunk : (_ck + 1) * blocks_per_chunk
+                    ]
+                    if len(_cb) < blocks_per_chunk or 0 in _cb:
+                        continue
                     # Skip SWA chunks that can never serve a load hit:
                     # within each full-attention alignment segment, only the
                     # trailing chunks queried by _sliding_window_lookup are

@@ -20,12 +20,33 @@ from vllm.v1.kv_cache_interface import (
     KVCacheSpec,
     MambaSpec,
     MLAAttentionSpec,
+    SlidingWindowMLASpec,
     UniformTypeKVCacheSpecs,
 )
 from vllm.v1.kv_offload.base import CanonicalPageMapping, CopyRun
 
 if TYPE_CHECKING:
     from vllm.config import VllmConfig
+
+# Version of the canonical byte format; bump on any layout change
+CANONICAL_FORMAT_VERSION = 1
+
+
+def canonical_format_id() -> str:
+    """Identity of the canonical byte format, for namespacing persisted KV.
+    Canonical pages keep the worker's KV layout family, so the id couples the
+    format version with that family; consumers must match it exactly."""
+    from vllm.v1.attention.backends.utils import get_kv_cache_layout
+
+    try:
+        layout = get_kv_cache_layout()
+    except AssertionError:
+        # Scheduler-side call without a current vllm config context: fall
+        # back to the same default rule the worker resolves to.
+        import os as _os
+
+        layout = _os.environ.get("VLLM_KV_CACHE_LAYOUT", "NHD")
+    return f"v{CANONICAL_FORMAT_VERSION}-{layout.lower()}"
 
 
 @dataclass(frozen=True)
@@ -254,6 +275,7 @@ def _layer_mapping(
     kv_cache: torch.Tensor | list[torch.Tensor] | None,
     num_blocks: int,
     ctx: _RankContext,
+    trust_replicated: bool = False,
 ) -> CanonicalPageMapping | None:
     """Certified mapping for one layer at one rank, or None (fail closed)."""
     if not isinstance(spec, AttentionSpec):
@@ -262,6 +284,30 @@ def _layer_mapping(
     page = spec.real_page_size_bytes
     if ctx.cp_size > 1 and (ctx.interleave > bs or bs % ctx.interleave):
         return None
+
+    if (
+        trust_replicated
+        and ctx.cp_size == 1
+        and ctx.dcp_size == 1
+        and isinstance(spec, (MLAAttentionSpec, SlidingWindowMLASpec))
+    ):
+        # DSV4 packed families (compressed MLA latent + indexer K, SWA MLA,
+        # compressor state): payload projections are built with disable_tp /
+        # ReplicatedLinear, so every TP rank holds identical page bytes.
+        # Canonical page == local page; replicated ranks rotate writes.
+        upage = _unpadded_page_size(spec) or page
+        return CanonicalPageMapping(
+            canonical_page_size_bytes=upage,
+            local_page_size_bytes=upage,
+            runs=(CopyRun(0, 0, upage, 1, upage, upage),),
+            # Every rank writes: on multi-node deployments each node's
+            # mmap must hold a complete canonical copy. With writer
+            # rotation each node would hold only its share, and restores
+            # would read half-empty data, corrupting the GPU KV cache.
+            num_writers=1,
+            writer_index=0,
+            parallelism_agnostic=True,
+        )
 
     if isinstance(spec, MLAAttentionSpec):
         # TP-replicated latent; CP shards its tokens across the DCP groups
@@ -352,7 +398,11 @@ def _is_exact_partition(intervals: list[tuple[int, int]], size: int) -> bool:
     )
 
 
-def _verify_tiling(layer_name: str, per_rank: list[CanonicalPageMapping]) -> None:
+def _verify_tiling(
+    layer_name: str,
+    per_rank: list[CanonicalPageMapping],
+    allow_replicated_writers: bool = False,
+) -> None:
     """Whichever ranks a block elects as writers must tile the canonical page
     exactly once, and each rank's runs must cover exactly its local page."""
     size = per_rank[0].canonical_page_size_bytes
@@ -364,6 +414,8 @@ def _verify_tiling(layer_name: str, per_rank: list[CanonicalPageMapping]) -> Non
         assert _is_exact_partition(local, mapping.local_page_size_bytes), (
             f"runs do not cover the local page of layer {layer_name}"
         )
+    if allow_replicated_writers:
+        return
     for block_id in range(num_writers):
         stored: list[tuple[int, int]] = []
         for mapping in per_rank:
@@ -413,6 +465,11 @@ def derive_canonical_mappings(
 
     my_rank = parallel_config.rank
     num_blocks = kv_cache_config.num_blocks
+    ktc = vllm_config.kv_transfer_config
+    _compact_packed = bool(
+        ktc is not None
+        and ktc.kv_connector_extra_config.get("dspark_compact_packed", False)
+    )
 
     mappings: dict[str, CanonicalPageMapping] = {}
     for kv_cache_group in kv_cache_config.kv_cache_groups:
@@ -426,7 +483,11 @@ def derive_canonical_mappings(
             per_rank: list[CanonicalPageMapping] = []
             for rank in range(group_size):
                 mapping = _layer_mapping(
-                    spec, kv_caches.get(layer_name), num_blocks, ctx(rank)
+                    spec,
+                    kv_caches.get(layer_name),
+                    num_blocks,
+                    ctx(rank),
+                    trust_replicated=_compact_packed,
                 )
                 if mapping is None:
                     break
@@ -439,6 +500,8 @@ def derive_canonical_mappings(
                     _opaque_fallback_mapping(page, group_size, rank)
                     for rank in range(group_size)
                 ]
-            _verify_tiling(layer_name, per_rank)
+            _verify_tiling(
+                layer_name, per_rank, allow_replicated_writers=_compact_packed
+            )
             mappings[layer_name] = per_rank[my_rank]
     return mappings

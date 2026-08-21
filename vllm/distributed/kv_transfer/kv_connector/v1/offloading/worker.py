@@ -69,6 +69,11 @@ class OffloadingConnectorWorker:
     def register_kv_caches(self, kv_caches: dict[str, torch.Tensor]):
         kv_cache_config = self.kv_cache_config
         num_blocks = kv_cache_config.num_blocks
+        _ktc = self.vllm_config.kv_transfer_config
+        _compact_packed = bool(
+            _ktc is not None
+            and _ktc.kv_connector_extra_config.get("dspark_compact_packed", False)
+        )
         mappings = derive_canonical_mappings(
             self.vllm_config, kv_cache_config, kv_caches
         )
@@ -155,7 +160,7 @@ class OffloadingConnectorWorker:
             ),
             None,
         )
-        if packed_kv_cache_tensor is not None:
+        if packed_kv_cache_tensor is not None and not _compact_packed:
             (tensor,) = tensors_per_block[packed_kv_cache_tensor.shared_by[0]]
             block_stride = tensor.stride(0)
             packed_tensor = tensor.as_strided(
@@ -176,45 +181,22 @@ class OffloadingConnectorWorker:
 
         block_tensors: list[CanonicalKVCacheTensor] = []
         block_data_refs: dict[str, list[CanonicalKVCacheRef]] = defaultdict(list)
-        for kv_cache_tensor in kv_cache_config.kv_cache_tensors:
-            # Filter to layers that were actually processed above.
-            # Packed KV allocation emits KVCacheTensor entries for
-            # every (tuple_idx, page_size) slot; slots where no group has a
-            # layer at that index produce an empty shared_by (reserved memory
-            # with no corresponding model layer).
-            tensor_layer_names = [
-                n for n in kv_cache_tensor.shared_by if n in tensors_per_block
-            ]
-            if not tensor_layer_names:
-                continue
-
-            # verify all layers in the group reference the exact same tensors
-            assert len({len(tensors_per_block[n]) for n in tensor_layer_names}) == 1
-            assert (
-                len({tensors_per_block[n][0].data_ptr() for n in tensor_layer_names})
-                == 1
-            )
-            assert (
-                len({tensors_per_block[n][0].stride() for n in tensor_layer_names}) == 1
-            )
-
-            # pick the first layer to represent the group
-            first_layer_name = tensor_layer_names[0]
-            for tensor in tensors_per_block[first_layer_name]:
-                block_tensors.append(
-                    CanonicalKVCacheTensor(
-                        tensor=tensor,
-                        page_size_bytes=page_size_bytes[first_layer_name],
+        if _compact_packed and packed_kv_cache_tensor is not None:
+            # Packed slab: per-layer strided views already carry each layer's
+            # true page; build one canonical tensor + ref per layer instead of
+            # charging every group the full slab stride.
+            for kv_cache_group in kv_cache_config.kv_cache_groups:
+                for layer_name in kv_cache_group.layer_names:
+                    if layer_name not in tensors_per_block:
+                        continue
+                    (tensor,) = tensors_per_block[layer_name]
+                    block_tensors.append(
+                        CanonicalKVCacheTensor(
+                            tensor=tensor,
+                            page_size_bytes=page_size_bytes[layer_name],
+                        )
                     )
-                )
-
-                curr_tensor_idx = len(block_tensors) - 1
-                for layer_name in tensor_layer_names:
-                    mapping = (
-                        mappings.get(layer_name)
-                        if len(tensors_per_block[first_layer_name]) == 1
-                        else None
-                    )
+                    mapping = mappings.get(layer_name)
                     assert (
                         mapping is None
                         or mapping.local_page_size_bytes
@@ -222,11 +204,63 @@ class OffloadingConnectorWorker:
                     )
                     block_data_refs[layer_name].append(
                         CanonicalKVCacheRef(
-                            tensor_idx=curr_tensor_idx,
-                            page_size_bytes=(unpadded_page_size_bytes[layer_name]),
+                            tensor_idx=len(block_tensors) - 1,
+                            page_size_bytes=unpadded_page_size_bytes[layer_name],
                             mapping=mapping,
                         )
                     )
+        else:
+            for kv_cache_tensor in kv_cache_config.kv_cache_tensors:
+                # Filter to layers that were actually processed above.
+                # Packed KV allocation emits KVCacheTensor entries for
+                # every (tuple_idx, page_size) slot; slots where no group has a
+                # layer at that index produce an empty shared_by (reserved memory
+                # with no corresponding model layer).
+                tensor_layer_names = [
+                    n for n in kv_cache_tensor.shared_by if n in tensors_per_block
+                ]
+                if not tensor_layer_names:
+                    continue
+
+                # verify all layers in the group reference the exact same tensors
+                assert len({len(tensors_per_block[n]) for n in tensor_layer_names}) == 1
+                assert (
+                    len({tensors_per_block[n][0].data_ptr() for n in tensor_layer_names})
+                    == 1
+                )
+                assert (
+                    len({tensors_per_block[n][0].stride() for n in tensor_layer_names}) == 1
+                )
+
+                # pick the first layer to represent the group
+                first_layer_name = tensor_layer_names[0]
+                for tensor in tensors_per_block[first_layer_name]:
+                    block_tensors.append(
+                        CanonicalKVCacheTensor(
+                            tensor=tensor,
+                            page_size_bytes=page_size_bytes[first_layer_name],
+                        )
+                    )
+
+                    curr_tensor_idx = len(block_tensors) - 1
+                    for layer_name in tensor_layer_names:
+                        mapping = (
+                            mappings.get(layer_name)
+                            if len(tensors_per_block[first_layer_name]) == 1
+                            else None
+                        )
+                        assert (
+                            mapping is None
+                            or mapping.local_page_size_bytes
+                            == unpadded_page_size_bytes[layer_name]
+                        )
+                        block_data_refs[layer_name].append(
+                            CanonicalKVCacheRef(
+                                tensor_idx=curr_tensor_idx,
+                                page_size_bytes=(unpadded_page_size_bytes[layer_name]),
+                                mapping=mapping,
+                            )
+                        )
 
         group_data_refs: list[list[CanonicalKVCacheRef]] = []
         for kv_cache_group in kv_cache_config.kv_cache_groups:
