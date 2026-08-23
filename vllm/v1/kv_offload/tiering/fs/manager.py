@@ -19,7 +19,7 @@ import functools
 import json
 import math
 import os
-from collections.abc import Iterable
+from collections.abc import Collection, Iterable
 from concurrent.futures import ThreadPoolExecutor
 from typing import TYPE_CHECKING, ClassVar
 
@@ -113,6 +113,21 @@ def _fanout_tasks(fn, paths, view, offs, sizes, use_o_direct, fan):
             functools.partial(fn, paths[sl], view, offs[sl], sz, use_o_direct)
         )
     return tasks
+
+
+def _keys_hex(keys) -> list[str]:
+    out = []
+    for k in keys:
+        try:
+            out.append(bytes(k).hex())
+        except Exception:  # noqa: BLE001
+            out.append(str(k))
+    return out
+
+
+def _req_id(job_metadata):
+    req_context = getattr(job_metadata, "req_context", None)
+    return getattr(req_context, "req_id", None) if req_context is not None else None
 
 
 class FsAsyncLookupManager(AsyncLookupManager):
@@ -345,8 +360,15 @@ class FileSystemTierManager(SecondaryTierManager):
             batch_store_block, paths, self._primary_kv_view, offs, sizes,
             self._use_o_direct, _FS_STORE_TASKS,
         )
-        _kv_event({"op": "store", "job": job_metadata.job_id,
-                   "chunks": len(keys)})
+        _kv_event({
+            "op": "store",
+            "job": job_metadata.job_id,
+            "chunks": len(keys),
+            "tasks": len(tasks),
+            "req": _req_id(job_metadata),
+            "bytes": sum(sizes) if isinstance(sizes, list) else sizes * len(keys),
+            "keys": _keys_hex(keys),
+        })
         self._pool.enqueue_store(job_metadata.job_id, len(tasks), tasks)
 
     @override
@@ -358,8 +380,15 @@ class FileSystemTierManager(SecondaryTierManager):
             batch_load_block, paths, self._primary_kv_view, offs, sizes,
             self._use_o_direct, _FS_LOAD_TASKS,
         )
-        _kv_event({"op": "load", "job": job_metadata.job_id,
-                   "chunks": len(keys)})
+        _kv_event({
+            "op": "load",
+            "job": job_metadata.job_id,
+            "chunks": len(keys),
+            "tasks": len(tasks),
+            "req": _req_id(job_metadata),
+            "bytes": sum(sizes) if isinstance(sizes, list) else sizes * len(keys),
+            "keys": _keys_hex(keys),
+        })
         self._pool.enqueue_load(job_metadata.job_id, len(tasks), tasks)
 
     @override
@@ -395,8 +424,43 @@ class FileSystemTierManager(SecondaryTierManager):
         """Block until all in-flight transfers in the threadpool finish."""
         self._pool.wait_idle()
 
+    @override
+    def touch(self, keys: Collection[OffloadKey], req_context: ReqContext) -> None:
+        # Record the request's full-attention (group 0) chunk chain once per
+        # request: enough to reconstruct which session a later store/load
+        # event belongs to without logging every touch call.
+        if not _EV_PATH:
+            return
+        try:
+            req_id = req_context.req_id
+            touched = getattr(self, "_ev_touched_reqs", None)
+            if touched is None:
+                touched = self._ev_touched_reqs = set()
+            if req_id in touched:
+                return
+            touched.add(req_id)
+            if len(touched) > 4096:
+                touched.clear()
+            group0_keys = [k for k in keys if bytes(k)[-4:] == b"\x00\x00\x00\x00"]
+            _kv_event({
+                "op": "touch",
+                "req": req_id,
+                "n_keys": len(keys),
+                "g0": _keys_hex(group0_keys),
+            })
+        except Exception:  # noqa: BLE001
+            pass
+
     def on_request_finished(self, req_context: ReqContext) -> None:
         self._lookup_manager.cleanup(req_context.req_id)
+        if _EV_PATH:
+            try:
+                _kv_event({"op": "req_end", "req": req_context.req_id})
+                touched = getattr(self, "_ev_touched_reqs", None)
+                if touched is not None:
+                    touched.discard(req_context.req_id)
+            except Exception:  # noqa: BLE001
+                pass
 
     @override
     def on_schedule_end(self, context: ScheduleEndContext) -> None:
