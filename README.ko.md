@@ -24,7 +24,7 @@
 
 LLM을 긴 세션으로 셀프호스팅할 때 진짜 비용은 디코드 처리량이 아니라 재프리필이다. 50만 토큰짜리 에이전트 세션이 GPU 캐시에서 밀려나면, 다음 턴을 보내는 순간 서버는 대화 전체를 처음부터 다시 계산한다. 프리픽스 캐시가 빗나가면 어텐션 키와 값을 다시 짓기 위해 대화 전체를 다시 훑기 때문이다. 이 하드웨어에서 그 재프리필은 분 단위로 들어간다. 한 응답에 몇 분을 기다리는 건 사실상 단일 세션만 쓰라는 강요다.
 
-그래서 로컬 에이전트의 병목은 초당 토큰이 아니라 살려 둘 수 있는 세션 수다. GPU 메모리는 유한하므로 세션이 여럿이면 가장 오래된 것이 밀려나고, 그걸 다시 여는 건 재프리필 전체다. 이건 GPU 안에서만으로는 풀리지 않는다.
+그래서 로컬 에이전트의 병목은 초당 토큰이 아니라 살려 둘 수 있는 세션 수다. GPU 메모리는 유한하므로 세션이 여럿이면 가장 오래된 것이 밀려나고, 그걸 다시 여는 건 재프리필 전체다. 이게 전체의 근본이다. 메모리에서 밀려난 KV는 그냥 유실되고 메모리 계층 어디에도 남지 않으므로, 다음 접근의 재프리필은 메모리 안에서는 결코 피할 수 없다. 유일한 지렛대는 밀려나기 전에 KV를 어딘가 영속 저장에 써두는 것이다. 이건 GPU 안에서만으로는 풀리지 않는다.
 
 KV 캐시는 토큰의 결정적 함수이므로 깔끔한 답이 있다. 밀려날 때 디스크에 쓰고, 세션을 다시 건드릴 때 읽어 와서 재계산을 건너뛰는 것이다. GPU에서 다시 짓는 데 435초가 걸리는 469k 토큰 세션의 KV는 디스크에서는 수 GB짜리 파일이고, 1GB/s 스토리지라면 몇 초 거리다. vLLM 0.27에는 실제로 티어링 경로(GPU 풀에서 CPU 버퍼를 거쳐 백엔드 스토리지로)가 들어 있다. 문제는 이것이 2노드 구성에서 동작하지 않았다는 점이다.
 
@@ -101,26 +101,60 @@ GB10 통합 메모리는 이 거래를 미묘하게 만든다. GPU와 CPU가 같
 이건 실험적 포크다. venv의 vLLM 0.27.1에 인라인 패치. `TRIAL_*`는 이 포크 고유 노브, `VLLM_*`는 업스트림 노브다. 여러 노브는 도중에 만난 특정 병목의 처방이라 존재한다.
 
 ```
-GPU 풀:   13 GiB (TRIAL_KVMEM=13958643712, 약 251만 토큰, 37만 세션 6개 상주)
-스테이징: 8 GiB  (TRIAL_KVOFF=8, GPU와 디스크 사이 버퍼)
-디스크:   두 노드에 CIFS hard,retrans=6로 마운트된 캐시 볼륨
+# GB10 두 대, 두 노드에 걸친 텐서 병렬(mp 백엔드), 200G 링크.
+# 머신별 값은 조정: 헤드/워커 IP, 빠른 NIC 이름, KV 캐시 디렉토리.
 
-env:  TRIAL_KVFS=1 TRIAL_KVFS_DIR=<캐시-볼륨>/kv/<노드>-compact
-      TRIAL_KVCANON=true TRIAL_KVCOMPACT=true    (canonical packed 오프로딩)
-      TRIAL_KVBPC=16 TRIAL_KVRT=32               (청크당 블록 수, 읽기 스레드)
-      VLLM_PREFIX_CACHE_RETENTION_INTERVAL=32768 (윈도우 그룹 희소 보존)
-      VLLM_SPARSE_INDEXER_MAX_LOGITS_MB=128       (인덱서 logits 버퍼 상한)
-      TRIAL_SPEC=dspark TRIAL_SPEC_N=5            (추측 디코딩)
-      TRIAL_GPUUTIL=0.75 TRIAL_MNBT=1024
+# --- 기동 전 두 노드에서 source하는 환경 (실제 운용 레시피) ---
+TRIAL_THINK=max
+TRIAL_SPEC=dspark TRIAL_SPEC_N=7             # dspark 드래프터, 디코드 약 1.5배
+TRIAL_MOE=flashinfer_b12x TRIAL_LINEAR=deep_gemm
+TRIAL_MML=524288 TRIAL_MNBT=1024 TRIAL_GPUUTIL=0.75
 
-기동:  워커 노드 유닛 먼저, 다음 헤드 노드 유닛 (systemd user 유닛 + linger)
-가드:  earlyoom + vm.min_free_kbytes 2GB + dirty 페이지 상한, 두 노드에 영속
-관측:  승격 실패 카운터, dmesg Xid, 가용 메모리, 캐시 볼륨 사용량
+TRIAL_KVMEM=13958643712                      # GPU 풀 13 GiB (약 251만 토큰)
+TRIAL_KVOFF=7                                # CPU 스테이징 티어 7 GiB (GPU와 디스크 사이 버퍼)
+TRIAL_KVFS=1
+TRIAL_KVFS_DIR=<캐시-디렉토리>/kv/<노드>-compact  # 노드별 (헤드와 워커가 서로 다른 하위 디렉토리)
+TRIAL_KVCANON=true TRIAL_KVCOMPACT=true       # canonical packed 오프로딩
+TRIAL_KVBPC=16 TRIAL_KVRT=32                  # 청크당 블록 수, 읽기 스레드
+TRIAL_TAILONLY=0
+
+DSPARK_RELAY_RESTORE=1 DSPARK_RELAY_WINDOW_BYTES=268435456   # 한 노드가 읽어 256 MiB TP 브로드캐스트
+DSPARK_FS_LOOKUP_THREADS=16 DSPARK_FS_LOAD_TASKS=16          # 헤드: 병렬 조회와 승격
+DSPARK_FS_PREAD_THREADS=16 DSPARK_FS_PREAD_WINDOW=16 DSPARK_FS_PREAD_SKIP=1
+
+VLLM_PREFIX_CACHE_RETENTION_INTERVAL=32768    # 윈도우 그룹 희소 보존
+VLLM_SPARSE_INDEXER_MAX_LOGITS_MB=128         # 인덱서 logits 버퍼 상한
+VLLM_EXECUTE_MODEL_TIMEOUT_SECONDS=1800
+
+# 빠른 링크의 NCCL, 당신의 NIC와 RoCE HCA로 고정
+NCCL_SOCKET_IFNAME=<nic> TP_SOCKET_IFNAME=<nic> GLOO_SOCKET_IFNAME=<nic>
+NCCL_IB_HCA=<hca> NCCL_CROSS_NIC=1 NCCL_IB_GID_INDEX=3
+
+# --- 공통 serve 인자, 두 노드 동일 ---
+ARGS=(deepseek-ai/DeepSeek-V4-Flash-0731 --served-model-name deepseek-v4-flash-0731 --trust-remote-code
+  --tensor-parallel-size 2 --nnodes 2 --master-addr <head-ip> --master-port 29501 --distributed-executor-backend mp
+  --kv-cache-dtype fp8_ds_mla --block-size 256
+  --max-model-len $TRIAL_MML --max-num-seqs 6 --max-num-batched-tokens $TRIAL_MNBT --long-prefill-token-threshold 1024
+  --gpu-memory-utilization $TRIAL_GPUUTIL --kv-cache-memory $TRIAL_KVMEM --kv-offloading-size $TRIAL_KVOFF
+  --kv-transfer-config '{"kv_connector":"OffloadingConnector","kv_role":"kv_both","kv_load_failure_policy":"recompute","kv_connector_extra_config":{"spec_name":"TieringOffloadingSpec","canonical_layout":true,"dspark_compact_packed":true,"blocks_per_chunk":16,"secondary_tiers":[{"type":"fs","root_dir":"'"$TRIAL_KVFS_DIR"'","n_read_threads":32,"n_write_threads":8}]}}'
+  --enable-prefix-caching --enable-chunked-prefill
+  --tokenizer-mode deepseek_v4 --tool-call-parser deepseek_v4 --enable-auto-tool-choice --reasoning-parser deepseek_v4
+  --default-chat-template-kwargs '{"thinking":true,"reasoning_effort":"'"$TRIAL_THINK"'"}'
+  --moe-backend $TRIAL_MOE --linear-backend $TRIAL_LINEAR
+  --speculative-config '{"method":"dspark","num_speculative_tokens":'"$TRIAL_SPEC_N"'}')
+
+# --- 기동: 워커(rank 1) 먼저, 다음 헤드(rank 0) ---
+VLLM_HOST_IP=<worker-ip> vllm serve "${ARGS[@]}" --node-rank 1 --headless
+VLLM_HOST_IP=<head-ip>   vllm serve "${ARGS[@]}" --node-rank 0 --host 0.0.0.0 --port 8888
+
+# TRIAL_KVFS_DIR은 노드별이다. DSPARK_RELAY_RESTORE=1이면 헤드만 저장 파일이 필요하고
+# (단일 canonical 라이터 + 릴레이 읽기), 워커는 거기에 아무것도 쓰거나 읽지 않는다.
+# 로컬 NVMe 경로, 직결 디스크, 공유 마운트 어디로든 지정 가능.
 ```
 
 몇몇 노브는 오프로딩 본체가 아니라 그 위에 얹힌 문제의 처방이다. `RETENTION_INTERVAL`은 작은 슬라이딩 윈도우와 상태 그룹 블록이 개당 1MB로 과금되어 세션의 실제 캐시 비용을 약 네 배 부풀리던 문제를 다룬다. 6세션 즉시 전환의 열쇠다. `LOGITS_MB`는 통합 메모리를 잠식하던(그리고 드래프터가 그걸 증폭하던) 희소 인덱서 프리필 logits 버퍼를 상한한다. 드래프터를 켠 채 대형 세션을 돌리는 열쇠다.
 
-추측 토큰은 5로 둔다. 메모리를 짜내려 낮췄더니 출력 분포가 왜곡됐고, 속도와 수락률만 믿고 출력 품질 검사를 건너뛴 게 실수였다. 그 원인(깨진 출력과 건너뛴 툴 호출)은 이후 3원 구성 비교로 못 박았고, 값은 정규 설정으로 되돌렸다. `GPUUTIL`은 0.75로 낮게 둔다. 웜 페이지 캐시가 부팅 시 GPU 메모리 검사를 깎기 때문이다.
+추측 토큰은 7로 둔다. 메모리를 짜내려 낮췄더니 출력 분포가 왜곡됐고, 속도와 수락률만 믿고 출력 품질 검사를 건너뛴 게 실수였다. 그 원인(깨진 출력과 건너뛴 툴 호출)은 이후 3원 구성 비교로 못 박았고, 값은 정규 설정으로 되돌렸다. `GPUUTIL`은 0.75로 낮게 둔다. 웜 페이지 캐시가 부팅 시 GPU 메모리 검사를 깎기 때문이다.
 
 ## 한계와 열린 문제
 

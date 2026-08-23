@@ -24,7 +24,7 @@ Author: nacyot.
 
 When you self-host an LLM for long sessions, the real cost is not decode throughput. It is reprefill. A 500k-token agent session that gets evicted from the GPU cache has to be recomputed from scratch the moment you send the next turn, because a prefix-cache miss means the server walks the whole conversation again to rebuild its attention keys and values. On this hardware that reprefill runs into the multi-minute range. Waiting minutes for one reply effectively forces you to use a single session.
 
-The bottleneck for a local agent, then, is not tokens per second. It is how many sessions you can keep alive. GPU memory is finite, so with several sessions the oldest gets pushed out, and reopening it is a full reprefill. You cannot solve this inside the GPU alone.
+The bottleneck for a local agent, then, is not tokens per second. It is how many sessions you can keep alive. GPU memory is finite, so with several sessions the oldest gets pushed out, and reopening it is a full reprefill. This is the root of the whole thing: the KV that gets pushed out of memory is simply lost, nothing higher in the memory hierarchy holds it, and so the reprefill on the next touch cannot be avoided from inside memory at all. The only lever is to have written the KV somewhere durable before it was evicted. You cannot solve this inside the GPU alone.
 
 The KV cache is a deterministic function of the tokens, so there is a clean answer: write it to disk when it is evicted, read it back when the session is touched again, and skip the recompute. A 469k-token session that costs 435 seconds to rebuild on the GPU is a few-GB file on disk, a few seconds away at 1 GB/s. vLLM 0.27 already ships a tiering path (GPU pool to a CPU buffer to backend storage). The problem was that it did not work in a two-node configuration.
 
@@ -101,26 +101,60 @@ Once it was clear the cost was the serial nature of the lookup, not read bandwid
 This is an experimental fork: vLLM 0.27.1 in a venv with inline patches. `TRIAL_*` are this fork's own knobs, `VLLM_*` are upstream knobs. Several knobs exist because they are the fix for a specific bottleneck met along the way.
 
 ```
-GPU pool:  13 GiB (TRIAL_KVMEM=13958643712, ~2.51M tokens, six 370k sessions resident)
-Staging:   8 GiB  (TRIAL_KVOFF=8, buffer between GPU and disk)
-Disk:      cache volume mounted CIFS hard,retrans=6 on both nodes
+# Two GB10 boxes, tensor parallel across both (mp backend) over the 200G link.
+# Adjust the machine-specific values: head/worker IPs, the fast-NIC name, the KV cache dir.
 
-env:  TRIAL_KVFS=1 TRIAL_KVFS_DIR=<cache-volume>/kv/<node>-compact
-      TRIAL_KVCANON=true TRIAL_KVCOMPACT=true    (canonical packed offloading)
-      TRIAL_KVBPC=16 TRIAL_KVRT=32               (blocks per chunk, read threads)
-      VLLM_PREFIX_CACHE_RETENTION_INTERVAL=32768 (sparse retention of window groups)
-      VLLM_SPARSE_INDEXER_MAX_LOGITS_MB=128       (indexer logits buffer cap)
-      TRIAL_SPEC=dspark TRIAL_SPEC_N=5            (speculative decoding)
-      TRIAL_GPUUTIL=0.75 TRIAL_MNBT=1024
+# --- environment, sourced on both nodes before launch (the running recipe) ---
+TRIAL_THINK=max
+TRIAL_SPEC=dspark TRIAL_SPEC_N=7             # dspark drafter, ~1.5x decode
+TRIAL_MOE=flashinfer_b12x TRIAL_LINEAR=deep_gemm
+TRIAL_MML=524288 TRIAL_MNBT=1024 TRIAL_GPUUTIL=0.75
 
-start: worker node unit first, then head node unit (systemd user units + linger)
-guards: earlyoom + vm.min_free_kbytes 2GB + a dirty-page ceiling, persistent on both nodes
-watch: promotion-failure counter, dmesg Xid, available memory, cache-volume usage
+TRIAL_KVMEM=13958643712                      # GPU pool, 13 GiB (about 2.51M tokens)
+TRIAL_KVOFF=7                                # CPU staging tier, 7 GiB (buffer between GPU and disk)
+TRIAL_KVFS=1
+TRIAL_KVFS_DIR=<cache-dir>/kv/<node>-compact # per node (head and worker use distinct subdirs)
+TRIAL_KVCANON=true TRIAL_KVCOMPACT=true       # canonical packed offloading
+TRIAL_KVBPC=16 TRIAL_KVRT=32                  # blocks per chunk, read threads
+TRIAL_TAILONLY=0
+
+DSPARK_RELAY_RESTORE=1 DSPARK_RELAY_WINDOW_BYTES=268435456   # one node reads + 256 MiB TP broadcast
+DSPARK_FS_LOOKUP_THREADS=16 DSPARK_FS_LOAD_TASKS=16          # head: parallel lookup and promotion
+DSPARK_FS_PREAD_THREADS=16 DSPARK_FS_PREAD_WINDOW=16 DSPARK_FS_PREAD_SKIP=1
+
+VLLM_PREFIX_CACHE_RETENTION_INTERVAL=32768    # sparse retention of window groups
+VLLM_SPARSE_INDEXER_MAX_LOGITS_MB=128         # indexer logits buffer cap
+VLLM_EXECUTE_MODEL_TIMEOUT_SECONDS=1800
+
+# NCCL over the fast link, pin to your NIC and RoCE HCAs
+NCCL_SOCKET_IFNAME=<nic> TP_SOCKET_IFNAME=<nic> GLOO_SOCKET_IFNAME=<nic>
+NCCL_IB_HCA=<hca> NCCL_CROSS_NIC=1 NCCL_IB_GID_INDEX=3
+
+# --- shared serve args, identical on both nodes ---
+ARGS=(deepseek-ai/DeepSeek-V4-Flash-0731 --served-model-name deepseek-v4-flash-0731 --trust-remote-code
+  --tensor-parallel-size 2 --nnodes 2 --master-addr <head-ip> --master-port 29501 --distributed-executor-backend mp
+  --kv-cache-dtype fp8_ds_mla --block-size 256
+  --max-model-len $TRIAL_MML --max-num-seqs 6 --max-num-batched-tokens $TRIAL_MNBT --long-prefill-token-threshold 1024
+  --gpu-memory-utilization $TRIAL_GPUUTIL --kv-cache-memory $TRIAL_KVMEM --kv-offloading-size $TRIAL_KVOFF
+  --kv-transfer-config '{"kv_connector":"OffloadingConnector","kv_role":"kv_both","kv_load_failure_policy":"recompute","kv_connector_extra_config":{"spec_name":"TieringOffloadingSpec","canonical_layout":true,"dspark_compact_packed":true,"blocks_per_chunk":16,"secondary_tiers":[{"type":"fs","root_dir":"'"$TRIAL_KVFS_DIR"'","n_read_threads":32,"n_write_threads":8}]}}'
+  --enable-prefix-caching --enable-chunked-prefill
+  --tokenizer-mode deepseek_v4 --tool-call-parser deepseek_v4 --enable-auto-tool-choice --reasoning-parser deepseek_v4
+  --default-chat-template-kwargs '{"thinking":true,"reasoning_effort":"'"$TRIAL_THINK"'"}'
+  --moe-backend $TRIAL_MOE --linear-backend $TRIAL_LINEAR
+  --speculative-config '{"method":"dspark","num_speculative_tokens":'"$TRIAL_SPEC_N"'}')
+
+# --- launch: worker (rank 1) first, then head (rank 0) ---
+VLLM_HOST_IP=<worker-ip> vllm serve "${ARGS[@]}" --node-rank 1 --headless
+VLLM_HOST_IP=<head-ip>   vllm serve "${ARGS[@]}" --node-rank 0 --host 0.0.0.0 --port 8888
+
+# TRIAL_KVFS_DIR is per node. With DSPARK_RELAY_RESTORE=1 only the head needs the
+# store files (single canonical writer plus relay read); the worker writes and reads
+# nothing there. Point it at a local NVMe path, an attached disk, or a shared mount.
 ```
 
 A few knobs are not part of the offloading core but the fix for what sat on top of it. `RETENTION_INTERVAL` addresses small sliding-window and state-group blocks being billed at 1 MB each, which inflated the real cache cost of a session about fourfold; it is the key to six-session instant switching. `LOGITS_MB` caps the sparse-indexer prefill logits buffer, which had been eating unified memory (and the drafter was amplifying it); it is the key to running large sessions with the drafter on.
 
-Speculative tokens stay at 5. Lowering it to squeeze memory distorted the output distribution, and the mistake was trusting speed and acceptance rate while skipping output-quality checks. The cause (garbled output and skipped tool calls) was later pinned with a three-way configuration comparison, and the value was returned to its normal setting. `GPUUTIL` is set low at 0.75 because a warm page cache trims the boot-time GPU memory check.
+Speculative tokens stay at 7. Lowering it to squeeze memory distorted the output distribution, and the mistake was trusting speed and acceptance rate while skipping output-quality checks. The cause (garbled output and skipped tool calls) was later pinned with a three-way configuration comparison, and the value was returned to its normal setting. `GPUUTIL` is set low at 0.75 because a warm page cache trims the boot-time GPU memory check.
 
 ## Limits and open problems
 
