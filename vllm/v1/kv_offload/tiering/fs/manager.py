@@ -20,6 +20,7 @@ import json
 import math
 import os
 from collections.abc import Iterable
+from concurrent.futures import ThreadPoolExecutor
 from typing import TYPE_CHECKING, ClassVar
 
 try:
@@ -129,11 +130,39 @@ class FsAsyncLookupManager(AsyncLookupManager):
         self, keys: list[OffloadKey], req_context: ReqContext
     ) -> Iterable[bool]:
         paths = [self._tier.file_mapper.get_file_name(k) for k in keys]
-        if _HAS_BATCH_LOOKUP_C:
+        # Existence checks are latency-bound (network filesystem metadata
+        # round trips), not CPU-bound: split the stat batch across
+        # DSPARK_FS_LOOKUP_THREADS threads (env-gated, default 1 = today's
+        # single-thread behavior).
+        n_threads = _env_int("DSPARK_FS_LOOKUP_THREADS", 1)
+        t0 = _ev_time.time()
+        if n_threads > 1 and len(paths) >= 2 * n_threads:
+            pool = getattr(self, "_lookup_pool", None)
+            if pool is None:
+                pool = self._lookup_pool = ThreadPoolExecutor(
+                    max_workers=n_threads, thread_name_prefix="fs_lookup"
+                )
+            fn = (
+                (lambda ps: list(batch_lookup_C(ps)))
+                if _HAS_BATCH_LOOKUP_C
+                else (lambda ps: [os.path.exists(p) for p in ps])
+            )
+            per = math.ceil(len(paths) / n_threads)
+            futures = [
+                pool.submit(fn, paths[i : i + per])
+                for i in range(0, len(paths), per)
+            ]
+            results = []
+            for fut in futures:
+                results.extend(fut.result())
+        elif _HAS_BATCH_LOOKUP_C:
             # C extension: GIL released for the entire faccessat() batch.
             results = list(batch_lookup_C(paths))
         else:
             results = [os.path.exists(p) for p in paths]
+        _kv_event({"op": "lookup_batch", "n": len(paths),
+                   "hit": sum(1 for r in results if r), "threads": n_threads,
+                   "dt": round(_ev_time.time() - t0, 3)})
         return results
 
 
