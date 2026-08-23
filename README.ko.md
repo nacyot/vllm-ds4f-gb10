@@ -101,55 +101,45 @@ GB10 통합 메모리는 이 거래를 미묘하게 만든다. GPU와 CPU가 같
 이건 실험적 포크다. venv의 vLLM 0.27.1에 인라인 패치. `TRIAL_*`는 이 포크 고유 노브, `VLLM_*`는 업스트림 노브다. 여러 노브는 도중에 만난 특정 병목의 처방이라 존재한다.
 
 ```
-# GB10 두 대, 두 노드에 걸친 텐서 병렬(mp 백엔드), 200G 링크.
-# 머신별 값은 조정: 헤드/워커 IP, 빠른 NIC 이름, KV 캐시 디렉토리.
+실행 스크립트는 `deploy/gb10-cluster/`에 있다. `serve-common.sh` 상단의 머신별 값
+(헤드와 워커 IP, 빠른 NIC 이름과 RoCE HCA, KV 캐시 디렉토리)을 채운 뒤, 워커를 먼저
+헤드를 다음에 실행한다.
 
-# --- 기동 전 두 노드에서 source하는 환경 (실제 운용 레시피) ---
-TRIAL_THINK=max
-TRIAL_SPEC=dspark TRIAL_SPEC_N=7             # dspark 드래프터, 디코드 약 1.5배
-TRIAL_MOE=flashinfer_b12x TRIAL_LINEAR=deep_gemm
-TRIAL_MML=524288 TRIAL_MNBT=1024 TRIAL_GPUUTIL=0.75
+  ./deploy/gb10-cluster/serve-worker.sh   # 워커 노드 (rank 1)
+  ./deploy/gb10-cluster/serve-head.sh     # 헤드 노드 (rank 0)
 
-TRIAL_KVMEM=13958643712                      # GPU 풀 13 GiB (약 251만 토큰)
-TRIAL_KVOFF=7                                # CPU 스테이징 티어 7 GiB (GPU와 디스크 사이 버퍼)
-TRIAL_KVFS=1
-TRIAL_KVFS_DIR=<캐시-디렉토리>/kv/<노드>-compact  # 노드별 (헤드와 워커가 서로 다른 하위 디렉토리)
-TRIAL_KVCANON=true TRIAL_KVCOMPACT=true       # canonical packed 오프로딩
-TRIAL_KVBPC=16 TRIAL_KVRT=32                  # 청크당 블록 수, 읽기 스레드
-TRIAL_TAILONLY=0
+레시피 노브, 한 줄에 하나씩 (deploy/gb10-cluster/ds4f.env):
 
-DSPARK_RELAY_RESTORE=1 DSPARK_RELAY_WINDOW_BYTES=268435456   # 한 노드가 읽어 256 MiB TP 브로드캐스트
-DSPARK_FS_LOOKUP_THREADS=16 DSPARK_FS_LOAD_TASKS=16          # 헤드: 병렬 조회와 승격
-DSPARK_FS_PREAD_THREADS=16 DSPARK_FS_PREAD_WINDOW=16 DSPARK_FS_PREAD_SKIP=1
+  TRIAL_THINK=max
+  TRIAL_SPEC=dspark
+  TRIAL_SPEC_N=7
+  TRIAL_MOE=flashinfer_b12x
+  TRIAL_LINEAR=deep_gemm
+  TRIAL_MML=524288
+  TRIAL_MNBT=1024
+  TRIAL_GPUUTIL=0.75
+  TRIAL_KVMEM=13958643712        # GPU 풀, 13 GiB
+  TRIAL_KVOFF=7                  # CPU 스테이징 티어, 7 GiB
+  TRIAL_KVFS=1
+  TRIAL_KVCANON=true
+  TRIAL_KVCOMPACT=true
+  TRIAL_KVBPC=16
+  TRIAL_KVRT=32
+  TRIAL_TAILONLY=0
+  DSPARK_RELAY_RESTORE=1               # 한 노드가 읽어 TP 브로드캐스트 (off = 공유 스토리지 pread)
+  DSPARK_RELAY_WINDOW_BYTES=268435456  # 256 MiB 브로드캐스트 윈도우
+  DSPARK_FS_LOOKUP_THREADS=16
+  DSPARK_FS_LOAD_TASKS=16
+  DSPARK_FS_PREAD_THREADS=16
+  DSPARK_FS_PREAD_WINDOW=16
+  DSPARK_FS_PREAD_SKIP=1
+  VLLM_PREFIX_CACHE_RETENTION_INTERVAL=32768
+  VLLM_SPARSE_INDEXER_MAX_LOGITS_MB=128
+  VLLM_EXECUTE_MODEL_TIMEOUT_SECONDS=1800
 
-VLLM_PREFIX_CACHE_RETENTION_INTERVAL=32768    # 윈도우 그룹 희소 보존
-VLLM_SPARSE_INDEXER_MAX_LOGITS_MB=128         # 인덱서 logits 버퍼 상한
-VLLM_EXECUTE_MODEL_TIMEOUT_SECONDS=1800
-
-# 빠른 링크의 NCCL, 당신의 NIC와 RoCE HCA로 고정
-NCCL_SOCKET_IFNAME=<nic> TP_SOCKET_IFNAME=<nic> GLOO_SOCKET_IFNAME=<nic>
-NCCL_IB_HCA=<hca> NCCL_CROSS_NIC=1 NCCL_IB_GID_INDEX=3
-
-# --- 공통 serve 인자, 두 노드 동일 ---
-ARGS=(deepseek-ai/DeepSeek-V4-Flash-0731 --served-model-name deepseek-v4-flash-0731 --trust-remote-code
-  --tensor-parallel-size 2 --nnodes 2 --master-addr <head-ip> --master-port 29501 --distributed-executor-backend mp
-  --kv-cache-dtype fp8_ds_mla --block-size 256
-  --max-model-len $TRIAL_MML --max-num-seqs 6 --max-num-batched-tokens $TRIAL_MNBT --long-prefill-token-threshold 1024
-  --gpu-memory-utilization $TRIAL_GPUUTIL --kv-cache-memory $TRIAL_KVMEM --kv-offloading-size $TRIAL_KVOFF
-  --kv-transfer-config '{"kv_connector":"OffloadingConnector","kv_role":"kv_both","kv_load_failure_policy":"recompute","kv_connector_extra_config":{"spec_name":"TieringOffloadingSpec","canonical_layout":true,"dspark_compact_packed":true,"blocks_per_chunk":16,"secondary_tiers":[{"type":"fs","root_dir":"'"$TRIAL_KVFS_DIR"'","n_read_threads":32,"n_write_threads":8}]}}'
-  --enable-prefix-caching --enable-chunked-prefill
-  --tokenizer-mode deepseek_v4 --tool-call-parser deepseek_v4 --enable-auto-tool-choice --reasoning-parser deepseek_v4
-  --default-chat-template-kwargs '{"thinking":true,"reasoning_effort":"'"$TRIAL_THINK"'"}'
-  --moe-backend $TRIAL_MOE --linear-backend $TRIAL_LINEAR
-  --speculative-config '{"method":"dspark","num_speculative_tokens":'"$TRIAL_SPEC_N"'}')
-
-# --- 기동: 워커(rank 1) 먼저, 다음 헤드(rank 0) ---
-VLLM_HOST_IP=<worker-ip> vllm serve "${ARGS[@]}" --node-rank 1 --headless
-VLLM_HOST_IP=<head-ip>   vllm serve "${ARGS[@]}" --node-rank 0 --host 0.0.0.0 --port 8888
-
-# TRIAL_KVFS_DIR은 노드별이다. DSPARK_RELAY_RESTORE=1이면 헤드만 저장 파일이 필요하고
-# (단일 canonical 라이터 + 릴레이 읽기), 워커는 거기에 아무것도 쓰거나 읽지 않는다.
-# 로컬 NVMe 경로, 직결 디스크, 공유 마운트 어디로든 지정 가능.
+전체 serve 인자 목록은 한 줄에 하나씩 serve-common.sh에 있다. TRIAL_KVFS_DIR은 CACHE_DIR에서
+노드별로 정해지고, DSPARK_RELAY_RESTORE=1이면 헤드만 거기에 저장하고 읽으므로, 캐시는 단일 노드
+로컬 NVMe, 직결 디스크, 마운트 어디든 될 수 있다.
 ```
 
 몇몇 노브는 오프로딩 본체가 아니라 그 위에 얹힌 문제의 처방이다. `RETENTION_INTERVAL`은 작은 슬라이딩 윈도우와 상태 그룹 블록이 개당 1MB로 과금되어 세션의 실제 캐시 비용을 약 네 배 부풀리던 문제를 다룬다. 6세션 즉시 전환의 열쇠다. `LOGITS_MB`는 통합 메모리를 잠식하던(그리고 드래프터가 그걸 증폭하던) 희소 인덱서 프리필 logits 버퍼를 상한한다. 드래프터를 켠 채 대형 세션을 돌리는 열쇠다.
