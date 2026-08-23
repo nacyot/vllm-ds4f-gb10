@@ -327,6 +327,81 @@ class TieringOffloadingSpec(CPUOffloadingSpec):
 
             def _fs_submit_load(job_id, src_spec, dst_spec):
                 entries = getattr(src_spec, "fs_paths", None)
+                # DSPARK_RELAY_RESTORE (experimental, opt-in, default off):
+                # one rank reads the canonical files, then broadcasts the loaded
+                # bytes to the other TP ranks over the process group interconnect.
+                # Removes the shared-storage requirement and moves the cross-node
+                # copy onto the fast link. Replicated KV -> one read suffices.
+                import os as _relay_os
+                if entries and _relay_os.environ.get("DSPARK_RELAY_RESTORE") == "1":
+                    import torch as _t
+                    from vllm.distributed.parallel_state import get_tp_group
+                    _tp = get_tp_group()
+                    if _tp.world_size > 1:
+                        _is_src = _tp.rank_in_group == 0
+                        _items = [
+                            (int(_bid) * _row + int(_e[1]), _e[0], int(_e[2]))
+                            for _bid, _e in zip(src_spec.block_ids, entries)
+                            if _e
+                        ]
+                        _flat = _t.frombuffer(
+                            memoryview(worker_mmap.mmap_obj), dtype=_t.uint8
+                        )
+                        _win_bytes = 268435456
+                        try:
+                            _win_bytes = int(_relay_os.environ.get(
+                                "DSPARK_RELAY_WINDOW_BYTES", "268435456"))
+                        except (ValueError, TypeError):
+                            _win_bytes = 268435456
+                        _wi = 0
+                        while _wi < len(_items):
+                            _wb = 0
+                            _wj = _wi
+                            while _wj < len(_items) and (
+                                    _wj == _wi
+                                    or _wb + _items[_wj][2] <= _win_bytes):
+                                _wb += _items[_wj][2]
+                                _wj += 1
+                            _window = _items[_wi:_wj]
+                            if _is_src:
+                                for _off, _path, _ln in _window:
+                                    try:
+                                        with open(_path, "rb") as _f:
+                                            _data = _f.read()
+                                    except OSError as _e2:
+                                        logger.warning(
+                                            "relay src read failed for %s: %s",
+                                            _path, _e2,
+                                        )
+                                        continue
+                                    _g = _t.frombuffer(
+                                        bytearray(_data), dtype=_t.uint8
+                                    ).cuda()
+                                    _flat[_off : _off + len(_data)].copy_(_g)
+                                _t.cuda.synchronize()
+                            _buf = _t.empty(_wb, dtype=_t.uint8, device="cuda")
+                            if _is_src:
+                                _pos = 0
+                                for _off, _p, _ln in _window:
+                                    _buf[_pos : _pos + _ln].copy_(
+                                        _flat[_off : _off + _ln])
+                                    _pos += _ln
+                            _tp.broadcast(_buf, src=0)
+                            if not _is_src:
+                                _pos = 0
+                                for _off, _p, _ln in _window:
+                                    _flat[_off : _off + _ln].copy_(
+                                        _buf[_pos : _pos + _ln])
+                                    _pos += _ln
+                            _t.cuda.synchronize()
+                            del _buf
+                            _wi = _wj
+                        _total = sum(_ln for _o, _p, _ln in _items)
+                        logger.debug(
+                            "relay restore: src=%s chunks=%d bytes=%d",
+                            _is_src, len(_items), _total,
+                        )
+                        return _orig_submit_load(job_id, src_spec, dst_spec)
                 logger.debug(
                     "wk_load job=%s spec=%s fs=%s",
                     job_id,
