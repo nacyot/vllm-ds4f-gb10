@@ -36,6 +36,8 @@ Example configuration:
 }
 """
 
+import os
+from concurrent.futures import ThreadPoolExecutor
 from typing import Any
 
 import torch
@@ -60,6 +62,13 @@ from vllm.v1.kv_offload.tiering.manager import (
 )
 
 logger = init_logger(__name__)
+
+
+def _env_int(name: str, default: int = 1) -> int:
+    try:
+        return int(os.environ.get(name, "") or default)
+    except ValueError:
+        return default
 
 
 class TieringOffloadingSpec(CPUOffloadingSpec):
@@ -310,10 +319,95 @@ class TieringOffloadingSpec(CPUOffloadingSpec):
             # rows from the files first, then run the normal load.
             _row = self.kv_bytes_per_chunk
             _orig_submit_load = _worker.submit_load
+            # DSPARK_FS_PREAD_SKIP: on the node that ran the promotion (the
+            # scheduler node in the current single-writer scheme), this
+            # worker's mmap was already filled during promotion, so the
+            # direct pread below would just duplicate that write.
+            _pread_skip = os.environ.get("DSPARK_FS_PREAD_SKIP") == "1"
 
             def _fs_submit_load(job_id, src_spec, dst_spec):
                 entries = getattr(src_spec, "fs_paths", None)
+                logger.debug(
+                    "wk_load job=%s spec=%s fs=%s",
+                    job_id,
+                    type(src_spec).__name__,
+                    len(entries) if entries else None,
+                )
+                if entries and _pread_skip:
+                    logger.debug(
+                        "fs-direct preads skipped (head node): %d",
+                        sum(1 for _e in entries if _e),
+                    )
+                    entries = None
+
+                n_pread_threads = _env_int("DSPARK_FS_PREAD_THREADS", 1)
+                if entries and n_pread_threads > 1:
+                    # Parallel windowed staging: read files on a small
+                    # threadpool (file I/O releases the GIL), stage a
+                    # bounded window of reads on the GPU, and synchronize
+                    # once per window instead of once per block. Peak extra
+                    # memory is window * per-block slice size, not the full
+                    # restore.
+                    import torch as _t
+
+                    window = _env_int("DSPARK_FS_PREAD_WINDOW", 16)
+                    pool = getattr(_worker, "_dspark_pread_pool", None)
+                    if pool is None:
+                        pool = _worker._dspark_pread_pool = ThreadPoolExecutor(
+                            max_workers=n_pread_threads,
+                            thread_name_prefix="fs_pread",
+                        )
+                    items = [
+                        (int(_bid) * _row + int(_ent[1]), _ent[0])
+                        for _bid, _ent in zip(src_spec.block_ids, entries)
+                        if _ent
+                    ]
+
+                    def _read_one(item):
+                        _off, _path = item
+                        try:
+                            with open(_path, "rb") as _f:
+                                return _f.read()
+                        except OSError as _e:
+                            logger.warning(
+                                "fs direct read failed for %s: %s", _path, _e
+                            )
+                            return None
+
+                    _flat = _t.frombuffer(
+                        memoryview(worker_mmap.mmap_obj), dtype=_t.uint8
+                    )
+                    _n_read = 0
+                    for _i in range(0, len(items), window):
+                        _chunk = items[_i : _i + window]
+                        _datas = list(pool.map(_read_one, _chunk))
+                        _staged = []
+                        for (_off, _path), _data in zip(_chunk, _datas):
+                            if _data is None:
+                                continue
+                            # Route the write through the GPU: letting the
+                            # CPU dirty pinned pages that the device then
+                            # reads has produced Xid 13 channel errors on
+                            # GB10, so upload the file bytes and let device
+                            # DMA write them into the pinned mmap.
+                            _src_gpu = _t.frombuffer(
+                                bytearray(_data), dtype=_t.uint8
+                            ).cuda()
+                            _flat[_off : _off + len(_data)].copy_(_src_gpu)
+                            _staged.append(_src_gpu)
+                            _n_read += 1
+                        _t.cuda.synchronize()
+                        del _staged, _datas
+                    logger.debug(
+                        "fs-direct preads (parallel x%d, window %d): %d",
+                        n_pread_threads,
+                        window,
+                        _n_read,
+                    )
+                    entries = None
+
                 if entries:
+                    _n_read = 0
                     for _bid, _ent in zip(src_spec.block_ids, entries):
                         if not _ent:
                             continue
@@ -336,10 +430,12 @@ class TieringOffloadingSpec(CPUOffloadingSpec):
                             )
                             _flat[_off : _off + len(_data)].copy_(_src_gpu)
                             _t.cuda.synchronize()
+                            _n_read += 1
                         except OSError as _e:
                             logger.warning(
                                 "fs direct read failed for %s: %s", _path, _e
                             )
+                    logger.debug("fs-direct preads: %d", _n_read)
                 return _orig_submit_load(job_id, src_spec, dst_spec)
 
             _worker.submit_load = _fs_submit_load
