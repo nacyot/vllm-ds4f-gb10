@@ -64,15 +64,15 @@ The most important property first: the client has to know nothing. Send the same
 
 Cold build (reprefill) versus disk restore, measured by force-evicting a session and reaccessing it:
 
-| Session size | Cold build (reprefill) | Disk restore | Speedup |
+All numbers here are on shared network storage at about 1 GB/s (see the limits section for why that matters and what local NVMe would change).
+
+| Session size | Cold build (reprefill) | Disk restore, initial | Disk restore, reworked |
 |---|---|---|---|
-| 94k tokens | 61 s | 8.1 s | 7.5x |
-| 188k tokens | 133 s | 12.6 s | 10.5x |
-| 469k tokens | 435 s | 27.8 s | 15.6x |
+| 94k tokens | 61 s | 8.1 s | not re-measured |
+| 188k tokens | 133 s | 12.6 s | not re-measured |
+| 469k tokens | 435 s | 27.8 s | ~9 s |
 
-The speedup grows with session size, because reprefill accelerates with context while a disk read is linear.
-
-Those are the first-cut numbers. A later reworking of the restore path (see "From 28 seconds to 9" below) cut a comparable cold restore from about 28 seconds to about 9, so the current restore cost is well under half of what this table shows.
+The "initial" column is the first working version; the "reworked" column is after the restore-path rework described in "From 28 seconds to 9" below, measured at 25.5 to 9.1 seconds on a 381k session. Small sessions were not re-measured because their stat cost was already small, so their gain is modest; the win concentrates on large sessions where serial existence-checks dominated. The speedup over reprefill grows with session size, because reprefill accelerates with context while a disk read is linear: a reworked 469k restore is roughly a 48x speedup over its 435 second reprefill.
 
 But a disk restore is meant to be the rare case, not the common one. With the GPU pool set to 13 GiB (about 2.51M tokens), six sessions of about 370k tokens each stay fully resident on the GPU, and switching among them lands in 1.6 to 1.8 seconds every time. Only the seventh, evicted, session comes back from disk. In the six-resident-session qualification, store failures were zero and the memory headroom stayed comfortable.
 
@@ -118,7 +118,8 @@ An honest list.
 2. The disk tier has no capacity cap or GC. Real write rate is on the order of tens of GB per day, so it is not a near-term issue, but a GC that indexes per-session size and last access and evicts oldest-first is the next task.
 3. A more aggressive tail-only store, which cuts storage further, was implemented and shown to save space, but a regression where restore lookup misses the window groups' store timing left it off by default.
 4. This design assumes a single user with unbounded context. It optimizes for reaccess latency over throughput and for session persistence over fast session turnover, which is a different target from multi-tenant serving.
-5. There is no always-on output-audit gate yet. Both output-quality regressions surfaced in real use rather than from a synthetic probe. Turning garbled-output sweeps, tool-call batteries, and truncated-tool-call scenarios into a standing gate is the remaining work.
+5. The storage tier assumes shared storage that both nodes can see. On restore each worker reads its slice from the file the scheduler node wrote, over the shared mount, so a local per-node disk is not supported out of the box. The numbers here are on a network cache volume at about 1 GB/s, so the read-bound part of a restore (roughly half of the nine seconds: existence-check stats, promotion read, remote read) is limited by that link, not by SSD speed. Because the MLA KV is replicated across ranks, a local-disk mode where each node writes and reads its own copy on fast NVMe would likely bring a restore closer to four or five seconds. That mode is not implemented yet and is the natural next step.
+6. There is no always-on output-audit gate yet. Both output-quality regressions surfaced in real use rather than from a synthetic probe. Turning garbled-output sweeps, tool-call batteries, and truncated-tool-call scenarios into a standing gate is the remaining work.
 
 Treat this fork as experimental. It is a reference for pushing disk KV offloading to measured results on a two-node unified-memory homelab, not a production drop-in.
 
