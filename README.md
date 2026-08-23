@@ -1,6 +1,6 @@
 # vllm-ds4f-gb10
 
-> Experimental patch set on top of [vLLM](https://github.com/vllm-project/vllm) **v0.27.1**, for serving DeepSeek V4 Flash across two DGX Spark **GB10** nodes with unified memory. Single user, specific hardware, reference implementation, not a production guarantee.
+> Experimental patch set on top of [vLLM](https://github.com/vllm-project/vllm) **v0.27.1**, for serving DeepSeek V4 Flash across two DGX Spark **GB10** nodes with unified memory. Specific hardware, reference implementation, not a production guarantee.
 
 **Base:** vLLM v0.27.1. Build and install with vLLM's own instructions; this fork applies the patches below on top of that tree. License: Apache-2.0 (inherited from vLLM, see `LICENSE`).
 
@@ -14,9 +14,9 @@ Every change here is opt-in behind an env var and defaults to stock vLLM behavio
 
 # Keeping many long agent sessions resident: disk KV offloading for multi-node vLLM
 
-**The goal.** On two GB10 DGX Spark boxes with unified memory, keep five or more sessions of 400k+ tokens resident and instant to switch between, and let any older session that has been evicted come back without paying the full reprefill cost. That is the target this work was built for. Everything else, including the restore-time work, is in service of it.
+**The goal.** Run many long agent sessions at once, and never worry about a session's KV cache expiring or about re-paying its multi-minute prefill. On two GB10 DGX Spark boxes with unified memory that means keeping five or more sessions of 400k+ tokens resident and instant to switch between, and letting any older session that has been evicted come back without the full reprefill cost. That is the target this work was built for. Everything else, including the restore-time work, is in service of it.
 
-This is an experimental patch set on top of [vLLM](https://github.com/vllm-project/vllm) 0.27.1. It targets a specific setup (two DGX Spark GB10 nodes, unified memory, DeepSeek V4 Flash FP8, tensor parallel across the two nodes) and a single-user workload. It is a reference implementation, not a production guarantee. If you run something similar, the parts below should transfer; if you do not, read it as a case study.
+This is an experimental patch set on top of [vLLM](https://github.com/vllm-project/vllm) 0.27.1. It targets a specific setup (two DGX Spark GB10 nodes, unified memory, DeepSeek V4 Flash FP8, tensor parallel across the two nodes). It is a reference implementation, not a production guarantee. If you run something similar, the parts below should transfer; if you do not, read it as a case study.
 
 Author: nacyot.
 
@@ -153,7 +153,7 @@ An honest list.
 1. Much of the 9-second restore is still control-plane and storage-bandwidth bound. The GPU copy is 0.18 seconds; the rest is spread across lookup, remote reads, tail reprefill, and tokenization. The theoretical floor is roughly 6 to 7 seconds. Going lower needs a narrower lookup and promotion prefetch, and fundamentally the real answer is a bigger pool so sessions are not evicted in the first place, which is a hardware-scale question.
 2. The disk tier has no capacity cap or GC. Real write rate is on the order of tens of GB per day, so it is not a near-term issue, but a GC that indexes per-session size and last access and evicts oldest-first is the next task.
 3. A more aggressive tail-only store, which cuts storage further, was implemented and shown to save space, but a regression where restore lookup misses the window groups' store timing left it off by default.
-4. This design assumes a single user with unbounded context. It optimizes for reaccess latency over throughput and for session persistence over fast session turnover, which is a different target from multi-tenant serving.
+4. This design optimizes for keeping many long-lived sessions persistent and instantly reaccessible, trading raw throughput and fast session turnover for reaccess latency and session persistence. That is a different target from high-churn multi-tenant serving.
 5. The storage tier assumes shared storage that both nodes can see. On restore each worker reads its slice from the file the scheduler node wrote, over the shared mount, so a local per-node disk is not supported out of the box. The numbers here are on a network cache volume at about 1 GB/s, so the read-bound part of a restore (roughly half of the nine seconds: existence-check stats, promotion read, remote read) is limited by that link, not by SSD speed. Because the MLA KV is replicated across ranks, one copy suffices: the relay path (item 5 above) has a single rank read that copy and broadcast it to the others over the interconnect, so the store can sit on one node's local NVMe, an attached disk, or a network mount, and no per-node shared mount is required. It is opt-in and off by default; with it off, the default path still reads over the shared mount described here.
 6. There is no always-on output-audit gate yet. Both output-quality regressions surfaced in real use rather than from a synthetic probe. Turning garbled-output sweeps, tool-call batteries, and truncated-tool-call scenarios into a standing gate is the remaining work.
 
