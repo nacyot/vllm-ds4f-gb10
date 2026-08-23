@@ -70,6 +70,8 @@ Cold build (reprefill) versus disk restore, measured by force-evicting a session
 
 The speedup grows with session size, because reprefill accelerates with context while a disk read is linear.
 
+Those are the first-cut numbers. A later reworking of the restore path (see "From 28 seconds to 9" below) cut a comparable cold restore from about 28 seconds to about 9, so the current restore cost is well under half of what this table shows.
+
 But a disk restore is meant to be the rare case, not the common one. With the GPU pool set to 13 GiB (about 2.51M tokens), six sessions of about 370k tokens each stay fully resident on the GPU, and switching among them lands in 1.6 to 1.8 seconds every time. Only the seventh, evicted, session comes back from disk. In the six-resident-session qualification, store failures were zero and the memory headroom stayed comfortable.
 
 Concurrency was checked too. Evicting two sessions and reaccessing both at once, two 188k sessions came back in 13.4 and 20.4 seconds, 2,900 MB total, zero incidents. Demotion writes going down and promotion reads coming up overlap without the staging buffer breaking. The fresh-session control passed on every run: open an unrelated session right after a restore and output stays correct with acceptance intact.
