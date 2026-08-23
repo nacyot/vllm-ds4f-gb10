@@ -2,6 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 import asyncio
+import os
 from collections import defaultdict, deque
 from collections.abc import Iterable
 from dataclasses import dataclass
@@ -40,6 +41,21 @@ from vllm.v1.metrics.stats import (
 
 # shared empty CPU tensor used as a placeholder pooling output
 EMPTY_CPU_TENSOR = torch.empty(0, device="cpu")
+
+# Experimental, opt-in (DeepSeek V4 tool-call generation stabilization).
+# DSML is DeepSeek's tool-call markup dialect; the strict parser can fail to
+# match a slightly malformed opener and let raw DSML structure tokens leak
+# into visible content instead of being consumed as a tool call. When this
+# guard is on, surfacing either of those leak signatures stops the request
+# rather than letting the leak propagate into conversation history.
+_DSPARK_DSML_LEAK_GUARD = os.environ.get("DSPARK_DSML_LEAK_GUARD", "") == "1"
+# Token ids for the parser's unrecovered dialect opener/closer; seeing one
+# in the newly generated tokens means the recovery parser did not match.
+_DSPARK_DSML_DIALECT_TOKEN_IDS = frozenset({128840, 128841})
+# A valid DSML close tag is "</|DSML|...>"; a bare closer with the marker
+# dropped is itself a leak signature (the substring won't appear as a false
+# positive inside a well-formed tag).
+_DSPARK_DSML_BARE_CLOSERS = ("</invoke>", "</parameter>", "</result>")
 
 
 class RequestOutputCollector:
@@ -659,6 +675,22 @@ class OutputProcessor:
                 if stop_string:
                     finish_reason = FinishReason.STOP
                     stop_reason = stop_string
+
+                # Experimental, opt-in (DeepSeek V4 tool-call generation
+                # stabilization): if a DSML structure token surfaces without
+                # the tool-call parser having consumed it, stop the request
+                # rather than let raw DSML markup pollute the visible output
+                # (and, in an agent loop, get fed back into history).
+                if _DSPARK_DSML_LEAK_GUARD and finish_reason is None:
+                    leaked = any(
+                        t in _DSPARK_DSML_DIALECT_TOKEN_IDS for t in new_token_ids
+                    )
+                    if not leaked:
+                        tail = req_state.detokenizer.output_text[-64:]
+                        leaked = any(c in tail for c in _DSPARK_DSML_BARE_CLOSERS)
+                    if leaked:
+                        finish_reason = FinishReason.STOP
+                        stop_reason = "dspark_dsml_leak_guard"
 
                 # 3) Compute sample and prompt logprobs for request,
                 # if required.

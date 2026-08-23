@@ -3,6 +3,7 @@
 
 # Adapted from
 # https://github.com/lm-sys/FastChat/blob/168ccc29d3f7edc50823016105c024fe2282732a/fastchat/protocol/openai_api_protocol.py
+import os
 import time
 from typing import Annotated, Any, ClassVar, Literal
 
@@ -694,6 +695,12 @@ class ChatCompletionRequest(OpenAIBaseModel):
         if self.ec_transfer_params:
             # Pass in ec_transfer_params via extra_args
             extra_args["ec_transfer_params"] = self.ec_transfer_params
+        # Experimental, opt-in (DeepSeek V4 tool-call generation
+        # stabilization): tool-call structure tokens are brittle at
+        # temperature > 0, so force greedy sampling on tool-bearing
+        # requests when the operator opts in.
+        if os.environ.get("DSPARK_TOOL_TEMP0", "") == "1" and self.tools:
+            temperature = 0.0
         return SamplingParams.from_optional(
             n=self.n,
             presence_penalty=self.presence_penalty,

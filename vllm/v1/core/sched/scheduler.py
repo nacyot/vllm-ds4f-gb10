@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 import itertools
+import os
 import time
 from collections import defaultdict, deque
 from collections.abc import Iterable
@@ -2144,6 +2145,12 @@ class Scheduler(SchedulerInterface):
                 self.encoder_cache_manager.free_encoder_input(request, input_id)
 
     def update_draft_token_ids(self, draft_token_ids: DraftTokenIds) -> None:
+        # Experimental, opt-in (DeepSeek V4 tool-call generation
+        # stabilization): speculative decoding against a guided/tools
+        # request forces every draft token through grammar validation,
+        # which is a bad match for tool-call structure tokens and can
+        # derail the request. Read the gate once per call, not per request.
+        spec_off_guided = os.environ.get("DSPARK_SPEC_OFF_GUIDED", "") == "1"
         for req_id, spec_token_ids in zip(
             draft_token_ids.req_ids,
             draft_token_ids.draft_token_ids,
@@ -2157,6 +2164,14 @@ class Scheduler(SchedulerInterface):
                 # Ignore draft tokens for prefill chunks.
                 if request.spec_token_ids:
                     request.spec_token_ids = []
+                continue
+
+            if spec_off_guided and request.use_structured_output:
+                # Drop the draft for this request only: an empty draft
+                # makes the next scheduler step skip spec verification
+                # for it, i.e. per-request opt-out rather than a global
+                # speculation toggle.
+                request.spec_token_ids = []
                 continue
 
             # Add newly generated spec token ids to the request.
