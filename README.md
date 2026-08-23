@@ -8,6 +8,8 @@
 
 Every change here is opt-in behind an env var and defaults to stock vLLM behavior. The blog below is the main content; a short knob index follows it.
 
+(한국어: [README.ko.md](README.ko.md))
+
 ---
 
 # Keeping many long agent sessions resident: disk KV offloading for multi-node vLLM
