@@ -76,6 +76,16 @@ All numbers here are on shared network storage at about 1 GB/s (see the limits s
 
 The "initial" column is the first working version; the "reworked" column is after the restore-path rework described in "From 28 seconds to 9" below, measured at 25.5 to 9.1 seconds on a 381k session. Small sessions were not re-measured because their stat cost was already small, so their gain is modest; the win concentrates on large sessions where serial existence-checks dominated. The speedup over reprefill grows with session size, because reprefill accelerates with context while a disk read is linear: a reworked 469k restore is roughly a 48x speedup over its 435 second reprefill.
 
+Relay path (item 5) on a single node's local NVMe, same force-evict-and-reaccess method:
+
+| Session size | Local-NVMe restore |
+|---|---|
+| 76k tokens | 2.6 s |
+| 352k tokens | 7.5 s |
+
+- Non-reading rank disk I/O, store and restore: 0 bytes.
+- Four 457k-token sessions resident together: switching among them 1.7 to 2.1 s each.
+
 But a disk restore is meant to be the rare case, not the common one. With the GPU pool set to 13 GiB (about 2.51M tokens), six sessions of about 370k tokens each stay fully resident on the GPU, and switching among them lands in 1.6 to 1.8 seconds every time. Only the seventh, evicted, session comes back from disk. In the six-resident-session qualification, store failures were zero and the memory headroom stayed comfortable.
 
 Concurrency was checked too. Evicting two sessions and reaccessing both at once, two 188k sessions came back in 13.4 and 20.4 seconds, 2,900 MB total, zero incidents. Demotion writes going down and promotion reads coming up overlap without the staging buffer breaking. The fresh-session control passed on every run: open an unrelated session right after a restore and output stays correct with acceptance intact.
