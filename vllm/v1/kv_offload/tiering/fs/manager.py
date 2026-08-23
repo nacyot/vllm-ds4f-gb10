@@ -17,6 +17,7 @@ File naming:  <base_path>_r<rank>/<hhh>/<hh>_g<group_idx>/<hash_hex>.bin
 
 import functools
 import json
+import math
 import os
 from collections.abc import Iterable
 from typing import TYPE_CHECKING, ClassVar
@@ -79,6 +80,38 @@ def _kv_event(rec):
             _f.write(_ev_json.dumps(rec, separators=(",", ":")) + "\n")
     except OSError:
         pass
+
+
+def _env_int(name: str, default: int = 1) -> int:
+    try:
+        return int(os.environ.get(name, "") or default)
+    except ValueError:
+        return default
+
+
+# Fan the store/load batch across a small threadpool. Both paths are
+# I/O-bound (CIFS/NFS round trips or O_DIRECT reads release the GIL), so
+# splitting one large batch across DSPARK_FS_{LOAD,STORE}_TASKS threads
+# shortens wall time without changing what gets read or written. Default
+# 1 = a single task, i.e. today's behavior.
+_FS_LOAD_TASKS = _env_int("DSPARK_FS_LOAD_TASKS", 1)
+_FS_STORE_TASKS = _env_int("DSPARK_FS_STORE_TASKS", 1)
+
+
+def _fanout_tasks(fn, paths, view, offs, sizes, use_o_direct, fan):
+    """Split one batch into up to `fan` tasks, each a partial over a slice."""
+    if fan <= 1 or len(paths) <= 1:
+        return [functools.partial(fn, paths, view, offs, sizes, use_o_direct)]
+    n = len(paths)
+    per = max(1, math.ceil(n / fan))
+    tasks = []
+    for i in range(0, n, per):
+        sl = slice(i, i + per)
+        sz = sizes[sl] if isinstance(sizes, list) else sizes
+        tasks.append(
+            functools.partial(fn, paths[sl], view, offs[sl], sz, use_o_direct)
+        )
+    return tasks
 
 
 class FsAsyncLookupManager(AsyncLookupManager):
@@ -276,34 +309,29 @@ class FileSystemTierManager(SecondaryTierManager):
     def submit_store(self, job_metadata: JobMetadata) -> None:
         if self.events is not None:
             self._store_job_keys[job_metadata.job_id] = list(job_metadata.keys)
-        task = functools.partial(
-            batch_store_block,
-            [self.file_mapper.get_file_name(key) for key in job_metadata.keys],
-            self._primary_kv_view,
-            *self._key_offsets_sizes(
-                list(job_metadata.keys), job_metadata.block_ids
-            ),
-            self._use_o_direct,
+        keys = list(job_metadata.keys)
+        paths = [self.file_mapper.get_file_name(key) for key in keys]
+        offs, sizes = self._key_offsets_sizes(keys, job_metadata.block_ids)
+        tasks = _fanout_tasks(
+            batch_store_block, paths, self._primary_kv_view, offs, sizes,
+            self._use_o_direct, _FS_STORE_TASKS,
         )
         _kv_event({"op": "store", "job": job_metadata.job_id,
-                   "chunks": len(job_metadata.keys)})
-        self._pool.enqueue_store(job_metadata.job_id, 1, [task])
+                   "chunks": len(keys)})
+        self._pool.enqueue_store(job_metadata.job_id, len(tasks), tasks)
 
     @override
     def submit_load(self, job_metadata: JobMetadata) -> None:
-        task = functools.partial(
-            batch_load_block,
-            [self.file_mapper.get_file_name(key) for key in job_metadata.keys],
-            self._primary_kv_view,
-            *self._key_offsets_sizes(
-                list(job_metadata.keys), job_metadata.block_ids
-            ),
-            self._use_o_direct,
+        keys = list(job_metadata.keys)
+        paths = [self.file_mapper.get_file_name(key) for key in keys]
+        offs, sizes = self._key_offsets_sizes(keys, job_metadata.block_ids)
+        tasks = _fanout_tasks(
+            batch_load_block, paths, self._primary_kv_view, offs, sizes,
+            self._use_o_direct, _FS_LOAD_TASKS,
         )
-
         _kv_event({"op": "load", "job": job_metadata.job_id,
-                   "chunks": len(job_metadata.keys)})
-        self._pool.enqueue_load(job_metadata.job_id, 1, [task])
+                   "chunks": len(keys)})
+        self._pool.enqueue_load(job_metadata.job_id, len(tasks), tasks)
 
     @override
     def get_finished_jobs(self) -> Iterable[JobResult]:
