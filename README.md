@@ -52,6 +52,8 @@ The fix removes the failure at the source rather than working around it. There a
 
 **4. Direction-split swap path.** Copies between GPU and staging use a different kernel per direction. Demotion (writing GPU to staging) goes through a batch-copy path; load (reading staging to GPU) uses a Triton kernel. Submitting large batches down one path collapsed the Blackwell driver frontend (it showed up as a clean bisection where large restores deterministically killed the GPU), and splitting by direction avoids it.
 
+**5. TP-broadcast relay restore (opt-in).** Worker-direct pread assumes every rank can reach the store files, that is, shared storage. An alternative path has one rank (TP local rank 0) read the canonical files and broadcast the loaded bytes to the other ranks over the tensor-parallel process group. Because the KV is replicated across ranks, one read suffices, so only that one node needs the storage and the rest receive their copy over the fast interconnect. This turns the storage location into a free choice: a single node internal NVMe, an attached disk, or a network mount all behave the same, instead of requiring a mount every node can see. The broadcast is chunked into fixed-size windows (256 MiB by default) so the transient GPU staging buffer stays bounded and large-session restores stay within the configured memory budget on unified memory. Opt-in behind `DSPARK_RELAY_RESTORE`, default off.
+
 A few smaller repairs ride along: a spec-decode asymmetry in the indexer cache, hole-skipping for partially populated blocks, and a writer-rotation half-write. All together this is around 700 lines, packaged as idempotent patch scripts so it can be reapplied after a reinstall.
 
 The first time this pipeline ran, the GPU died deterministically right after a restore (Xid 13). After eliminating eight software hypotheses one by one, the cause turned out to be the GPU driver; upgrading it made the symptom vanish. The lesson, paid for in hours: the thing that just changed being your code does not make your code the culprit.
@@ -128,6 +130,7 @@ Beyond the disk offloading recipe above, this tree carries a few more experiment
 
 - **Restore-path parallelism** (see "From 28 seconds to 9"): `DSPARK_FS_LOOKUP_THREADS`, `DSPARK_FS_LOAD_TASKS`, `DSPARK_FS_STORE_TASKS`, `DSPARK_FS_PREAD_THREADS`, `DSPARK_FS_PREAD_WINDOW`, `DSPARK_FS_PREAD_SKIP`.
 - **Per-event KV JSONL log** for offline analysis of restore/store episodes: `DSPARK_KV_EVENT_LOG=/path/file.jsonl`.
+- **TP-broadcast relay restore** so only one node needs the store files (one rank reads, broadcasts to the rest over the TP group, so storage location becomes a free choice): `DSPARK_RELAY_RESTORE=1`. Broadcast window size: `DSPARK_RELAY_WINDOW_BYTES=268435456` (256 MiB).
 - **DeepSeek V4 tool-call generation stabilization** (experimental, still under validation): `DSPARK_SPEC_OFF_GUIDED` (opt a tools request out of speculative-decode grammar validation), `DSPARK_DSML_LEAK_GUARD` (stop a request if tool-call markup tokens leak into free text), `DSPARK_TOOL_TEMP0` (force temperature 0 on tool turns so structure tokens stay deterministic).
 - **GB10 kernel and backend knobs**: opt-in B12X MXFP4 MoE backend, DeepGemm opt-in for the mHC pre-norm path, e8m0 block-scale upcast for the Triton path, DSpark draft attention backend pinning, MLA index-width rounding.
 
