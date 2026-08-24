@@ -27,7 +27,13 @@ def compute_fp8_einsum_recipe() -> tuple[tuple[int, int, int], bool]:
     """
     cap = current_platform.get_device_capability()
     assert cap is not None, "DeepseekV4 attention requires a CUDA device"
-    return deepseek_v4_fp8_einsum_config(cap.major)
+    # sm120-port: force the base-compatible recipe on GB10.
+    # Our vendored DeepGEMM build expects (1, 1, 128) + TMA-aligned scales
+    # (as the stock 0.27.1 o_proj used); the jasl (1, 128, 128) legacy layout
+    # fails DeepGEMM layout.hpp assert sf.size(-2)==ceil_div(mn, gran_mn).
+    einsum_recipe = (1, 128, 128) if cap.major <= 9 else (1, 1, 128)
+    tma_aligned_scales = cap.major >= 10
+    return einsum_recipe, tma_aligned_scales
 
 
 def deep_gemm_fp8_o_proj(
