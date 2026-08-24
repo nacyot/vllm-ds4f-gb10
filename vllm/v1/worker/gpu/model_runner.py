@@ -1571,7 +1571,9 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             spec_hidden_states = hidden_states
             if hasattr(self.model, "get_mtp_target_hidden_states"):
                 pre_hc_hidden_states = self.model.get_mtp_target_hidden_states()
-                spec_hidden_states = pre_hc_hidden_states[: hidden_states.shape[0]]  # type: ignore[union-attr]
+                # sm120-port: jasl model may return None here; only slice when populated.
+                if pre_hc_hidden_states is not None:
+                    spec_hidden_states = pre_hc_hidden_states[: hidden_states.shape[0]]  # type: ignore[union-attr]
             draft_tokens = self.speculator.propose(
                 input_batch,
                 attn_metadata,
