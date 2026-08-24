@@ -64,6 +64,7 @@ from vllm.v1.kv_cache_interface import (
     MLAAttentionSpec,
     get_kv_quant_mode,
 )
+from vllm.v1.worker.ubatching import dbo_current_ubatch_id
 
 logger = init_logger(__name__)
 
@@ -120,6 +121,32 @@ def _resolve_dsv4_kv_cache_dtype(
     return kv_cache_dtype, torch.bfloat16
 
 
+def resolve_layer_compress_ratio(config, layer_id: int) -> tuple[int, bool]:
+    """Resolve (operational_compress_ratio, use_unscaled_rope) for a layer.
+
+    NOTE(zyongye) Compress ratio can't be 0; historically every layer_id >=
+    num_hidden_layers (the MTP draft layer) was mapped to 1 because "MTP layer
+    is not included in the compress ratio list". Some checkpoints DO include
+    their MTP draft layer in compress_ratios, with an entry of 0 meaning
+    uncompressed KV and plain (unscaled) rope. The operational ratio stays
+    clamped to >= 1 (KV-cache specs treat 1 as "no compression" and divide by
+    it); a raw 0 only selects unscaled rope for that layer.
+    """
+    if layer_id < config.num_hidden_layers:
+        return max(1, config.compress_ratios[layer_id]), False
+    if layer_id < len(config.compress_ratios):
+        raw_compress_ratio = config.compress_ratios[layer_id]
+        return max(1, raw_compress_ratio), raw_compress_ratio == 0
+    # Draft-module layer past the end of compress_ratios. Every real
+    # checkpoint declares draft blocks with a trailing 0 per block (0731
+    # ships [..., 0, 0, 0] for its three DSpark blocks), and the reference
+    # implementation indexes the list directly -- a short list is a config
+    # gap, not a request for yarn. Returning (1, False) here handed draft
+    # blocks yarn-scaled rope with the base rope_theta, inconsistent with
+    # their in-range siblings (jasl/vllm#30). Treat the missing entry as 0.
+    return 1, True
+
+
 class DeepseekV4Attention(nn.Module, AttentionLayerBase, ABC):
     """DeepseekV4 MLA attention layer.
 
@@ -134,6 +161,8 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase, ABC):
 
     # Provided by the platform subclass.
     backend_cls: ClassVar[type[AttentionBackend]]
+    # Backend for the SWA cache layer; None uses the default SWA backend.
+    swa_backend_cls: ClassVar[type[AttentionBackend] | None] = None
     # KV-cache per-token block format (both layouts are paged). True (default)
     # = fp8_ds_mla (UE8M0 block-scaled fp8 packed as uint8); False = plain
     # bf16 / per-tensor fp8 KV row. Backends can override the instance hook when
@@ -143,6 +172,9 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase, ABC):
     # workspace allocated in _forward_prefill and is also read by the dummy-run
     # path to pre-reserve that workspace.
     PREFILL_CHUNK_SIZE: ClassVar[int] = 4
+    _q_padded_scratch_by_key: ClassVar[
+        dict[tuple[str, int, int, torch.dtype, int, int], torch.Tensor]
+    ] = {}
 
     @classmethod
     @abstractmethod
@@ -204,13 +236,9 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase, ABC):
         self.n_groups = config.o_groups
         self.n_local_groups = self.n_groups // tp_size
         self.window_size = config.sliding_window
-        # NOTE(zyongye) Compress ratio can't be 0
-        # we do this for because MTP layer is not included
-        # in the compress ratio list
-        if layer_id < config.num_hidden_layers:
-            self.compress_ratio = max(1, config.compress_ratios[layer_id])
-        else:
-            self.compress_ratio = 1
+        self.compress_ratio, use_unscaled_rope = resolve_layer_compress_ratio(
+            config, layer_id
+        )
         self.eps = config.rms_norm_eps
         self.scale = self.head_dim**-0.5
 
@@ -268,6 +296,7 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase, ABC):
             rope_head_dim=self.rope_head_dim,
             max_position_embeddings=config.max_position_embeddings,
             compress_ratio=self.compress_ratio,
+            use_unscaled_rope=use_unscaled_rope,
         )
         self.indexer_rotary_emb = self.rotary_emb
         self.topk_indices_buffer = topk_indices_buffer
@@ -309,6 +338,10 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase, ABC):
             vllm_config.scheduler_config.max_num_batched_tokens
         )
         self.max_model_len = vllm_config.model_config.max_model_len
+        self._q_padded_scratch_num_ubatches = (
+            2 if vllm_config.parallel_config.enable_dbo else 1
+        )
+        self._q_padded_scratch_dtype = vllm_config.model_config.dtype
 
         # Resolve the kv-cache dtype from this backend's block format. The same
         # resolution drives the SWA cache tensor dtype below.
@@ -322,6 +355,7 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase, ABC):
             dtype=self.kv_cache_torch_dtype,
             prefix=f"{prefix}.swa_cache",
             cache_config=cache_config,
+            backend_cls=self.swa_backend_cls,
         )
 
         # Register with compilation context for metadata lookup.
@@ -347,6 +381,94 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase, ABC):
                 eager_scratch_pool=eager_scratch_pool,
             )
 
+    @staticmethod
+    def _q_padded_scratch_device_index(device: torch.device) -> int:
+        if device.index is not None:
+            return int(device.index)
+        if device.type == "cuda":
+            return int(torch.cuda.current_device())
+        return -1
+
+    @classmethod
+    def _reserve_q_padded_scratch_buffer(
+        cls,
+        num_tokens: int,
+        padded_heads: int,
+        head_dim: int,
+        dtype: torch.dtype,
+        device: torch.device,
+        ubatch_id: int,
+    ) -> torch.Tensor:
+        key = (
+            device.type,
+            cls._q_padded_scratch_device_index(device),
+            ubatch_id,
+            dtype,
+            padded_heads,
+            head_dim,
+        )
+        scratch = cls._q_padded_scratch_by_key.get(key)
+        if scratch is not None and scratch.shape[0] >= num_tokens:
+            return scratch
+
+        old_scratch = cls._q_padded_scratch_by_key.pop(key, None)
+        if old_scratch is not None:
+            del old_scratch
+            torch.accelerator.empty_cache()
+
+        scratch = torch.empty(
+            (num_tokens, padded_heads, head_dim),
+            dtype=dtype,
+            device=device,
+        )
+        cls._q_padded_scratch_by_key[key] = scratch
+        return scratch
+
+    def _get_q_padded_scratch(self, q: torch.Tensor) -> torch.Tensor:
+        # dtype is part of the buffer cache key, and reserve_profile_scratch
+        # reserves under model_config.dtype while this reads under the runtime
+        # q.dtype. If they ever diverge the profile run warms a buffer nobody
+        # reads and the real one is allocated lazily afterwards -- which is
+        # exactly the post-profiling OOM the reservation exists to prevent
+        # (jasl/vllm#26). Keep the assumption loud rather than implicit.
+        assert q.dtype == self._q_padded_scratch_dtype, (
+            f"q dtype {q.dtype} differs from the reserved scratch dtype "
+            f"{self._q_padded_scratch_dtype}; the profile-run reservation would "
+            "not be reused."
+        )
+        num_tokens = q.shape[0]
+        reserved_tokens = max(num_tokens, int(self.max_num_batched_tokens))
+        scratch = self._reserve_q_padded_scratch_buffer(
+            reserved_tokens,
+            int(self.padded_heads),
+            int(self.head_dim),
+            q.dtype,
+            q.device,
+            dbo_current_ubatch_id(),
+        )
+        return scratch[:num_tokens]
+
+    def _qnorm_rope_can_write_inplace(self) -> bool:
+        return self.n_local_heads == self.padded_heads
+
+    def reserve_profile_scratch(self) -> None:
+        if self.kv_cache_torch_dtype != torch.uint8:
+            return
+        if self._qnorm_rope_can_write_inplace():
+            return
+        device = self.q_norm.weight.device
+        if device.type not in ("cuda", "xpu"):
+            return
+        for ubatch_id in range(self._q_padded_scratch_num_ubatches):
+            self._reserve_q_padded_scratch_buffer(
+                max(1, int(self.max_num_batched_tokens)),
+                int(self.padded_heads),
+                int(self.head_dim),
+                self._q_padded_scratch_dtype,
+                device,
+                ubatch_id,
+            )
+
     def forward(
         self,
         positions: torch.Tensor,
@@ -362,11 +484,10 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase, ABC):
             device=hidden_states.device,
         )
 
-        # Metadata-independent input GEMMs + RMSNorm stay in the captured
-        # graph; the metadata-dependent rest (q up-proj + kv-insert, indexer,
-        # compressor, MLA attention) runs in the eager break.
+        # Keep the attention input preparation in the captured graph. Only the
+        # sparse indexer and MLA attention run in the eager break below.
         qr_kv, kv_score, indexer_kv_score, indexer_weights = (
-            self.attn_gemm_parallel_execute(hidden_states)
+            self._run_parallel_input_projections(hidden_states)
         )
         qr, kv = qr_kv.split([self.q_lora_rank, self.head_dim], dim=-1)
         qr, kv = fused_q_kv_rmsnorm(
@@ -377,16 +498,62 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase, ABC):
             self.eps,
         )
 
-        # attention_impl is wrapped with @eager_break_during_capture: this is
-        # where the breakable cudagraph capture breaks (the attention op runs
-        # eagerly between captured graph segments).
-        self.attention_impl(
+        attn_metadata = get_forward_context().attn_metadata
+        indexer = self.indexer
+        compressor = self.compressor
+        aux_streams = self.aux_stream_list
+
+        def project_query_and_cache_kv() -> torch.Tensor:
+            q = self.wq_b(qr).view(-1, self.n_local_heads, self.head_dim)
+            return self._fused_qnorm_rope_kv_insert(q, kv, positions, attn_metadata)
+
+        index_q: torch.Tensor | None = None
+        index_q_scale: torch.Tensor | None = None
+        index_weights_out: torch.Tensor | None = None
+
+        # Keep Q projection and KV insertion on the default stream. The indexer
+        # and MLA compressor use aux streams 0 and 1; aux 2 is internal to the
+        # indexer. ROCm runs the same work sequentially without aux streams.
+        if indexer is not None:
+            assert compressor is not None
+            q, (indexer_inputs, _) = execute_in_parallel(
+                project_query_and_cache_kv,
+                [
+                    lambda: indexer(
+                        hidden_states,
+                        qr,
+                        indexer_kv_score,
+                        indexer_weights,
+                        positions,
+                        self.indexer_rotary_emb,
+                    ),
+                    lambda: compressor(kv_score, positions, self.rotary_emb),
+                ],
+                self.ln_events[0],
+                [self.ln_events[1], self.ln_events[2]],
+                [aux_streams[0], aux_streams[1]] if aux_streams is not None else None,
+                enable=aux_streams is not None,
+            )
+            index_q, index_q_scale, index_weights_out = indexer_inputs
+        elif compressor is not None:
+            aux_stream = aux_streams[0] if aux_streams is not None else None
+            q, _ = maybe_execute_in_parallel(
+                project_query_and_cache_kv,
+                lambda: compressor(kv_score, positions, self.rotary_emb),
+                self.ln_events[0],
+                self.ln_events[1],
+                aux_stream,
+            )
+        else:
+            q = project_query_and_cache_kv()
+
+        self._sparse_indexer_and_attn(
             hidden_states,
-            qr,
+            index_q,
+            index_q_scale,
+            index_weights_out,
+            q,
             kv,
-            kv_score,
-            indexer_kv_score,
-            indexer_weights,
             positions,
             o_padded,
         )
@@ -396,11 +563,20 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase, ABC):
         return self._o_proj(o, positions)
 
     def _fused_wqa_wkv_gemm(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        # Override point: the ROCm layer preshuffles this weight in place, so
+        # it cannot go through fused_wqa_wkv directly.
         # MergedColumnParallelLinear returns (output, bias); bias is None.
         qr_kv, _ = self.fused_wqa_wkv(hidden_states)
         return qr_kv
 
-    def attn_gemm_parallel_execute(self, hidden_states) -> tuple[Any, ...]:
+    def _run_parallel_input_projections(
+        self, hidden_states: torch.Tensor
+    ) -> tuple[
+        torch.Tensor,
+        torch.Tensor | None,
+        torch.Tensor | None,
+        torch.Tensor | None,
+    ]:
         aux_streams = self.aux_stream_list
         if aux_streams is not None:
             assert len(aux_streams) >= 3
@@ -443,11 +619,8 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase, ABC):
             aux_fns[1] = indexer_weights_proj
             aux_fns[2] = indexer_compressor_kv_score
 
-        def fused_wqa_wkv() -> torch.Tensor:
-            return self._fused_wqa_wkv_gemm(hidden_states)
-
         qr_kv, (kv_score, indexer_weights, indexer_kv_score) = execute_in_parallel(
-            fused_wqa_wkv,
+            lambda: self._fused_wqa_wkv_gemm(hidden_states),
             aux_fns,
             self.ln_events[0],
             self.ln_events[1:4],
@@ -459,81 +632,26 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase, ABC):
         return qr_kv, kv_score, indexer_kv_score, indexer_weights
 
     @eager_break_during_capture
-    def attention_impl(
+    def _sparse_indexer_and_attn(
         self,
         hidden_states: torch.Tensor,
-        qr: torch.Tensor,
+        index_q: torch.Tensor | None,
+        index_q_scale: torch.Tensor | None,
+        index_weights: torch.Tensor | None,
+        q: torch.Tensor,
         kv: torch.Tensor,
-        kv_score: torch.Tensor,
-        indexer_kv_score: torch.Tensor,
-        indexer_weights: torch.Tensor,
         positions: torch.Tensor,
-        out: torch.Tensor,  # [num_tokens, padded_heads, head_dim], written in place
+        out: torch.Tensor,
     ) -> None:
-        forward_context = get_forward_context()
-        attn_metadata = forward_context.attn_metadata
-
-        # wq_b + kv_insert (+ MLA compressor when an indexer is present) ride
-        # on the default stream so q stays on its consumer stream (forward_mqa
-        # downstream reads q on default). Indexer/compressor go on aux for
-        # overlap with default's GEMM + cache write.
-        if self.indexer is not None:
-            aux_streams = self.aux_stream_list
-            indexer = self.indexer
-            # Local ref so the closure keeps a non-None type for mypy.
-            assert self.compressor is not None
-            compressor = self.compressor
-
-            def wq_b_kv_insert() -> torch.Tensor:
-                q = self.wq_b(qr).view(-1, self.n_local_heads, self.head_dim)
-                q = self._fused_qnorm_rope_kv_insert(q, kv, positions, attn_metadata)
-                return q
-
-            # 3-way overlap (matches TRT-LLM PR #14142 Level 1): default runs
-            # wq_b+kv_insert; slot [0] runs the full indexer; slot [1] runs the
-            # MLA compressor. Slot [2] is reserved for the indexer's inner
-            # overlap. ROCm (aux_streams is None) falls back to sequential.
-            q, _ = execute_in_parallel(
-                wq_b_kv_insert,
-                [
-                    lambda: indexer(
-                        hidden_states,
-                        qr,
-                        indexer_kv_score,
-                        indexer_weights,
-                        positions,
-                        self.indexer_rotary_emb,
-                    ),
-                    lambda: compressor(kv_score, positions, self.rotary_emb),
-                ],
-                self.ln_events[0],
-                [self.ln_events[1], self.ln_events[2]],
-                [aux_streams[0], aux_streams[1]] if aux_streams is not None else None,
-                enable=aux_streams is not None,
+        if self.indexer is not None and index_q is not None:
+            assert index_weights is not None
+            q_quant = (index_q, index_q_scale) if index_q_scale is not None else index_q
+            self.indexer.indexer_op(
+                hidden_states,
+                q_quant,
+                None,
+                index_weights,
             )
-        elif self.compressor is not None:
-            # wq_b + kv_insert on default, compressor on aux.
-            aux_stream = (
-                self.aux_stream_list[0] if self.aux_stream_list is not None else None
-            )
-            compressor = self.compressor
-
-            def wq_b_kv_insert() -> torch.Tensor:
-                q = self.wq_b(qr).view(-1, self.n_local_heads, self.head_dim)
-                q = self._fused_qnorm_rope_kv_insert(q, kv, positions, attn_metadata)
-                return q
-
-            q, _ = maybe_execute_in_parallel(
-                wq_b_kv_insert,
-                lambda: compressor(kv_score, positions, self.rotary_emb),
-                self.ln_events[0],
-                self.ln_events[1],
-                aux_stream,
-            )
-        else:
-            # SWA-only layer: no compressor, no overlap.
-            q = self.wq_b(qr).view(-1, self.n_local_heads, self.head_dim)
-            q = self._fused_qnorm_rope_kv_insert(q, kv, positions, attn_metadata)
 
         # MLA attention writes into the pre-allocated `out` buffer
         # ([num_tokens, padded_heads, head_dim]).
@@ -551,6 +669,10 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase, ABC):
         if not isinstance(attn_metadata, dict):
             # Profile run: kernel doesn't fire; produce a padded tensor so
             # downstream FlashMLA gets the right shape.
+            if self.kv_cache_torch_dtype == torch.uint8:
+                if self._qnorm_rope_can_write_inplace():
+                    return q
+                return self._get_q_padded_scratch(q)
             if self.n_local_heads < self.padded_heads:
                 return F.pad(
                     q,
@@ -576,27 +698,26 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase, ABC):
         if cache_dtype == torch.uint8:
             # fp8_ds_mla UE8M0 paged path. Horizontally fused:
             #   Q side:  per-head RMSNorm (no weight) + GPT-J RoPE, zero-filling
-            #            the padding head slots.
+            #            the padding head slots into a reusable q buffer.
             #   KV side: GPT-J RoPE + UE8M0 FP8 quant + paged cache insert.
             swa_kv_cache_2d = swa_kv_cache.view(swa_kv_cache.shape[0], -1)
-            if self.eager_scratch_pool is not None:
+            # Writing Q in place is free whenever padded_heads == n_local_heads,
+            # which holds on SM12x TP=2, so prefer it over any scratch buffer.
+            # Otherwise reuse upstream's eager-break pool when present, and fall
+            # back to our own class scratch. All three satisfy the op's
+            # q_out.size(1) == q_head_padded contract: _select_dsv4_attn_cls
+            # yields one attention class model-wide, so the pool's
+            # padded_q_heads equals every layer's self.padded_heads.
+            if self._qnorm_rope_can_write_inplace():
+                q_out = q
+            elif self.eager_scratch_pool is not None:
                 q_out = self.eager_scratch_pool.q_out(q.shape[0])
-                torch.ops._C.fused_deepseek_v4_qnorm_rope_kv_rope_quant_insert_out(
-                    q,
-                    kv,
-                    q_out,
-                    swa_kv_cache_2d,
-                    swa_metadata.slot_mapping,
-                    positions,
-                    cos_sin_cache,
-                    self.padded_heads,
-                    self.eps,
-                    swa_metadata.block_size,
-                )
-                return q_out
-            return torch.ops._C.fused_deepseek_v4_qnorm_rope_kv_rope_quant_insert(
+            else:
+                q_out = self._get_q_padded_scratch(q)
+            torch.ops._C.fused_deepseek_v4_qnorm_rope_kv_rope_quant_insert_out(
                 q,
                 kv,
+                q_out,
                 swa_kv_cache_2d,
                 swa_metadata.slot_mapping,
                 positions,
@@ -605,6 +726,7 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase, ABC):
                 self.eps,
                 swa_metadata.block_size,
             )
+            return q_out
 
         # Plain-row path: the [num_blocks, block_size, 512] cache stores the KV
         # row in its element dtype (no Q padding). bf16 rewrites q in place;
@@ -836,7 +958,7 @@ class DeepseekV4Indexer(nn.Module):
         indexer_weights: torch.Tensor,
         positions: torch.Tensor,
         rotary_emb: nn.Module,
-    ) -> torch.Tensor:
+    ) -> tuple[torch.Tensor | None, torch.Tensor | None, torch.Tensor | None]:
         compressor = self.compressor
 
         attn_metadata = get_forward_context().attn_metadata
@@ -860,7 +982,7 @@ class DeepseekV4Indexer(nn.Module):
                         PADDED_TOP_K=triton.next_power_of_2(self.topk_tokens),
                         num_warps=8,
                     )
-                return self.topk_indices_buffer
+                return None, None, None
 
         def wq_b_and_q_quant():
             # ReplicatedLinear returns (output, bias); bias is None.
@@ -882,11 +1004,15 @@ class DeepseekV4Indexer(nn.Module):
 
         # compressor returns None and writes K to the indexer KV cache; the
         # join orders that write before indexer_op (skip_k_cache_insert=True).
-        (q_quant, weights), k = maybe_execute_in_parallel(
+        (q_quant, weights), _ = maybe_execute_in_parallel(
             wq_b_and_q_quant,
             lambda: compressor(compressed_kv_score, positions, rotary_emb),
             self.ln_events[0],
             self.ln_events[1],
             self.aux_stream,
         )
-        return self.indexer_op(hidden_states, q_quant, k, weights)
+        if isinstance(q_quant, tuple):
+            q, q_scale = q_quant
+        else:
+            q, q_scale = q_quant, None
+        return q, q_scale, weights

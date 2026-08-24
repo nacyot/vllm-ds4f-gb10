@@ -1,10 +1,15 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-import os
-
 import torch
 
+from vllm.platforms import current_platform
 from vllm.utils.torch_utils import direct_register_custom_op
+
+
+def _use_tf32_hc_prenorm_gemm() -> bool:
+    from vllm.utils.deep_gemm import is_deep_gemm_supported
+
+    return current_platform.is_device_capability_family(120) or is_deep_gemm_supported()
 
 
 def _torch_hc_prenorm_gemm(
@@ -164,13 +169,8 @@ def mhc_pre_tilelang(
     residual_flat = residual.view(-1, hc_mult, hidden_size)
     num_tokens = residual_flat.shape[0]
 
-    from vllm.utils.deep_gemm import is_deep_gemm_supported
-
-    use_deep_gemm = (
-        is_deep_gemm_supported()
-        and os.environ.get("DSPARK_MHC_DEEPGEMM", "0") == "1"
-    )
-    if use_deep_gemm:
+    use_tf32_hc_prenorm_gemm = _use_tf32_hc_prenorm_gemm()
+    if use_tf32_hc_prenorm_gemm:
         # these numbers are from deepgemm kernel impl
         block_k = 64
         block_m = 64
@@ -196,7 +196,7 @@ def mhc_pre_tilelang(
     )
 
     residual_2d = residual_flat.view(num_tokens, hc_mult * hidden_size)
-    if use_deep_gemm:
+    if use_tf32_hc_prenorm_gemm:
         tf32_hc_prenorm_gemm(
             residual_2d,
             fn,
@@ -355,15 +355,6 @@ def mhc_pre_broadcast_tilelang(
 
     n_splits = compute_num_split(64, hidden_size, cdiv(num_tokens, 64))
 
-    from vllm.utils.deep_gemm import is_deep_gemm_supported
-
-    _use_deep_gemm_bcast = (
-        is_deep_gemm_supported()
-        and os.environ.get("DSPARK_MHC_DEEPGEMM", "0") == "1"
-    )
-    if not _use_deep_gemm_bcast:
-        n_splits = 1
-
     residual_out = torch.empty(
         num_tokens, hc_mult, hidden_size, dtype=torch.bfloat16, device=residual.device
     )
@@ -383,20 +374,15 @@ def mhc_pre_broadcast_tilelang(
         n_splits, num_tokens, dtype=torch.float32, device=residual.device
     )
 
-    if _use_deep_gemm_bcast:
-        from vllm.utils.deep_gemm import tf32_hc_prenorm_gemm
+    from vllm.utils.deep_gemm import tf32_hc_prenorm_gemm
 
-        tf32_hc_prenorm_gemm(
-            residual_flat,
-            fn_broadcast,
-            gemm_out_mul,
-            gemm_out_sqrsum,
-            n_splits,
-        )
-    else:
-        _x_f32 = residual_flat.float()
-        torch.matmul(_x_f32, fn_broadcast.t(), out=gemm_out_mul[0])
-        torch.sum(_x_f32 * _x_f32, dim=-1, out=gemm_out_sqrsum[0])
+    tf32_hc_prenorm_gemm(
+        residual_flat,
+        fn_broadcast,
+        gemm_out_mul,
+        gemm_out_sqrsum,
+        n_splits,
+    )
     mhc_pre_big_fuse_broadcast_with_norm_tilelang(
         gemm_out_mul,
         gemm_out_sqrsum,
@@ -449,7 +435,42 @@ def mhc_post_tilelang(
     return out
 
 
-def mhc_fused_post_pre_tilelang(
+def mhc_post_mean_tilelang(
+    x: torch.Tensor,
+    residual: torch.Tensor,
+    post_layer_mix: torch.Tensor,
+    comb_res_mix: torch.Tensor,
+) -> torch.Tensor:
+    """Apply MHC post and return only the mean across HC channels."""
+    num_tokens, hc_mult, hidden_size = residual.shape
+    assert x.shape == (num_tokens, hidden_size)
+    assert post_layer_mix.shape in (
+        (num_tokens, hc_mult, 1),
+        (num_tokens, hc_mult),
+    )
+    assert comb_res_mix.shape == (num_tokens, hc_mult, hc_mult)
+
+    out = torch.empty(num_tokens, hidden_size, dtype=torch.bfloat16, device=x.device)
+    if num_tokens == 0:
+        return out
+
+    from vllm.model_executor.kernels.mhc.tilelang_kernels import (
+        mhc_post_mean_tilelang as _mhc_post_mean_kernel,
+    )
+
+    _mhc_post_mean_kernel(
+        comb_res_mix,
+        residual,
+        post_layer_mix.view(num_tokens, hc_mult),
+        x,
+        out,
+        hc_mult,
+        hidden_size,
+    )
+    return out
+
+
+def _mhc_fused_post_pre_tilelang_impl(
     x: torch.Tensor,
     residual: torch.Tensor,
     post_layer_mix: torch.Tensor,
@@ -466,6 +487,8 @@ def mhc_fused_post_pre_tilelang(
     tile_n: int = 1,
     norm_weight: torch.Tensor | None = None,
     norm_eps: float = 1e-6,
+    reuse_residual_buffer: bool = False,
+    reuse_input_buffer: bool = False,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     """
     Run one MHC post block followed by the next MHC pre block.
@@ -531,19 +554,14 @@ def mhc_fused_post_pre_tilelang(
     post_layer_mix_flat = post_layer_mix.view(num_tokens, hc_mult)
     comb_res_mix_flat = comb_res_mix.view(num_tokens, hc_mult, hc_mult)
 
-    from vllm.utils.deep_gemm import is_deep_gemm_supported
-
-    use_deep_gemm = (
-        is_deep_gemm_supported()
-        and os.environ.get("DSPARK_MHC_DEEPGEMM", "0") == "1"
-    )
+    use_tf32_hc_prenorm_gemm = _use_tf32_hc_prenorm_gemm()
     use_small_fma = num_tokens <= 16
     if use_small_fma:
         # TODO(gnovack): investigate autotuning these heuristics
         tile_n = 2 if num_tokens < 8 else 3
         n_splits = 8 if (num_tokens < 8 and hidden_size <= 4096) else 4
     else:
-        if use_deep_gemm:
+        if use_tf32_hc_prenorm_gemm:
             # these number are from deepgemm kernel impl
             block_k = 64
             block_m = 64
@@ -566,7 +584,11 @@ def mhc_fused_post_pre_tilelang(
         dtype=torch.float32,
         device=residual.device,
     )
-    residual_cur = torch.empty_like(residual_flat)
+    residual_cur = (
+        residual_flat
+        if reuse_residual_buffer and not use_small_fma
+        else torch.empty_like(residual_flat)
+    )
     post_mix_cur = torch.empty(
         num_tokens,
         hc_mult,
@@ -579,11 +601,15 @@ def mhc_fused_post_pre_tilelang(
         dtype=torch.float32,
         device=residual.device,
     )
-    layer_input_cur = torch.empty(
-        num_tokens,
-        hidden_size,
-        dtype=torch.bfloat16,
-        device=residual.device,
+    layer_input_cur = (
+        x_flat
+        if reuse_input_buffer
+        else torch.empty(
+            num_tokens,
+            hidden_size,
+            dtype=torch.bfloat16,
+            device=residual.device,
+        )
     )
 
     if use_small_fma:
@@ -614,7 +640,7 @@ def mhc_fused_post_pre_tilelang(
         )
 
         residual_cur_2d = residual_cur.view(num_tokens, hc_mult * hidden_size)
-        if use_deep_gemm:
+        if use_tf32_hc_prenorm_gemm:
             from vllm.utils.deep_gemm import tf32_hc_prenorm_gemm
 
             tf32_hc_prenorm_gemm(
@@ -683,6 +709,87 @@ def mhc_fused_post_pre_tilelang(
     )
 
 
+def mhc_fused_post_pre_tilelang(
+    x: torch.Tensor,
+    residual: torch.Tensor,
+    post_layer_mix: torch.Tensor,
+    comb_res_mix: torch.Tensor,
+    fn: torch.Tensor,
+    hc_scale: torch.Tensor,
+    hc_base: torch.Tensor,
+    rms_eps: float,
+    hc_pre_eps: float,
+    hc_sinkhorn_eps: float,
+    hc_post_mult_value: float,
+    sinkhorn_repeat: int,
+    n_splits: int = 1,
+    tile_n: int = 1,
+    norm_weight: torch.Tensor | None = None,
+    norm_eps: float = 1e-6,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    return _mhc_fused_post_pre_tilelang_impl(
+        x,
+        residual,
+        post_layer_mix,
+        comb_res_mix,
+        fn,
+        hc_scale,
+        hc_base,
+        rms_eps,
+        hc_pre_eps,
+        hc_sinkhorn_eps,
+        hc_post_mult_value,
+        sinkhorn_repeat,
+        n_splits=n_splits,
+        tile_n=tile_n,
+        norm_weight=norm_weight,
+        norm_eps=norm_eps,
+        reuse_residual_buffer=False,
+        reuse_input_buffer=False,
+    )
+
+
+def mhc_fused_post_pre_tilelang_reuse_residual(
+    x: torch.Tensor,
+    residual: torch.Tensor,
+    post_layer_mix: torch.Tensor,
+    comb_res_mix: torch.Tensor,
+    fn: torch.Tensor,
+    hc_scale: torch.Tensor,
+    hc_base: torch.Tensor,
+    rms_eps: float,
+    hc_pre_eps: float,
+    hc_sinkhorn_eps: float,
+    hc_post_mult_value: float,
+    sinkhorn_repeat: int,
+    n_splits: int = 1,
+    tile_n: int = 1,
+    norm_weight: torch.Tensor | None = None,
+    norm_eps: float = 1e-6,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Reuse dead residual and input storage for the next MHC transition."""
+    return _mhc_fused_post_pre_tilelang_impl(
+        x,
+        residual,
+        post_layer_mix,
+        comb_res_mix,
+        fn,
+        hc_scale,
+        hc_base,
+        rms_eps,
+        hc_pre_eps,
+        hc_sinkhorn_eps,
+        hc_post_mult_value,
+        sinkhorn_repeat,
+        n_splits=n_splits,
+        tile_n=tile_n,
+        norm_weight=norm_weight,
+        norm_eps=norm_eps,
+        reuse_residual_buffer=True,
+        reuse_input_buffer=True,
+    )
+
+
 def _mhc_fused_post_pre_tilelang_fake(
     x: torch.Tensor,
     residual: torch.Tensor,
@@ -739,6 +846,15 @@ def _mhc_post_tilelang_fake(
     return torch.empty_like(residual)
 
 
+def _mhc_post_mean_tilelang_fake(
+    x: torch.Tensor,
+    residual: torch.Tensor,
+    post_layer_mix: torch.Tensor,
+    comb_res_mix: torch.Tensor,
+) -> torch.Tensor:
+    return torch.empty_like(x)
+
+
 def hc_head_fused_kernel_tilelang(
     hs_flat: torch.Tensor,
     fn: torch.Tensor,
@@ -770,6 +886,104 @@ def hc_head_fused_kernel_tilelang(
     return out
 
 
+def mhc_post_hc_head_tilelang(
+    x: torch.Tensor,
+    residual: torch.Tensor,
+    post_layer_mix: torch.Tensor,
+    comb_res_mix: torch.Tensor,
+    fn: torch.Tensor,
+    hc_scale: torch.Tensor,
+    hc_base: torch.Tensor,
+    rms_eps: float,
+    hc_eps: float,
+) -> torch.Tensor:
+    """Apply final MHC post + hc_head without returning the post tensor."""
+    num_tokens, hc_mult, hidden_size = residual.shape
+    assert x.shape == (num_tokens, hidden_size)
+    assert post_layer_mix.shape in (
+        (num_tokens, hc_mult, 1),
+        (num_tokens, hc_mult),
+    )
+    assert comb_res_mix.shape == (num_tokens, hc_mult, hc_mult)
+    assert fn.shape == (hc_mult, hc_mult * hidden_size)
+    assert hc_scale.shape == (1,)
+    assert hc_base.shape == (hc_mult,)
+
+    out = torch.empty(num_tokens, hidden_size, dtype=torch.bfloat16, device=x.device)
+    if num_tokens == 0:
+        return out
+
+    from vllm.model_executor.kernels.mhc.tilelang_kernels import (
+        mhc_post_hc_head_tilelang as _mhc_post_hc_head_kernel,
+    )
+
+    _mhc_post_hc_head_kernel(
+        comb_res_mix,
+        residual,
+        post_layer_mix.view(num_tokens, hc_mult),
+        x,
+        fn,
+        hc_scale,
+        hc_base,
+        out,
+        hidden_size,
+        rms_eps,
+        hc_eps,
+        hc_mult,
+    )
+    return out
+
+
+def mhc_post_mean_hc_head_tilelang(
+    x: torch.Tensor,
+    residual: torch.Tensor,
+    post_layer_mix: torch.Tensor,
+    comb_res_mix: torch.Tensor,
+    fn: torch.Tensor,
+    hc_scale: torch.Tensor,
+    hc_base: torch.Tensor,
+    rms_eps: float,
+    hc_eps: float,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Apply final MHC post + aux mean + hc_head without returning the post tensor."""
+    num_tokens, hc_mult, hidden_size = residual.shape
+    assert x.shape == (num_tokens, hidden_size)
+    assert post_layer_mix.shape in (
+        (num_tokens, hc_mult, 1),
+        (num_tokens, hc_mult),
+    )
+    assert comb_res_mix.shape == (num_tokens, hc_mult, hc_mult)
+    assert fn.shape == (hc_mult, hc_mult * hidden_size)
+    assert hc_scale.shape == (1,)
+    assert hc_base.shape == (hc_mult,)
+
+    out = torch.empty(num_tokens, hidden_size, dtype=torch.bfloat16, device=x.device)
+    mean_out = torch.empty_like(out)
+    if num_tokens == 0:
+        return out, mean_out
+
+    from vllm.model_executor.kernels.mhc.tilelang_kernels import (
+        mhc_post_mean_hc_head_tilelang as _mhc_post_mean_hc_head_kernel,
+    )
+
+    _mhc_post_mean_hc_head_kernel(
+        comb_res_mix,
+        residual,
+        post_layer_mix.view(num_tokens, hc_mult),
+        x,
+        fn,
+        hc_scale,
+        hc_base,
+        out,
+        mean_out,
+        hidden_size,
+        rms_eps,
+        hc_eps,
+        hc_mult,
+    )
+    return out, mean_out
+
+
 def _hc_head_fused_kernel_tilelang_fake(
     hs_flat: torch.Tensor,
     fn: torch.Tensor,
@@ -782,6 +996,37 @@ def _hc_head_fused_kernel_tilelang_fake(
     return torch.empty(
         num_tokens, hidden_size, dtype=torch.bfloat16, device=hs_flat.device
     )
+
+
+def _mhc_post_hc_head_tilelang_fake(
+    x: torch.Tensor,
+    residual: torch.Tensor,
+    post_layer_mix: torch.Tensor,
+    comb_res_mix: torch.Tensor,
+    fn: torch.Tensor,
+    hc_scale: torch.Tensor,
+    hc_base: torch.Tensor,
+    rms_eps: float,
+    hc_eps: float,
+) -> torch.Tensor:
+    num_tokens, _, hidden_size = residual.shape
+    return torch.empty(num_tokens, hidden_size, dtype=torch.bfloat16, device=x.device)
+
+
+def _mhc_post_mean_hc_head_tilelang_fake(
+    x: torch.Tensor,
+    residual: torch.Tensor,
+    post_layer_mix: torch.Tensor,
+    comb_res_mix: torch.Tensor,
+    fn: torch.Tensor,
+    hc_scale: torch.Tensor,
+    hc_base: torch.Tensor,
+    rms_eps: float,
+    hc_eps: float,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    num_tokens, _, hidden_size = residual.shape
+    out = torch.empty(num_tokens, hidden_size, dtype=torch.bfloat16, device=x.device)
+    return out, torch.empty_like(out)
 
 
 direct_register_custom_op(
@@ -798,6 +1043,13 @@ direct_register_custom_op(
 )
 
 direct_register_custom_op(
+    op_name="mhc_post_mean_tilelang",
+    op_func=mhc_post_mean_tilelang,
+    mutates_args=[],
+    fake_impl=_mhc_post_mean_tilelang_fake,
+)
+
+direct_register_custom_op(
     op_name="mhc_fused_post_pre_tilelang",
     op_func=mhc_fused_post_pre_tilelang,
     mutates_args=[],
@@ -809,4 +1061,18 @@ direct_register_custom_op(
     op_func=hc_head_fused_kernel_tilelang,
     mutates_args=[],
     fake_impl=_hc_head_fused_kernel_tilelang_fake,
+)
+
+direct_register_custom_op(
+    op_name="mhc_post_hc_head_tilelang",
+    op_func=mhc_post_hc_head_tilelang,
+    mutates_args=[],
+    fake_impl=_mhc_post_hc_head_tilelang_fake,
+)
+
+direct_register_custom_op(
+    op_name="mhc_post_mean_hc_head_tilelang",
+    op_func=mhc_post_mean_hc_head_tilelang,
+    mutates_args=[],
+    fake_impl=_mhc_post_mean_hc_head_tilelang_fake,
 )

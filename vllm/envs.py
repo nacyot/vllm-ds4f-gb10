@@ -304,6 +304,18 @@ if TYPE_CHECKING:
     VLLM_GPU_NIC_PCIE_MAPPING: str = ""
     VLLM_NIC_SELECTION_VARS: str = ""
     VLLM_PREFIX_CACHE_RETENTION_INTERVAL: int | None = None
+    VLLM_DEEPSEEK_V4_EAGER_SCRATCH_POOL: bool = False
+    VLLM_DEEPSEEK_V4_INDEXED_D512_SPLIT_PREFILL: bool = True
+    VLLM_DEEPSEEK_V4_INDEXED_D512_SPLIT_PREFILL_MIN_TOKENS: int = 4096
+    VLLM_DEEPSEEK_V4_INDEXED_D512_SPLIT_PREFILL_WARMUP: bool = True
+    VLLM_DEEPSEEK_V4_INDEXED_D512_CHUNKED_PREFILL: bool = True
+    VLLM_DEEPSEEK_V4_FLASHINFER_SM120_DECODE: bool = True
+    VLLM_DEEPSEEK_V4_FLASHINFER_SM120_PREFILL: bool = True
+    VLLM_TRITON_MLA_SPARSE: bool | None = None
+    VLLM_TRITON_MLA_SPARSE_TOPK_CHUNK_SIZE: int = 512
+    VLLM_TRITON_MLA_SPARSE_QUERY_CHUNK_SIZE: int = 256
+    VLLM_TRITON_MLA_SPARSE_HEAD_BLOCK_SIZE: int | None = None
+    VLLM_TRITON_MLA_SPARSE_MATMUL_DECODE: bool | None = None
 
 
 def get_default_cache_root():
@@ -2064,6 +2076,57 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # Each entry is VAR_NAME or VAR_NAME:<suffix> (suffix appended to
     # RDMA device name). Must be set together with VLLM_GPU_NIC_PCIE_MAPPING.
     "VLLM_NIC_SELECTION_VARS": lambda: os.getenv("VLLM_NIC_SELECTION_VARS", ""),
+    "VLLM_DEEPSEEK_V4_EAGER_SCRATCH_POOL": lambda: bool(
+        int(os.getenv("VLLM_DEEPSEEK_V4_EAGER_SCRATCH_POOL", "0"))
+    ),
+    "VLLM_DEEPSEEK_V4_INDEXED_D512_SPLIT_PREFILL": lambda: bool(
+        int(os.getenv("VLLM_DEEPSEEK_V4_INDEXED_D512_SPLIT_PREFILL", "1"))
+    ),
+    # Minimum prefill sequence length to admit a row to the indexed-D512 fast
+    # prefill path. Lower = more (shorter / early-chunk) prefills use the fast
+    # kernel. 4096 measured +9-59% short/medium-prefill tok/s (biggest at the
+    # 4-8k band), GSM8K-clean and KV-cache-neutral on SM12x; set 8192 to revert
+    # to the prior conservative threshold.
+    "VLLM_DEEPSEEK_V4_INDEXED_D512_SPLIT_PREFILL_MIN_TOKENS": lambda: int(
+        os.getenv("VLLM_DEEPSEEK_V4_INDEXED_D512_SPLIT_PREFILL_MIN_TOKENS", "4096")
+    ),
+    # Pre-compile the D512-split sparse-MLA prefill Triton kernels at startup
+    # (one per 128-aligned combined_topk in [256, 1152]) so the first long
+    # prefill does not pay a first-use JIT compile that blocks the engine step.
+    "VLLM_DEEPSEEK_V4_INDEXED_D512_SPLIT_PREFILL_WARMUP": lambda: bool(
+        int(os.getenv("VLLM_DEEPSEEK_V4_INDEXED_D512_SPLIT_PREFILL_WARMUP", "1"))
+    ),
+    "VLLM_DEEPSEEK_V4_INDEXED_D512_CHUNKED_PREFILL": lambda: bool(
+        int(os.getenv("VLLM_DEEPSEEK_V4_INDEXED_D512_CHUNKED_PREFILL", "1"))
+    ),
+    "VLLM_DEEPSEEK_V4_FLASHINFER_SM120_DECODE": lambda: bool(
+        int(os.getenv("VLLM_DEEPSEEK_V4_FLASHINFER_SM120_DECODE", "1"))
+    ),
+    "VLLM_DEEPSEEK_V4_FLASHINFER_SM120_PREFILL": lambda: bool(
+        int(os.getenv("VLLM_DEEPSEEK_V4_FLASHINFER_SM120_PREFILL", "1"))
+    ),
+    # Experimental sparse MLA fallback controls.
+    # ``VLLM_TRITON_MLA_SPARSE`` unset means auto-select where FlashMLA sparse
+    # is unavailable; set 0/1 to force-disable/force-enable the fallback.
+    "VLLM_TRITON_MLA_SPARSE": lambda: (
+        None
+        if os.getenv("VLLM_TRITON_MLA_SPARSE") is None
+        else bool(int(os.getenv("VLLM_TRITON_MLA_SPARSE", "0")))
+    ),
+    "VLLM_TRITON_MLA_SPARSE_TOPK_CHUNK_SIZE": lambda: int(
+        os.getenv("VLLM_TRITON_MLA_SPARSE_TOPK_CHUNK_SIZE", "512")
+    ),
+    "VLLM_TRITON_MLA_SPARSE_QUERY_CHUNK_SIZE": lambda: int(
+        os.getenv("VLLM_TRITON_MLA_SPARSE_QUERY_CHUNK_SIZE", "256")
+    ),
+    "VLLM_TRITON_MLA_SPARSE_HEAD_BLOCK_SIZE": lambda: maybe_convert_int(
+        os.getenv("VLLM_TRITON_MLA_SPARSE_HEAD_BLOCK_SIZE")
+    ),
+    "VLLM_TRITON_MLA_SPARSE_MATMUL_DECODE": lambda: (
+        None
+        if os.getenv("VLLM_TRITON_MLA_SPARSE_MATMUL_DECODE") is None
+        else bool(int(os.getenv("VLLM_TRITON_MLA_SPARSE_MATMUL_DECODE", "0")))
+    ),
 }
 
 

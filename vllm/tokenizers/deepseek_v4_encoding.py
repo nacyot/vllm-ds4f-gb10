@@ -65,11 +65,20 @@ tool_output_template: str = (
     "<tool_result>{content}</tool_result>"
 )
 
-REASONING_EFFORT_MAX = (
-    "Reasoning Effort: Absolute maximum with no shortcuts permitted.\n"
-    "You MUST be very thorough in your thinking and comprehensively decompose the problem to resolve the root cause, rigorously stress-testing your logic against all potential paths, edge cases, and adversarial scenarios.\n"
-    "Explicitly write out your entire deliberation process, documenting every intermediate step, considered alternative, and rejected hypothesis to ensure absolutely no assumption is left unchecked.\n\n"
-)
+REASONING_EFFORT_PROMPTS: Dict[str, str] = {
+    "low": "",
+    "high": (
+        "Reasoning Effort: Absolute maximum with no shortcuts permitted.\n"
+        "You MUST be very thorough in your thinking and comprehensively decompose the problem to resolve the root cause, rigorously stress-testing your logic against all potential paths, edge cases, and adversarial scenarios.\n"
+        "Explicitly write out your entire deliberation process, documenting every intermediate step, considered alternative, and rejected hypothesis to ensure absolutely no assumption is left unchecked.\n\n"
+    ),
+    "max": (
+        "Reasoning Effort: Beyond maximum — exhaustive, relentless, and uncompromising.\n"
+        "You MUST reason with the utmost depth and rigor, leaving absolutely nothing to chance: exhaustively decompose the problem into its most fundamental components, trace every causal chain to its root, and resolve the underlying cause rather than any surface symptom.\n"
+        "Do not stop reasoning until you have independently verified the solution from multiple angles and are certain that no assumption remains unchecked and no error remains undiscovered.\n\n"
+    ),
+}
+DEFAULT_REASONING_EFFORT = "low"
 
 TOOLS_TEMPLATE = """## Tools
 
@@ -139,10 +148,15 @@ def encode_arguments_to_dsml(tool_call: Dict[str, Any]) -> str:
     p_dsml_template = '<{dsml_token}parameter name="{key}" string="{is_str}">{value}</{dsml_token}parameter>'
     P_dsml_strs = []
 
-    if isinstance(tool_call["arguments"], str):
-        arguments = json.loads(tool_call["arguments"])
+    raw_arguments = tool_call.get("arguments")
+    if raw_arguments is None or raw_arguments == "":
+        arguments = {}
+    elif isinstance(raw_arguments, str):
+        arguments = json.loads(raw_arguments)
+        if arguments is None:
+            arguments = {}
     else:
-        arguments = tool_call["arguments"]
+        arguments = raw_arguments
 
     for k, v in arguments.items():
         p_dsml_str = p_dsml_template.format(
@@ -190,7 +204,14 @@ def find_last_user_index(messages: List[Dict[str, Any]]) -> int:
 # Message Rendering
 # ============================================================
 
-def render_message(index: int, messages: List[Dict[str, Any]], thinking_mode: str, drop_thinking: bool = True, reasoning_effort: Optional[str] = None) -> str:
+def render_message(
+    index: int,
+    messages: List[Dict[str, Any]],
+    thinking_mode: str,
+    drop_thinking: bool = True,
+    reasoning_effort: Optional[str] = None,
+    last_user_idx: Optional[int] = None,
+) -> str:
     """
     Render a single message at the given index into its encoded string form.
 
@@ -202,7 +223,9 @@ def render_message(index: int, messages: List[Dict[str, Any]], thinking_mode: st
         messages: Full list of messages in the conversation.
         thinking_mode: Either "chat" or "thinking".
         drop_thinking: Whether to drop reasoning content from earlier turns.
-        reasoning_effort: Optional reasoning effort level ("max", "high", or None).
+        reasoning_effort: Reasoning effort level, one of "low", "high", "max".
+            None is treated as "low".
+        last_user_idx: Cached index of the last user/developer message.
 
     Returns:
         Encoded string for this message.
@@ -212,7 +235,9 @@ def render_message(index: int, messages: List[Dict[str, Any]], thinking_mode: st
 
     prompt = ""
     msg = messages[index]
-    last_user_idx = find_last_user_index(messages)
+    last_user_idx = (
+        find_last_user_index(messages) if last_user_idx is None else last_user_idx
+    )
 
     role = msg.get("role")
     content = msg.get("content")
@@ -227,10 +252,13 @@ def render_message(index: int, messages: List[Dict[str, Any]], thinking_mode: st
     if tool_calls:
         tool_calls = tool_calls_from_openai_format(tool_calls)
 
-    # Reasoning effort prefix (only at index 0 in thinking mode with max effort)
-    assert reasoning_effort in ['max', None, 'high'], f"Invalid reasoning effort: {reasoning_effort}"
-    if index == 0 and thinking_mode == "thinking" and reasoning_effort == 'max':
-        prompt += REASONING_EFFORT_MAX
+    reasoning_effort = reasoning_effort or DEFAULT_REASONING_EFFORT
+    assert reasoning_effort in REASONING_EFFORT_PROMPTS, (
+        f"Invalid reasoning effort: {reasoning_effort}, expected one of "
+        f"{list(REASONING_EFFORT_PROMPTS)}"
+    )
+    if index == 0 and thinking_mode == "thinking":
+        prompt += REASONING_EFFORT_PROMPTS[reasoning_effort]
 
     if role == "system":
         prompt += system_msg_template.format(content=content or "")
@@ -368,6 +396,78 @@ def render_message(index: int, messages: List[Dict[str, Any]], thinking_mode: st
 # Preprocessing
 # ============================================================
 
+def _merge_assistant_run(run: List[Dict[str, Any]]) -> Dict[str, Any]:
+    """Combine a run of consecutive assistant messages into one message."""
+    if len(run) == 1:
+        return run[0]
+    combined = copy.deepcopy(run[0])
+    contents = [m["content"] for m in run if m.get("content")]
+    reasonings = [m["reasoning"] for m in run if m.get("reasoning")]
+    tool_calls = [tc for m in run for tc in (m.get("tool_calls") or [])]
+    if contents:
+        combined["content"] = "\n\n".join(contents)
+    else:
+        combined.pop("content", None)
+    if reasonings:
+        combined["reasoning"] = "\n\n".join(reasonings)
+    else:
+        combined.pop("reasoning", None)
+    if tool_calls:
+        combined["tool_calls"] = tool_calls
+    else:
+        combined.pop("tool_calls", None)
+    # End-of-turn markers come from the last message of the run.
+    for key in ("task", "wo_eos", "mask"):
+        if key in run[-1]:
+            combined[key] = run[-1][key]
+        else:
+            combined.pop(key, None)
+    return combined
+
+
+def merge_consecutive_assistant_messages(
+    messages: List[Dict[str, Any]],
+) -> List[Dict[str, Any]]:
+    """
+    Merge runs of consecutive assistant messages into single assistant messages.
+
+    Some clients replay one logical assistant turn as several consecutive
+    assistant messages (e.g. a content-only message followed by a separate
+    tool_calls + reasoning message). DeepSeek-V4 renders one assistant turn as
+    a single unit: reasoning + content + tool calls. Rendering consecutive
+    assistant messages individually produces malformed prompts, because the
+    Assistant transition tokens are only emitted after user/developer messages:
+    the follow-up message is glued onto the previous one with no separator and
+    its reasoning renders as free text terminated by a stray thinking end token.
+
+    Merge rules for a run of consecutive assistant messages:
+    - content: non-empty parts joined with "\n\n" (order preserved)
+    - reasoning: non-empty parts joined with "\n\n" (order preserved)
+    - tool_calls: concatenated (order preserved)
+    - task / wo_eos / mask: taken from the last message of the run
+      (end-of-turn semantics, mirroring merge_tool_messages)
+
+    Args:
+        messages: Message list in OpenAI format.
+
+    Returns:
+        Message list with consecutive assistant messages merged.
+    """
+    merged: List[Dict[str, Any]] = []
+    run: List[Dict[str, Any]] = []
+    for msg in messages:
+        if msg.get("role") == "assistant":
+            run.append(msg)
+            continue
+        if run:
+            merged.append(_merge_assistant_run(run))
+            run = []
+        merged.append(msg)
+    if run:
+        merged.append(_merge_assistant_run(run))
+    return merged
+
+
 def merge_tool_messages(messages: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
     """
     Merge tool messages into the preceding user message using content_blocks format.
@@ -486,6 +586,7 @@ def encode_messages(
 
     This is the main entry point for encoding conversations. It handles:
     - BOS token insertion
+    - Consecutive assistant message merging (split turns)
     - Thinking mode with optional reasoning content dropping
     - Tool message merging into user messages
     - Multi-turn conversation context
@@ -497,17 +598,21 @@ def encode_messages(
         drop_thinking: If True, drop reasoning from earlier assistant turns
                       (only keep reasoning for messages after the last user message).
         add_default_bos_token: Whether to prepend BOS token at conversation start.
-        reasoning_effort: Optional reasoning effort level ("max", "high", or None).
+        reasoning_effort: Reasoning effort level, one of "low", "high", "max".
+            Only takes effect in thinking mode. None is treated as "low".
 
     Returns:
         The encoded prompt string.
     """
     context = context if context else []
 
-    # Preprocess: merge tool messages and sort tool results
+    # Preprocess: merge split assistant turns, merge tool messages,
+    # and sort tool results
+    messages = merge_consecutive_assistant_messages(messages)
     messages = merge_tool_messages(messages)
     messages = sort_tool_results_by_call_order(context + messages)[len(context):]
     if context:
+        context = merge_consecutive_assistant_messages(context)
         context = merge_tool_messages(context)
         context = sort_tool_results_by_call_order(context)
 
@@ -530,6 +635,8 @@ def encode_messages(
         num_to_render = len(messages)
         context_len = len(context)
 
+    last_user_idx = find_last_user_index(full_messages)
+
     for idx in range(num_to_render):
         prompt += render_message(
             idx + context_len,
@@ -537,6 +644,7 @@ def encode_messages(
             thinking_mode=thinking_mode,
             drop_thinking=effective_drop_thinking,
             reasoning_effort=reasoning_effort,
+            last_user_idx=last_user_idx,
         )
 
     return prompt
