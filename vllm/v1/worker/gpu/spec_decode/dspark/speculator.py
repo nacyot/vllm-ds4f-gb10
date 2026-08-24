@@ -13,8 +13,6 @@ Differences from DFlash:
     token), so we sample at all N positions and ``sample_pos = query_pos + 1``
     (standard next-token), whereas DFlash's masks sit AT the predicted position.
     This is the ``sample_from_anchor`` path in the shared prepare-inputs kernel.
-    Speculators-format checkpoints instead use the DFlash ``1 + N`` fill-in
-    layout (anchor is the bonus token).
   * Sequential Markov sampling: instead of DFlash's single parallel sample, we
     sample left-to-right, adding a prefix-dependent Markov bias derived from the
     previously sampled token at each step.
@@ -29,16 +27,31 @@ import torch
 
 from vllm.config import VllmConfig
 from vllm.config.compilation import CUDAGraphMode
+from vllm.logger import init_logger
 from vllm.v1.worker.gpu.sample.gumbel import gumbel_sample
 from vllm.v1.worker.gpu.spec_decode.dflash.speculator import DFlashSpeculator
 from vllm.v1.worker.gpu.spec_decode.dspark.utils import load_dspark_model
+
+logger = init_logger(__name__)
 
 
 class DSparkSpeculator(DFlashSpeculator):
     _speculator_name = "DSpark"
 
     def __init__(self, vllm_config: VllmConfig, device: torch.device):
-        super().__init__(vllm_config, device)
+        # DSpark only stores the combined main_x hidden state, not the
+        # HC-multiplexed aux hidden state used by DFlash. Size the base
+        # class's buffer directly instead of re-allocating it after super().
+        assert vllm_config.speculative_config is not None
+        draft_hidden = (
+            vllm_config.speculative_config.draft_model_config.get_hidden_size()
+        )
+        super().__init__(
+            vllm_config,
+            device,
+            hidden_states_size=draft_hidden,
+            allocate_hidden_states=False,
+        )
 
         # Whether to sample from the anchor position. When True, uses anchor-as-first
         # (N slots, each position predicts the next token). When False, uses 1+N
@@ -51,33 +64,43 @@ class DSparkSpeculator(DFlashSpeculator):
         else:
             self.num_query_per_req = 1 + self.num_speculative_steps
 
-        # DSpark consumes mean-pooled target aux hidden states at the target
-        # layers, combined to hidden_size via main_proj. Store that combined
-        # main_x (hidden_size wide). DSpark does not use the same pre-allocated buffer
-        # that DeepSeek-V4's MTP uses.
-        draft_hidden = self.draft_model_config.get_hidden_size()
-        self.hidden_states = torch.zeros(
-            self.max_num_tokens, draft_hidden, dtype=self.dtype, device=device
+        self._anchor_idx = (
+            torch.arange(self.max_num_reqs, dtype=torch.int64, device=device)
+            * self.num_query_per_req
         )
 
         self._step_cols = torch.arange(
             self.num_speculative_steps, dtype=torch.int32, device=device
         )
 
-        self._anchor_idx = (
-            torch.arange(self.max_num_reqs, dtype=torch.int64, device=device)
-            * self.num_query_per_req
-        )
-
         # Reduced-vocab probabilistic drafting only; set in load_draft_model.
         self._d2t_scatter_index: torch.Tensor | None = None
         self._draft_scatter_buf: torch.Tensor | None = None
+        self._draft_topk: int | None = getattr(
+            self.draft_model_config.hf_config, "dspark_draft_topk", None
+        )
+
+        self.draft_token_confidence_probs = torch.empty_like(
+            self.draft_tokens, dtype=torch.float32
+        )
+        self.enable_adaptive_verification = (
+            self.speculative_config.enable_adaptive_verification
+        )
 
     def load_draft_model(
         self,
         target_model: torch.nn.Module,
         target_attn_layer_names: set[str],
     ) -> torch.nn.Module:
+        # Take upstream's body whole. The merge-base ALSO had the d2t scatter
+        # assignment; our line lost it in an earlier merge while keeping the
+        # reader at _apply_d2t_scatter, so `self._d2t_scatter_index` was
+        # declared, read, and never assigned -- the branch was dead rather than
+        # broken, which is why nothing failed. Restoring it also brings
+        # upstream #47808's confidence-head requirement for adaptive
+        # verification. Every symbol it needs exists here: draft_logits,
+        # draft_id_to_target_id, enable_adaptive_verification (speculative.py
+        # :248, set at __init__), and confidence_head (our dspark.py).
         model = load_dspark_model(target_model, self.vllm_config)
         # Reduced draft vocab: probabilistic rejection sampling indexes draft
         # logits by target id, so precompute the draft->target column map and a
@@ -95,21 +118,70 @@ class DSparkSpeculator(DFlashSpeculator):
                 dtype=self.draft_logits.dtype,
                 device=self.device,
             )
+        # Upstream writes `model.model.confidence_head`, which assumes the draft
+        # model nests its layers under `.model` (qwen3_dspark, gemma4_dspark).
+        # This fork FLATTENED the DeepSeek-V4 DSpark class, so it holds the head
+        # directly and `model.model` raises AttributeError from nn.Module's
+        # __getattr__. Accept both shapes.
+        draft_inner = getattr(model, "model", model)
+        if self.enable_adaptive_verification and draft_inner.confidence_head is None:
+            raise ValueError(
+                "Adaptive verification needs a DSpark checkpoint with a confidence "
+                "head, and this one has none. Pass "
+                "enable_adaptive_verification=false in the speculative config to verify"
+                " a fixed number of drafts instead."
+            )
         return model
 
+    def _sample_logits(
+        self,
+        logits: torch.Tensor,
+        idx_map: torch.Tensor,
+        sample_pos: torch.Tensor,
+        step: int,
+    ) -> torch.Tensor:
+        if self.draft_logits is None:
+            return self.model.map_draft_to_target(logits.argmax(dim=-1))
+
+        # Probabilistic sampling and rejection operate in target-vocabulary
+        # space. A reduced draft vocabulary is scattered into its target rows.
+        if self._d2t_scatter_index is not None:
+            assert self._draft_scatter_buf is not None
+            buf = self._draft_scatter_buf[: logits.shape[0]]
+            buf.index_copy_(1, self._d2t_scatter_index, logits.to(buf.dtype))
+            logits = buf
+
+        # sample_pos is the predicted token's position Q; the target verifies
+        # it with the predecessor's Gumbel key (Q-1). Pass Q-1.
+        return gumbel_sample(
+            logits,
+            idx_map,
+            self.temperature,
+            self.seeds,
+            sample_pos - 1,
+            apply_temperature=True,
+            logits_cache=self.draft_logits,
+            logits_cache_col=self._step_cols[step],
+            use_fp64=self.use_fp64_gumbel,
+        )
+
     def _sample_sequential(self, num_reqs: int, head_hidden: torch.Tensor) -> None:
+        if self._draft_topk is not None:
+            self._sample_sequential_topk(num_reqs, head_hidden)
+            return
+
         # Sequential Markov sampling over the backbone's output hidden states.
         n_spec = self.num_speculative_steps
         num_sample = num_reqs * n_spec
         # Per-(req, position) head hidden, ordered (req, step).
         sample_hidden = head_hidden[self.sample_indices[:num_sample]]
-        # Draft-vocab logits; sampled ids are remapped to target vocab below.
-        base_logits = self.model.compute_draft_logits(sample_hidden)
+        base_logits = self.model.compute_logits(sample_hidden)
         vocab_size = base_logits.shape[-1]
         base_logits = base_logits.view(num_reqs, n_spec, vocab_size)
 
         idx_map = self.sample_idx_mapping[:num_sample].view(num_reqs, n_spec)
         sample_pos = self.sample_pos[:num_sample].view(num_reqs, n_spec)
+        confidence_markov_embeds = []
 
         # Anchor (bonus) token per request = the input id at query offset 0,
         # read via the precomputed persistent index (fixed buffer for capture).
@@ -118,35 +190,73 @@ class DSparkSpeculator(DFlashSpeculator):
         for i in range(n_spec):
             # Sequential stage: Markov bias from the previously sampled token.
             markov_embed = self.model.markov_embed(prev)
+            if self.enable_adaptive_verification:
+                confidence_markov_embeds.append(markov_embed)
             bias = self.model.markov_bias(markov_embed)
             logits_i = base_logits[:, i] + bias
-            if self.draft_logits is not None:
-                # Probabilistic: sample in target vocab (a reduced draft vocab is
-                # scattered into its target columns; full vocab is already there).
-                if self._d2t_scatter_index is not None:
-                    assert self._draft_scatter_buf is not None
-                    buf = self._draft_scatter_buf[:num_reqs]
-                    buf.index_copy_(1, self._d2t_scatter_index, logits_i.to(buf.dtype))
-                    logits_i = buf
-                # sample_pos is the predicted token's position Q; the target
-                # verifies it with the predecessor's Gumbel key (Q-1). Pass Q-1.
-                draft_sampled_i = gumbel_sample(
-                    logits_i,
-                    idx_map[:, i],
-                    self.temperature,
-                    self.seeds,
-                    sample_pos[:, i] - 1,
-                    apply_temperature=True,
-                    output_processed_logits=self.draft_logits,
-                    output_processed_logits_col=self._step_cols[i],
-                    use_fp64=self.use_fp64_gumbel,
-                )
-            else:
-                draft_sampled_i = self.model.map_draft_to_target(
-                    logits_i.argmax(dim=-1)
-                )
+            draft_sampled_i = self._sample_logits(
+                logits_i, idx_map[:, i], sample_pos[:, i], i
+            )
             self.draft_tokens[:num_reqs, i] = draft_sampled_i
             prev = draft_sampled_i
+
+        if self.enable_adaptive_verification:
+            confidence = self.model.compute_confidence(
+                sample_hidden,
+                torch.stack(confidence_markov_embeds, dim=1).flatten(0, 1),
+            )
+            self.draft_token_confidence_probs[:num_reqs] = confidence.view(
+                num_reqs, n_spec
+            )
+
+    def _sample_sequential_topk(self, num_reqs: int, head_hidden: torch.Tensor) -> None:
+        """Apply the sequential Markov head only to top-k base-logit candidates.
+
+        Candidate selection is done once for all draft positions. At each
+        sequential step, the selected logits are corrected in place and every
+        other entry is set to ``-inf``. The normal dense sampling and rejection
+        paths then consume that truncated distribution unchanged.
+        """
+        assert self._draft_topk is not None
+        n_spec = self.num_speculative_steps
+        num_sample = num_reqs * n_spec
+        sample_hidden = head_hidden[self.sample_indices[:num_sample]]
+        base_logits = self.model.compute_draft_logits(sample_hidden)
+        base_logits = base_logits.view(num_reqs, n_spec, -1)
+        base_values, draft_indices = base_logits.topk(self._draft_topk, dim=-1)
+        # Reuse the dense backbone output as the normal sampler's input. Fill
+        # once for all positions, then scatter only the corrected candidates
+        # during the sequential loop.
+        base_logits.fill_(float("-inf"))
+        idx_map = self.sample_idx_mapping[:num_sample].view(num_reqs, n_spec)
+        sample_pos = self.sample_pos[:num_sample].view(num_reqs, n_spec)
+        confidence_markov_embeds = []
+        prev = self.input_buffers.input_ids[self._anchor_idx[:num_reqs]]
+
+        for i in range(n_spec):
+            markov_embed = self.model.markov_embed(prev)
+            if self.enable_adaptive_verification:
+                confidence_markov_embeds.append(markov_embed)
+            logits_i = self.model.apply_markov_bias_gathered(
+                markov_embed,
+                base_logits[:, i],
+                base_values[:, i],
+                draft_indices[:, i],
+            )
+            draft_sampled_i = self._sample_logits(
+                logits_i, idx_map[:, i], sample_pos[:, i], i
+            )
+            self.draft_tokens[:num_reqs, i] = draft_sampled_i
+            prev = draft_sampled_i
+
+        if self.enable_adaptive_verification:
+            confidence = self.model.compute_confidence(
+                sample_hidden,
+                torch.stack(confidence_markov_embeds, dim=1).flatten(0, 1),
+            )
+            self.draft_token_confidence_probs[:num_reqs] = confidence.view(
+                num_reqs, n_spec
+            )
 
     def _generate_draft(
         self,
