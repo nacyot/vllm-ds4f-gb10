@@ -35,10 +35,13 @@ def _warm_fa4_mla_prefill(worker: Worker) -> None:
 
 
 def _warm_inkling_fa4_rel_attention(worker: Worker) -> None:
-    from vllm.models.inkling.configs import InklingMMConfig, InklingModelConfig
-    from vllm.models.inkling.nvidia.ops.fa4_rel_attention import (
-        INKLING_FA4_REL_ATTENTION_KERNEL,
-    )
+    try:
+        from vllm.models.inkling.configs import InklingMMConfig, InklingModelConfig
+        from vllm.models.inkling.nvidia.ops.fa4_rel_attention import (
+            INKLING_FA4_REL_ATTENTION_KERNEL,
+        )
+    except ImportError:
+        return  # sm120-port: inkling model family absent in this build; DSv4 unused
 
     vllm_config = worker.vllm_config
     hf_config = vllm_config.model_config.hf_config
