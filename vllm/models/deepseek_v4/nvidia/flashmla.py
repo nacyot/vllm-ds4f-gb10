@@ -3,6 +3,8 @@
 
 from typing import TYPE_CHECKING, ClassVar, cast
 
+import os
+
 import torch
 
 import vllm.envs as envs
@@ -952,21 +954,29 @@ class DeepseekV4FlashMLAAttention(DeepseekV4Attention):
                 # first prefill requests index past their gathered slot and read
                 # stale workspace (latent C4A multi-request prefill bug). torch.where
                 # preserves -1 sentinels; no-op at num_prefills==1 (cu_base[0]==0).
-                assert swa_metadata.token_to_req_indices is not None
-                _comp_lens = seq_lens // self.compress_ratio
-                _cu_base = (torch.cumsum(_comp_lens, dim=0) - _comp_lens).to(
-                    torch.int32
-                )
-                _req_local = (
-                    swa_metadata.token_to_req_indices[
-                        num_decode_tokens : num_decode_tokens + num_prefill_tokens
-                    ]
-                    - num_decodes
-                ).long()
-                _base = _cu_base[_req_local].unsqueeze(1)
-                topk_indices = torch.where(
-                    topk_indices >= 0, topk_indices - _base, topk_indices
-                )
+                # [c4a-rebase] The rebase above is WRONG for this stack: the
+                # indexer's top_k_per_row_prefill already writes request-local
+                # indices (csrc/libtorch_stable/sampler.cu), as upstream 0.27.1
+                # flashmla.py assumes. Subtracting again drove every non-first
+                # prefill request's indices negative (dropped -> context loss).
+                # Keep it opt-in for A/B only.
+                if os.environ.get("VLLM_DSV4_C4A_TOPK_REBASE", "0") == "1":
+                    assert swa_metadata.token_to_req_indices is not None
+                    _comp_lens = seq_lens // self.compress_ratio
+                    _cu_base = (torch.cumsum(_comp_lens, dim=0) - _comp_lens).to(
+                        torch.int32
+                    )
+                    _req_local = (
+                        swa_metadata.token_to_req_indices[
+                            num_decode_tokens : num_decode_tokens
+                            + num_prefill_tokens
+                        ]
+                        - num_decodes
+                    ).long()
+                    _base = _cu_base[_req_local].unsqueeze(1)
+                    topk_indices = torch.where(
+                        topk_indices >= 0, topk_indices - _base, topk_indices
+                    )
             else:
                 # C128A: pre-computed during metadata build.
                 assert attn_metadata is not None
