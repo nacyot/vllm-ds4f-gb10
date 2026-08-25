@@ -55,6 +55,14 @@ def sparse_indexer_max_logits_bytes(is_sm12x: bool | None = None) -> int:
 
 
 def _uses_deep_gemm_scheduler_metadata() -> bool:
+    if (
+        current_platform.is_cuda()
+        and has_deep_gemm()
+        and current_platform.is_device_capability_family(120)
+    ):
+        # [sm12x-native] the native DeepGEMM paged MQA logits kernel needs the
+        # schedule metadata; only the Triton fallback can do without it.
+        return os.environ.get("VLLM_SM12X_NATIVE_DEEPGEMM", "0") == "1"
     return (
         current_platform.is_cuda()
         and has_deep_gemm()

@@ -570,6 +570,16 @@ def fp8_fp4_mqa_topk_indices(
     )
 
 
+def _sm12x_native_deep_gemm() -> bool:
+    # [sm12x-native] prefer vendored DeepGEMM sm120 MQA kernels over the
+    # Python/Triton fallbacks when the env asks for it (see patch header).
+    return os.environ.get("VLLM_SM12X_NATIVE_DEEPGEMM", "0") == "1"
+
+
+def _sm12x_native_tf32() -> bool:
+    return os.environ.get("VLLM_SM12X_NATIVE_TF32", "0") == "1"
+
+
 def _fp8_mqa_logits_sm12x(
     q: tuple[torch.Tensor, torch.Tensor | None],
     kv: tuple[torch.Tensor, torch.Tensor],
@@ -618,6 +628,17 @@ def fp8_fp4_mqa_logits(
         Logits tensor of shape [M, N], dtype `torch.float32`.
     """
     if current_platform.is_device_capability_family(120) and q[1] is None:
+        if _sm12x_native_deep_gemm():  # [sm12x-native]
+            _lazy_init()
+            if _fp8_fp4_mqa_logits_impl is not None:
+                return _fp8_fp4_mqa_logits_impl(
+                    q,
+                    kv,
+                    weights,
+                    cu_seqlen_ks,
+                    cu_seqlen_ke,
+                    clean_logits=clean_logits,
+                )
         return _fp8_mqa_logits_sm12x(
             q, kv, weights, cu_seqlen_ks, cu_seqlen_ke, clean_logits
         )
@@ -748,6 +769,21 @@ def fp8_fp4_paged_mqa_logits(
         `torch.float32`.
     """
     if current_platform.is_device_capability_family(120) and q[1] is None:
+        if _sm12x_native_deep_gemm():  # [sm12x-native]
+            _lazy_init()
+            if _fp8_fp4_paged_mqa_logits_impl is not None:
+                _kw = {} if indices is None else {"indices": indices}
+                return _fp8_fp4_paged_mqa_logits_impl(
+                    q,
+                    kv_cache,
+                    weights,
+                    context_lens,
+                    block_tables,
+                    schedule_metadata,
+                    max_model_len,
+                    clean_logits=clean_logits,
+                    **_kw,
+                )
         return _fp8_paged_mqa_logits_sm12x(
             q, kv_cache, weights, context_lens, block_tables, max_model_len
         )
@@ -797,6 +833,10 @@ def tf32_hc_prenorm_gemm(
     See the caller function for shape requirement
     """
     if current_platform.is_device_capability_family(120):
+        if _sm12x_native_tf32():  # [sm12x-native]
+            _lazy_init()
+            if _tf32_hc_prenorm_gemm_impl is not None:
+                return _tf32_hc_prenorm_gemm_impl(x, fn, out, sqrsum, num_split)
         return _tf32_hc_prenorm_gemm_sm12x(x, fn, out, sqrsum, num_split)
     _lazy_init()
     if _tf32_hc_prenorm_gemm_impl is None:
