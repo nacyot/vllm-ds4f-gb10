@@ -444,7 +444,12 @@ def _fp8_mqa_logits_sm12x(
     clean_logits: bool,
 ) -> torch.Tensor:
     q_values, q_scale = q
-    if clean_logits and q_scale is None and q_values.dim() == 3 and kv[0].dim() == 2:
+    # sm120-port: route to the Triton kernel regardless of clean_logits.
+    # Downstream top_k_per_row_prefill masks by cu_seqlen_ks/ke, so
+    # out-of-range logits are never read; the torch fallback here is
+    # O(M*N) python-side and takes 30s+ per large prefill step (c>=2
+    # aggregate collapse at MNBT=8192).
+    if q_scale is None and q_values.dim() == 3 and kv[0].dim() == 2:
         from vllm.models.deepseek_v4.nvidia.ops.sm12x_mqa import (
             fp8_mqa_logits_triton,
         )
