@@ -2079,6 +2079,75 @@ def test_swa_alignment_skip(request_runner, async_scheduling: bool):
     )
 
 
+def test_bounded_restore_reserves_rows_for_hybrid_groups(request_runner):
+    """The full-attention prefix must not consume the SWA row reserve."""
+    kv_cache_groups = [
+        KVCacheGroupSpec(
+            ["full"],
+            FullAttentionSpec(
+                block_size=16,
+                num_kv_heads=1,
+                head_size=1,
+                dtype=torch.float32,
+            ),
+        ),
+        KVCacheGroupSpec(
+            ["swa"],
+            SlidingWindowSpec(
+                block_size=4,
+                num_kv_heads=1,
+                head_size=1,
+                dtype=torch.float32,
+                sliding_window=8,
+            ),
+        ),
+    ]
+    runner = request_runner(
+        block_size=4,
+        num_gpu_blocks=32,
+        async_scheduling=False,
+        kv_cache_groups=kv_cache_groups,
+    )
+
+    runner.new_request(token_ids=[0] * 32)
+    req_status = runner.connector_scheduler._req_status[str(runner.req_id)]
+    req_status.update_offload_keys()
+    runner.connector_scheduler._bounded_restore_capacity = 3
+
+    # Two full-attention chunks would need 2 + 2 SWA rows and overflow.
+    # One chunk needs exactly 1 + 2 rows, so the first restore window ends
+    # at 16 tokens and leaves a valid common prefix for both cache groups.
+    assert (
+        runner.connector_scheduler._bounded_max_hit_size_tokens(
+            req_status,
+            num_computed_tokens=0,
+            max_hit_size_tokens=32,
+        )
+        == 16
+    )
+
+
+def test_incremental_load_ignores_pending_blocks_before_resume_boundary():
+    """An earlier SWA window must not be counted as pending again."""
+    blocks = [
+        SimpleNamespace(is_null=True, block_hash=None) for _ in range(10)
+    ]
+    # An active block from the completed first window remains visible before
+    # the resume boundary. The next window has one active destination at 9.
+    blocks[6] = SimpleNamespace(is_null=False, block_hash=None)
+    blocks[9] = SimpleNamespace(is_null=False, block_hash=None)
+
+    assert (
+        OffloadingConnectorScheduler._first_pending_gpu_block_index(
+            blocks,
+            num_gpu_blocks=10,
+            num_locally_computed_tokens=32,
+            tokens_per_block=4,
+        )
+        == 9
+    )
+
+
 @pytest.mark.parametrize("async_scheduling", [True, False])
 def test_stale_sliding_window_block_after_prepare_store_failure(
     request_runner, async_scheduling: bool

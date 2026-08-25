@@ -11,14 +11,19 @@ NIC=${NIC:-eth0}                    # fast NIC interface name (NCCL/TP/GLOO)
 HCA=${HCA:-}                        # RoCE HCA(s), e.g. rocep1s0f0 (empty = TCP over NIC)
 CACHE_DIR=${CACHE_DIR:-/mnt/cache}  # KV cache dir: local NVMe, attached disk, or a mount
 VENV=${VENV:-$HOME/vllm027-venv}    # venv with this fork installed
+MODEL=${MODEL:-deepseek-ai/DeepSeek-V4-Flash-0731}
+CONFIG_FILE=${CONFIG_FILE:-$(dirname "${BASH_SOURCE[0]}")/ds4f.env}
+MAX_NUM_SEQS=${MAX_NUM_SEQS:-6}
 # ------------------------------------
 
 source "$VENV/bin/activate"
 
 # load the recipe knobs (TRIAL_*, DSPARK_*, VLLM_*) into the environment
 set -a
-source "$(dirname "${BASH_SOURCE[0]}")/ds4f.env"
+source "$CONFIG_FILE"
 set +a
+
+KV_LOAD_FAILURE_POLICY=${KV_LOAD_FAILURE_POLICY:-recompute}
 
 # per-node KV directory (head and worker use distinct subdirs; with the relay on,
 # only the head actually stores and reads there)
@@ -32,7 +37,7 @@ export NCCL_CROSS_NIC=1 NCCL_IB_GID_INDEX=3
 
 # serve args, identical on both nodes, one per line
 ARGS=(
-  deepseek-ai/DeepSeek-V4-Flash-0731
+  "$MODEL"
   --served-model-name deepseek-v4-flash-0731
   --trust-remote-code
   --tensor-parallel-size 2
@@ -43,14 +48,15 @@ ARGS=(
   --kv-cache-dtype fp8_ds_mla
   --block-size 256
   --max-model-len "$TRIAL_MML"
-  --max-num-seqs 6
+  --max-num-seqs "$MAX_NUM_SEQS"
   --max-num-batched-tokens "$TRIAL_MNBT"
   --long-prefill-token-threshold 1024
   --gpu-memory-utilization "$TRIAL_GPUUTIL"
   --kv-cache-memory "$TRIAL_KVMEM"
   --kv-offloading-size "$TRIAL_KVOFF"
-  --kv-transfer-config "{\"kv_connector\":\"OffloadingConnector\",\"kv_role\":\"kv_both\",\"kv_load_failure_policy\":\"recompute\",\"kv_connector_extra_config\":{\"spec_name\":\"TieringOffloadingSpec\",\"canonical_layout\":$TRIAL_KVCANON,\"dspark_compact_packed\":$TRIAL_KVCOMPACT,\"blocks_per_chunk\":$TRIAL_KVBPC,\"secondary_tiers\":[{\"type\":\"fs\",\"root_dir\":\"$TRIAL_KVFS_DIR\",\"n_read_threads\":$TRIAL_KVRT,\"n_write_threads\":8}]}}"
+  --kv-transfer-config "{\"kv_connector\":\"OffloadingConnector\",\"kv_role\":\"kv_both\",\"kv_load_failure_policy\":\"$KV_LOAD_FAILURE_POLICY\",\"kv_connector_extra_config\":{\"spec_name\":\"TieringOffloadingSpec\",\"canonical_layout\":$TRIAL_KVCANON,\"dspark_compact_packed\":$TRIAL_KVCOMPACT,\"blocks_per_chunk\":$TRIAL_KVBPC,\"secondary_tiers\":[{\"type\":\"fs\",\"root_dir\":\"$TRIAL_KVFS_DIR\",\"n_read_threads\":$TRIAL_KVRT,\"n_write_threads\":8}]}}"
   --enable-prefix-caching
+  --enable-prompt-tokens-details
   --enable-chunked-prefill
   --tokenizer-mode deepseek_v4
   --tool-call-parser deepseek_v4
@@ -59,5 +65,10 @@ ARGS=(
   --default-chat-template-kwargs "{\"thinking\":true,\"reasoning_effort\":\"$TRIAL_THINK\"}"
   --moe-backend "$TRIAL_MOE"
   --linear-backend "$TRIAL_LINEAR"
-  --speculative-config "{\"method\":\"dspark\",\"num_speculative_tokens\":$TRIAL_SPEC_N}"
 )
+
+if [[ "${TRIAL_SPEC:-dspark}" != "none" ]]; then
+  ARGS+=(
+    --speculative-config "{\"method\":\"$TRIAL_SPEC\",\"num_speculative_tokens\":$TRIAL_SPEC_N}"
+  )
+fi

@@ -2,6 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 import itertools
+import os
 from collections.abc import Sequence
 from dataclasses import dataclass
 from typing import Literal, overload
@@ -485,6 +486,23 @@ class KVCacheManager:
             )
             required_blocks = num_blocks_to_allocate + watermark_blocks
             if required_blocks > self.block_pool.get_num_free_blocks():
+                if os.environ.get("DSPARK_BOUNDED_RESTORE_DIAGNOSTICS") == "1":
+                    logger.warning(
+                        "Bounded restore full-sequence admission blocked "
+                        "req=%s computed=%d local=%d external=%d required=%d "
+                        "free=%d watermark=%d group_blocks=%s",
+                        request.request_id,
+                        request.num_computed_tokens,
+                        num_local_computed_tokens,
+                        num_external_computed_tokens,
+                        required_blocks,
+                        self.block_pool.get_num_free_blocks(),
+                        watermark_blocks,
+                        [
+                            len(manager.req_to_blocks.get(request.request_id, ()))
+                            for manager in self.coordinator.single_type_managers
+                        ],
+                    )
                 return None
 
         num_tokens_main_model = total_computed_tokens + num_new_tokens
@@ -524,6 +542,27 @@ class KVCacheManager:
         required_blocks = num_blocks_to_allocate + watermark_blocks
         if required_blocks > available_blocks:
             # Cannot allocate new blocks
+            if os.environ.get("DSPARK_BOUNDED_RESTORE_DIAGNOSTICS") == "1":
+                logger.warning(
+                    "Bounded restore GPU allocation blocked req=%s "
+                    "computed=%d local=%d external=%d total=%d required=%d "
+                    "available=%d free=%d reserved=%d watermark=%d "
+                    "group_blocks=%s",
+                    request.request_id,
+                    request.num_computed_tokens,
+                    num_local_computed_tokens,
+                    num_external_computed_tokens,
+                    total_computed_tokens,
+                    required_blocks,
+                    available_blocks,
+                    self.block_pool.get_num_free_blocks(),
+                    reserved_blocks,
+                    watermark_blocks,
+                    [
+                        len(manager.req_to_blocks.get(request.request_id, ()))
+                        for manager in self.coordinator.single_type_managers
+                    ],
+                )
             return None
 
         if (

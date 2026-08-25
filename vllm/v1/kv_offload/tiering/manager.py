@@ -20,6 +20,7 @@ Key Design Principles:
    protecting blocks from eviction until complete_read() is called
 """
 
+import os
 import time
 from collections.abc import Collection, Iterable, Sequence
 from dataclasses import dataclass, field
@@ -205,6 +206,13 @@ class TieringOffloadingManager(OffloadingManager):
             SecondaryTierManager, dict[str, PendingPromotion]
         ] = {}
 
+        # Primary rows confirmed as hits during the current scheduler step.
+        # A long secondary prefix may exceed primary capacity; promotions later
+        # in the same lookup must stop at that capacity boundary instead of
+        # evicting the leading rows before the connector can load them to GPU.
+        # prepare_load() pins the accepted window before this set is cleared.
+        self._promotion_protected_keys: set[OffloadKey] = set()
+
         # Compact packed multi-node: keys promoted from the fs tier. A
         # promotion only writes the scheduler node's mmap, so loads of
         # these keys carry the file path and each worker preads the shared
@@ -229,6 +237,28 @@ class TieringOffloadingManager(OffloadingManager):
         # Buffers manager-level observations (e.g. lookup delay) between
         # get_stats() calls; merged in and reset each time get_stats() runs.
         self._stats = OffloadingConnectorStats()
+
+        # Opt-in diagnostics for bounded multi-window restore. Keep these
+        # disabled by default because lookup() runs once per offload key and
+        # may be called thousands of times while a request is deferred.
+        self._restore_diagnostics = (
+            os.environ.get("DSPARK_BOUNDED_RESTORE_DIAGNOSTICS") == "1"
+        )
+        self._last_pending_signature: tuple[str, int, int, int, int, int] | None = None
+        self._last_retry_signature: tuple[str, str, int, int, int, int, int] | None = (
+            None
+        )
+        self._last_blocked_promotion: tuple[str, int, int, int, int] | None = None
+
+    def _primary_debug_counts(self) -> tuple[int, int, int, int]:
+        """Return (free, evictable, write-pending, allocated) for diagnostics."""
+        primary = self.primary_tier
+        return (
+            primary._get_num_free_blocks(),
+            primary._num_evictable_cache_blocks,
+            primary._num_write_pending_blocks,
+            primary._num_allocated_blocks,
+        )
 
     def _next_job_id(self) -> JobId:
         """Generate a unique job ID for async transfer tracking."""
@@ -277,6 +307,17 @@ class TieringOffloadingManager(OffloadingManager):
                         job_metadata.req_context,
                         completed_job.success,
                     )
+                    if self._restore_diagnostics:
+                        logger.warning(
+                            "Bounded restore staging promotion complete "
+                            "req=%s job=%d keys=%d success=%s free=%d "
+                            "evictable=%d write_pending=%d allocated=%d",
+                            job_metadata.req_context.req_id,
+                            job_id,
+                            len(job_metadata.keys),
+                            completed_job.success,
+                            *self._primary_debug_counts(),
+                        )
                     if completed_job.success and hasattr(tier, "file_mapper"):
                         self._fs_promoted_keys.update(job_metadata.keys)
                 else:
@@ -325,8 +366,39 @@ class TieringOffloadingManager(OffloadingManager):
 
         primary_hit = self.primary_tier.lookup(key, req_context)
         if primary_hit is LookupResult.HIT:
+            self._promotion_protected_keys.add(key)
             return LookupResult.HIT
         if primary_hit is LookupResult.HIT_PENDING:
+            if self._restore_diagnostics:
+                free, evictable, write_pending, allocated = (
+                    self._primary_debug_counts()
+                )
+                signature = (
+                    req_context.req_id,
+                    free,
+                    evictable,
+                    write_pending,
+                    allocated,
+                    len(self._transfer_jobs),
+                )
+                if signature != self._last_pending_signature:
+                    self._last_pending_signature = signature
+                    logger.warning(
+                        "Bounded restore primary HIT_PENDING req=%s key=%s "
+                        "free=%d evictable=%d write_pending=%d allocated=%d "
+                        "transfer_jobs=%d pending_promotions=%d",
+                        req_context.req_id,
+                        key.hex(),
+                        free,
+                        evictable,
+                        write_pending,
+                        allocated,
+                        len(self._transfer_jobs),
+                        sum(
+                            len(by_req)
+                            for by_req in self._pending_load_submissions.values()
+                        ),
+                    )
             return LookupResult.HIT_PENDING
 
         lookup_start = time.monotonic()
@@ -356,6 +428,34 @@ class TieringOffloadingManager(OffloadingManager):
                 )
             if result is LookupResult.RETRY:
                 any_retry = True
+                if self._restore_diagnostics:
+                    free, evictable, write_pending, allocated = (
+                        self._primary_debug_counts()
+                    )
+                    signature = (
+                        req_context.req_id,
+                        str(tier.tier_type),
+                        free,
+                        evictable,
+                        write_pending,
+                        allocated,
+                        len(self._transfer_jobs),
+                    )
+                    if signature != self._last_retry_signature:
+                        self._last_retry_signature = signature
+                        logger.warning(
+                            "Bounded restore secondary RETRY req=%s key=%s "
+                            "tier=%s free=%d evictable=%d write_pending=%d "
+                            "allocated=%d transfer_jobs=%d",
+                            req_context.req_id,
+                            key.hex(),
+                            tier.tier_type,
+                            free,
+                            evictable,
+                            write_pending,
+                            allocated,
+                            len(self._transfer_jobs),
+                        )
 
         self._accumulate_lookup_sync_delay(req_state, lookup_start)
         if any_retry:
@@ -419,11 +519,45 @@ class TieringOffloadingManager(OffloadingManager):
         # Must happen immediately so primary.lookup() returns None (in-flight)
         # for this key on any subsequent lookup() call within the same step,
         # preventing duplicate promotion attempts.
-        primary_write_result = self.primary_tier.prepare_write([key], req_context)
+        primary_write_result = self.primary_tier.prepare_store(
+            [key],
+            req_context,
+            protected_keys=self._promotion_protected_keys,
+        )
 
         if primary_write_result is None:
             # Primary tier is full; caller should treat the block as unavailable
             # rather than retrying indefinitely.
+            if self._restore_diagnostics:
+                free, evictable, write_pending, allocated = (
+                    self._primary_debug_counts()
+                )
+                signature = (
+                    req_context.req_id,
+                    free,
+                    evictable,
+                    write_pending,
+                    len(self._promotion_protected_keys),
+                )
+                if signature != self._last_blocked_promotion:
+                    self._last_blocked_promotion = signature
+                    logger.warning(
+                        "Bounded restore promotion blocked req=%s key=%s "
+                        "free=%d evictable=%d write_pending=%d allocated=%d "
+                        "protected=%d transfer_jobs=%d pending_promotions=%d",
+                        req_context.req_id,
+                        key.hex(),
+                        free,
+                        evictable,
+                        write_pending,
+                        allocated,
+                        len(self._promotion_protected_keys),
+                        len(self._transfer_jobs),
+                        sum(
+                            len(by_req)
+                            for by_req in self._pending_load_submissions.values()
+                        ),
+                    )
             return False
 
         store_spec = primary_write_result.store_spec
@@ -528,6 +662,14 @@ class TieringOffloadingManager(OffloadingManager):
             req_context: Per-request context.
         """
         self.primary_tier.complete_load(keys, req_context)
+        if self._restore_diagnostics:
+            logger.warning(
+                "Bounded restore GPU load complete req=%s keys=%d "
+                "free=%d evictable=%d write_pending=%d allocated=%d",
+                req_context.req_id,
+                len(keys),
+                *self._primary_debug_counts(),
+            )
 
     @override
     def prepare_store(
@@ -775,6 +917,7 @@ class TieringOffloadingManager(OffloadingManager):
         self._processed_jobs_this_step = False
 
         self._flush_pending_promotions()
+        self._promotion_protected_keys.clear()
         for tier in self.secondary_tiers:
             tier.on_schedule_end(context)
 
@@ -830,6 +973,7 @@ class TieringOffloadingManager(OffloadingManager):
         # reset below invalidates; their submit_load() has not yet been
         # called so no tier I/O is touching that memory.
         self._pending_load_submissions.clear()
+        self._promotion_protected_keys.clear()
 
         finished_req_ids = []
         for req_id, state in self._req_state.items():

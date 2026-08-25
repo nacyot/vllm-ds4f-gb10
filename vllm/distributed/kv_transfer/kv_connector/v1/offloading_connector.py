@@ -1,5 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+import os
 from collections.abc import Iterable
 from typing import Any
 
@@ -56,6 +57,10 @@ class OffloadingConnector(KVConnectorBase_V1, SupportsHMA):
         # Runs as kv_both, but is a best-effort cache: a dropped save is just a
         # future cache miss, so opt out of the producer-role default.
         return False
+
+    @property
+    def supports_incremental_kv_load(self) -> bool:
+        return os.environ.get("DSPARK_BOUNDED_WARM_RESTORE") == "1"
 
     def __init__(
         self,

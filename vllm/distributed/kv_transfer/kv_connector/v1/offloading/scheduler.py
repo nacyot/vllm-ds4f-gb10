@@ -1,5 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+import os
 import time
 from collections.abc import Iterable, Sequence
 from dataclasses import dataclass, field
@@ -456,6 +457,16 @@ class OffloadingConnectorScheduler:
         )
         self.manager: OffloadingManager = spec.get_manager()
         self._connector_stats = OffloadingConnectorStats()
+        self._bounded_restore_capacity: int | None = None
+        if os.environ.get("DSPARK_BOUNDED_WARM_RESTORE") == "1":
+            capacity = int(getattr(spec, "num_blocks", 0))
+            if capacity > 0:
+                self._bounded_restore_capacity = capacity
+        self._restore_diagnostics = (
+            os.environ.get("DSPARK_BOUNDED_RESTORE_DIAGNOSTICS") == "1"
+        )
+        self._last_restore_lookup_diag: dict[tuple[str, int], tuple] = {}
+        self._active_restore_lookup_diag: dict[str, int] | None = None
 
         full_attention_groups: list[int] = []
         sliding_window_groups: list[int] = []
@@ -556,6 +567,9 @@ class OffloadingConnectorScheduler:
         defer_lookup = False
         for local_idx, key in enumerate(keys):
             result = self.manager.lookup(key, req_context)
+            diagnostics = getattr(self, "_active_restore_lookup_diag", None)
+            if diagnostics is not None:
+                diagnostics[result.name] = diagnostics.get(result.name, 0) + 1
             match result:
                 case LookupResult.HIT:
                     self._events_tracker.record_lookup(
@@ -588,7 +602,11 @@ class OffloadingConnectorScheduler:
         defer_lookup = False
         consecutive_hits = 0
         for idx in range(len(keys) - 1, -1, -1):
-            match self.manager.lookup(keys[idx], req_context):
+            result = self.manager.lookup(keys[idx], req_context)
+            diagnostics = getattr(self, "_active_restore_lookup_diag", None)
+            if diagnostics is not None:
+                diagnostics[result.name] = diagnostics.get(result.name, 0) + 1
+            match result:
                 case LookupResult.HIT:
                     consecutive_hits += 1
                 case LookupResult.HIT_PENDING:
@@ -650,6 +668,12 @@ class OffloadingConnectorScheduler:
                     max_hit_size_tokens, self._mamba_align_size
                 )
 
+        max_hit_size_tokens = self._bounded_max_hit_size_tokens(
+            req_status,
+            num_computed_tokens=num_computed_tokens,
+            max_hit_size_tokens=max_hit_size_tokens,
+        )
+
         num_hit_tokens: int = 0
         defer_lookup = False
         lookup_groups = self._lookup_groups
@@ -706,23 +730,53 @@ class OffloadingConnectorScheduler:
                 # end index (in the sliced offload_keys) up to which we
                 # have backend-confirmed hits
                 num_hit_chunks: int | None
-                if sliding_window_size_in_chunks is None:
-                    num_hit_chunks = self._maximal_prefix_lookup(
-                        offload_keys,
-                        req_status.req_context,
-                        req_status.req,
-                        group_config,
-                        start_chunk_idx,
+                diagnostics = {} if self._restore_diagnostics else None
+                self._active_restore_lookup_diag = diagnostics
+                try:
+                    if sliding_window_size_in_chunks is None:
+                        num_hit_chunks = self._maximal_prefix_lookup(
+                            offload_keys,
+                            req_status.req_context,
+                            req_status.req,
+                            group_config,
+                            start_chunk_idx,
+                        )
+                    else:
+                        required_window = sliding_window_size_in_chunks
+                        if is_eagle_unverified:
+                            required_window += 1
+                        num_hit_chunks = self._sliding_window_lookup(
+                            offload_keys,
+                            required_window,
+                            req_status.req_context,
+                        )
+                finally:
+                    self._active_restore_lookup_diag = None
+                if diagnostics is not None:
+                    diag_key = (req_status.req.request_id, group_idx)
+                    diag_signature = (
+                        num_computed_tokens,
+                        max_hit_size_tokens,
+                        num_hit_chunks,
+                        tuple(sorted(diagnostics.items())),
                     )
-                else:
-                    required_window = sliding_window_size_in_chunks
-                    if is_eagle_unverified:
-                        required_window += 1
-                    num_hit_chunks = self._sliding_window_lookup(
-                        offload_keys,
-                        required_window,
-                        req_status.req_context,
-                    )
+                    if self._last_restore_lookup_diag.get(diag_key) != diag_signature:
+                        self._last_restore_lookup_diag[diag_key] = diag_signature
+                        logger.warning(
+                            "Bounded restore lookup req=%s group=%d kind=%s "
+                            "computed=%d max_hit=%d result=%s counts=%s",
+                            req_status.req.request_id,
+                            group_idx,
+                            (
+                                "full"
+                                if sliding_window_size_in_chunks is None
+                                else "sliding"
+                            ),
+                            num_computed_tokens,
+                            max_hit_size_tokens,
+                            num_hit_chunks,
+                            diagnostics,
+                        )
                 if num_hit_chunks == 0:
                     return 0
 
@@ -800,6 +854,69 @@ class OffloadingConnectorScheduler:
         )
 
         return num_hit_tokens
+
+    def _bounded_max_hit_size_tokens(
+        self,
+        req_status: RequestOffloadState,
+        num_computed_tokens: int,
+        max_hit_size_tokens: int,
+    ) -> int:
+        """Fit one common hybrid-cache restore window in CPU staging.
+
+        Full-attention groups need every chunk in the restored prefix, while
+        sliding-window groups need only their trailing window. Reserving the
+        latter before lookup prevents an early full-attention scan from using
+        every fixed staging row and invalidating the whole hybrid-cache hit.
+        """
+        capacity = self._bounded_restore_capacity
+        if capacity is None or max_hit_size_tokens <= num_computed_tokens:
+            return max_hit_size_tokens
+
+        full_chunk_sizes = [
+            group.tokens_per_chunk
+            for group in self.config.kv_group_configs
+            if group.sliding_window_size_in_chunks is None
+        ]
+        if not full_chunk_sizes:
+            return max_hit_size_tokens
+        alignment = min(full_chunk_sizes)
+        start_step = cdiv(num_computed_tokens, alignment)
+        end_step = max_hit_size_tokens // alignment
+        if end_step <= start_step:
+            return num_computed_tokens
+
+        def required_rows(candidate_end: int) -> int:
+            total = 0
+            for group, state in zip(
+                self.config.kv_group_configs, req_status.group_states
+            ):
+                tokens_per_chunk = group.tokens_per_chunk
+                start_chunk = num_computed_tokens // tokens_per_chunk
+                end_chunk = min(
+                    cdiv(candidate_end, tokens_per_chunk),
+                    len(state.offload_keys),
+                )
+                available_chunks = max(0, end_chunk - start_chunk)
+                sliding_window = group.sliding_window_size_in_chunks
+                if sliding_window is None:
+                    total += available_chunks
+                else:
+                    required_window = sliding_window + int(group.is_eagle_group)
+                    total += min(available_chunks, required_window)
+            return total
+
+        low = 0
+        high = end_step - start_step
+        while low < high:
+            mid = (low + high + 1) // 2
+            candidate_end = (start_step + mid) * alignment
+            if required_rows(candidate_end) <= capacity:
+                low = mid
+            else:
+                high = mid - 1
+
+        bounded_end = (start_step + low) * alignment
+        return max(num_computed_tokens, min(max_hit_size_tokens, bounded_end))
 
     def on_new_request(self, request: Request) -> None:
         """Called when a new request is added to the scheduler."""
@@ -901,12 +1018,14 @@ class OffloadingConnectorScheduler:
             num_gpu_blocks = cdiv(num_cached_tokens, tokens_per_block)
 
             assert len(group_blocks) >= num_gpu_blocks
-            num_locally_computed_gpu_blocks = num_gpu_blocks
-            # Skip null placeholder blocks (used for sliding window or mamba padding).
-            for i, block in enumerate(group_blocks[:num_gpu_blocks]):
-                if not block.is_null and block.block_hash is None:
-                    num_locally_computed_gpu_blocks = i
-                    break
+            num_locally_computed_gpu_blocks = (
+                self._first_pending_gpu_block_index(
+                    group_blocks,
+                    num_gpu_blocks=num_gpu_blocks,
+                    num_locally_computed_tokens=num_locally_computed_tokens,
+                    tokens_per_block=tokens_per_block,
+                )
+            )
 
             assert (
                 num_locally_computed_tokens
@@ -968,6 +1087,28 @@ class OffloadingConnectorScheduler:
 
         if self._chunks_being_loaded is not None:
             self._chunks_being_loaded.update(keys_to_load)
+
+    @staticmethod
+    def _first_pending_gpu_block_index(
+        group_blocks: Sequence[Any],
+        num_gpu_blocks: int,
+        num_locally_computed_tokens: int,
+        tokens_per_block: int,
+    ) -> int:
+        """Find the first new external-load destination after a resume point."""
+        scan_start = min(
+            num_gpu_blocks,
+            num_locally_computed_tokens // tokens_per_block,
+        )
+        # Null placeholders represent evicted sliding-window or padded blocks.
+        # An active block with no hash is the first destination that still
+        # needs KV data. Earlier active blocks belong to completed windows.
+        for i, block in enumerate(
+            group_blocks[scan_start:num_gpu_blocks], start=scan_start
+        ):
+            if not block.is_null and block.block_hash is None:
+                return i
+        return num_gpu_blocks
 
     def _update_req_states(self, scheduler_output: SchedulerOutput) -> None:
         """

@@ -201,6 +201,37 @@ def test_already_stored_block_not_evicted_during_prepare_store(eviction_policy):
     assert manager.lookup(to_key(2), _EMPTY_REQ_CTX) is LookupResult.HIT
 
 
+@pytest.mark.parametrize("eviction_policy", ["lru", "arc"])
+def test_prepare_store_respects_additional_protected_keys(eviction_policy):
+    """A bounded restore window must not evict rows already matched this step."""
+    manager = make_cpu_manager(num_blocks=2, cache_policy=eviction_policy)
+    resident = to_keys([1, 2])
+    incoming = to_keys([3])
+
+    manager.prepare_store(resident, _EMPTY_REQ_CTX)
+    manager.complete_store(resident, _EMPTY_REQ_CTX)
+
+    assert (
+        manager.prepare_store(
+            incoming,
+            _EMPTY_REQ_CTX,
+            protected_keys=resident,
+        )
+        is None
+    )
+    assert manager.lookup(resident[0], _EMPTY_REQ_CTX) is LookupResult.HIT
+    assert manager.lookup(resident[1], _EMPTY_REQ_CTX) is LookupResult.HIT
+
+    output = manager.prepare_store(
+        incoming,
+        _EMPTY_REQ_CTX,
+        protected_keys=[resident[1]],
+    )
+    assert output is not None
+    assert output.evicted_keys == [resident[0]]
+    assert manager.lookup(resident[1], _EMPTY_REQ_CTX) is LookupResult.HIT
+
+
 def test_filter_reused_manager_reports_stores_skipped_counter():
     manager = make_cpu_manager(
         num_blocks=4,

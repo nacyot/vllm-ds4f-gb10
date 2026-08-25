@@ -207,13 +207,24 @@ class KVCacheCoordinator(ABC):
             num_local_computed_tokens: The number of local computed tokens.
             num_external_computed_tokens: The number of external computed tokens.
         """
-        # A running request is already tracked in num_cached_block and won't
-        # have new prefix-cache hits, so this is a no-op for it.
-        if any(
+        tracked_groups = [
             request_id in manager.num_cached_block
             for manager in self.single_type_managers
-        ):
+        ]
+        if any(tracked_groups):
+            assert all(tracked_groups)
             assert all(len(blocks) == 0 for blocks in new_computed_blocks)
+            # A normal running request has no new prefix hit. An opt-in
+            # incremental KV connector is different: its next external window
+            # still needs destination blocks, including sparse/null padding for
+            # sliding-window groups.
+            if num_external_computed_tokens > 0:
+                for manager in self.single_type_managers:
+                    manager.allocate_external_computed_blocks(
+                        request_id,
+                        num_local_computed_tokens,
+                        num_external_computed_tokens,
+                    )
             return
 
         # Two-phase allocation (issue #33775): first touch every group's local

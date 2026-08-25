@@ -1837,8 +1837,110 @@ def _step_until_kv_transfer_finished(scheduler: Scheduler, req_ids: list[str]):
     scheduler.update_from_output(output, MODEL_RUNNER_OUTPUT)
     for req_id in req_ids:
         assert req_id in scheduler.finished_recving_kv_req_ids
-
     return initial_ecos
+
+
+def test_incremental_external_load_resumes_remote_lookup(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    """An opt-in connector may fill one long prefix in four async windows."""
+    block_size = 16
+    window_tokens = block_size * 2
+    num_windows = 4
+    scheduler = create_scheduler(
+        enable_prefix_caching=True,
+        use_kv_connector=mock_kv(
+            matched_tokens=window_tokens,
+            is_async=True,
+        ),
+        block_size=block_size,
+    )
+    assert scheduler.connector is not None
+    monkeypatch.setattr(
+        type(scheduler.connector),
+        "supports_incremental_kv_load",
+        property(lambda _self: True),
+        raising=False,
+    )
+
+    matched_from: list[int] = []
+    original_lookup = scheduler.connector.get_num_new_matched_tokens
+
+    def tracked_lookup(request, num_computed_tokens):
+        matched_from.append(num_computed_tokens)
+        return original_lookup(request, num_computed_tokens)
+
+    monkeypatch.setattr(
+        scheduler.connector,
+        "get_num_new_matched_tokens",
+        tracked_lookup,
+    )
+
+    reservation_exclusions: list[str | None] = []
+    original_reserved_blocks = scheduler._inflight_prefill_reserved_blocks
+
+    def tracked_reserved_blocks(exclude_request_id=None):
+        reservation_exclusions.append(exclude_request_id)
+        return original_reserved_blocks(exclude_request_id=exclude_request_id)
+
+    monkeypatch.setattr(
+        scheduler,
+        "_inflight_prefill_reserved_blocks",
+        tracked_reserved_blocks,
+    )
+
+    (request,) = create_requests(
+        num_requests=1,
+        num_tokens=window_tokens * num_windows + 1,
+        max_tokens=3,
+        block_size=block_size,
+    )
+    scheduler.add_request(request)
+    _step_until_kv_transfer_finished(scheduler, [request.request_id])
+
+    empty_output = ModelRunnerOutput(
+        req_ids=[],
+        req_id_to_index={},
+        sampled_token_ids=[],
+        logprobs=None,
+        prompt_logprobs_dict={},
+        pooler_output=[],
+    )
+
+    for completed_windows in range(2, num_windows + 1):
+        # Each completed window immediately starts the next remote load from
+        # the previous boundary instead of locally prefilling the suffix.
+        load_output = scheduler.schedule()
+        assert request.status == RequestStatus.WAITING_FOR_REMOTE_KVS
+        assert request.num_computed_tokens == window_tokens * completed_windows
+        assert matched_from == [
+            window_tokens * i for i in range(completed_windows)
+        ]
+
+        scheduler.update_from_output(load_output, empty_output)
+        poll_output = scheduler.schedule()
+        completed_output = ModelRunnerOutput(
+            req_ids=[],
+            req_id_to_index={},
+            sampled_token_ids=[],
+            logprobs=None,
+            prompt_logprobs_dict={},
+            pooler_output=[],
+            kv_connector_output=KVConnectorOutput(
+                finished_recving=[request.request_id]
+            ),
+        )
+        scheduler.update_from_output(poll_output, completed_output)
+
+    # Once all four windows are attached, the remaining one-token sampling
+    # tail runs locally. A fifth remote lookup would be both redundant and an
+    # infinite-loop risk for connectors that report fixed-size windows.
+    final_output = scheduler.schedule()
+    assert request.status == RequestStatus.RUNNING
+    assert final_output.num_scheduled_tokens[request.request_id] == 1
+    assert matched_from == [window_tokens * i for i in range(num_windows)]
+    assert reservation_exclusions
+    assert set(reservation_exclusions) == {request.request_id}
 
 
 @pytest.mark.parametrize("is_async", [False, True])
@@ -5536,6 +5638,32 @@ def test_async_load_reservation_prevents_wedge_e2e():
     assert b.status == RequestStatus.WAITING
     assert b.num_preemptions == 0
     assert b.request_id not in req_to_blocks
+
+
+def test_inflight_prefill_reservation_excludes_current_request(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    """A resumed async restore must not reserve its own remaining blocks twice."""
+    scheduler = create_scheduler()
+    current, other = create_requests(
+        num_requests=2,
+        num_tokens=64,
+        req_ids=["current", "other"],
+    )
+    scheduler._inflight_prefills.update((current, other))
+    remaining = {current.request_id: 7, other.request_id: 5}
+    monkeypatch.setattr(
+        scheduler,
+        "_request_remaining_blocks",
+        lambda request: remaining[request.request_id],
+    )
+
+    assert (
+        scheduler._inflight_prefill_reserved_blocks(
+            exclude_request_id=current.request_id
+        )
+        == 5
+    )
 
 
 def _create_hybrid_mamba_connector_scheduler(

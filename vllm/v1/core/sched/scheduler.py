@@ -742,6 +742,16 @@ class Scheduler(SchedulerInterface):
                 connector_prefix_cache_queries, connector_prefix_cache_hits = 0, 0
                 did_prefix_cache_lookup = False
 
+                incremental_external_lookup = bool(
+                    request.num_computed_tokens > 0
+                    and self.connector is not None
+                    and self.connector.supports_incremental_kv_load
+                    # A full hit is reduced by one token after transfer so the
+                    # model can sample. Do not treat that deliberate tail
+                    # recompute as another restore window.
+                    and request.num_computed_tokens < request.num_tokens - 1
+                )
+
                 # Get already-cached tokens.
                 if request.num_computed_tokens == 0:
                     did_prefix_cache_lookup = True
@@ -852,6 +862,36 @@ class Scheduler(SchedulerInterface):
                             num_local_cached_tokens=num_new_local_computed_tokens,
                             num_external_cached_tokens=num_external_computed_tokens,
                         )
+
+                elif incremental_external_lookup:
+                    # The previous async window is already attached to this
+                    # request. Ask the opt-in connector for the next suffix and
+                    # allocate only that suffix; the prior blocks stay owned by
+                    # the request and were cached after its transfer fence.
+                    assert self.connector is not None
+                    new_computed_blocks = self.kv_cache_manager.empty_kv_cache_blocks
+                    num_new_local_computed_tokens = 0
+                    existing_computed_tokens = request.num_computed_tokens
+                    ext_tokens, load_kv_async = (
+                        self.connector.get_num_new_matched_tokens(
+                            request, existing_computed_tokens
+                        )
+                    )
+                    if ext_tokens is None:
+                        request_queue.pop_request()
+                        step_skipped_waiting.prepend_request(request)
+                        continue
+                    if ext_tokens == 0:
+                        load_kv_async = False
+                    num_external_computed_tokens = ext_tokens
+                    num_computed_tokens = (
+                        existing_computed_tokens + num_external_computed_tokens
+                    )
+                    assert num_computed_tokens <= request.num_tokens
+                    connector_prefix_cache_queries = (
+                        request.num_tokens - existing_computed_tokens
+                    )
+                    connector_prefix_cache_hits = num_external_computed_tokens
                 else:
                     # KVTransfer: WAITING reqs have num_computed_tokens > 0
                     # after async KV recvs are completed.
@@ -969,7 +1009,9 @@ class Scheduler(SchedulerInterface):
                     # no forward progress and isn't preemptible here. Admit it
                     # only if it fits in (free - other in-flight reservations), to
                     # avoid deadlock and predictable preemptions.
-                    reserved_blocks = self._inflight_prefill_reserved_blocks()
+                    reserved_blocks = self._inflight_prefill_reserved_blocks(
+                        exclude_request_id=request.request_id
+                    )
 
                 new_blocks = self.kv_cache_manager.allocate_slots(
                     request,
@@ -2640,11 +2682,20 @@ class Scheduler(SchedulerInterface):
             apply_admission_cap=True,
         )
 
-    def _inflight_prefill_reserved_blocks(self) -> int:
-        """Num blocks in-flight prefills still need to finish (their reservation)."""
+    def _inflight_prefill_reserved_blocks(
+        self, exclude_request_id: str | None = None
+    ) -> int:
+        """Blocks reserved by other in-flight prefills.
+
+        A request resuming an incremental async restore remains in
+        ``_inflight_prefills``. Exclude it from its own admission check because
+        ``allocate_slots`` already counts that request's required blocks.
+        """
 
         return sum(
-            self._request_remaining_blocks(req) for req in self._inflight_prefills
+            self._request_remaining_blocks(req)
+            for req in self._inflight_prefills
+            if req.request_id != exclude_request_id
         )
 
     def _update_waiting_for_remote_kv(self, request: Request) -> None:

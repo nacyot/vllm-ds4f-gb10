@@ -193,6 +193,16 @@ class KVConnectorBase_V1(ABC):
         """
         return self._kv_transfer_config.is_kv_producer
 
+    @property
+    def supports_incremental_kv_load(self) -> bool:
+        """Whether a completed async prefix load may resume remote lookup.
+
+        The default keeps the historical one-shot connector behavior. A
+        connector that returns bounded partial hits can opt in so a long prefix
+        is restored through multiple scheduler/fenced transfer windows.
+        """
+        return False
+
     def __init__(
         self,
         vllm_config: "VllmConfig",
