@@ -259,6 +259,7 @@ def dspark_context_kv_store(
         kv,
         cache,
         positions.contiguous(),
+        _row_map.contiguous(),
         query_start_loc.contiguous(),
         rejected.contiguous(),
         kv_weight,
