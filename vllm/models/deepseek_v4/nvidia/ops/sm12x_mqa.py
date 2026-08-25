@@ -377,12 +377,12 @@ def _fp8_paged_mqa_logits_rowwise_kernel(
         other=0,
     )
     if token_start + pid_n * BLOCK_N >= context_len:
-        logits = tl.full((BLOCK_N,), float("-inf"), dtype=tl.float32)
-        tl.store(
-            logits_ptr + row * stride_lm + offs_local_n * stride_ln,
-            logits,
-            mask=valid_row & valid_n,
-        )
+        # [oob-skip] Every consumer on the SM120 decode path (persistent_topk,
+        # FilteredTopK, top_k_per_row_decode) scans only [0, context_len) per
+        # row, so filling the out-of-context tail with -inf was dead traffic
+        # (~50 MB per call at max_model_len 524k). Programs are still launched
+        # with the same grid and row stride, so CUDA-graph capture is unchanged.
+        # The partial block straddling context_len is still masked below.
         return
     context_mask = valid_n & (offs_n < context_len)
 
