@@ -275,6 +275,21 @@ class PrefillStats:
     num_external_cached_tokens: int = 0
     num_cache_creation_tokens: int = 0
 
+    def initialize(
+        self, num_prompt_tokens: int, num_local_cached_tokens: int
+    ) -> None:
+        """Initialize prompt and local-cache counts before external loads.
+
+        External KV restore windows are committed separately once their
+        transfer succeeds.  Keeping that count at zero here makes the
+        eventual usage reflect committed windows rather than lookup results.
+        """
+        self.set(
+            num_prompt_tokens=num_prompt_tokens,
+            num_local_cached_tokens=num_local_cached_tokens,
+            num_external_cached_tokens=0,
+        )
+
     def set(
         self,
         num_prompt_tokens: int,
@@ -282,6 +297,9 @@ class PrefillStats:
         num_external_cached_tokens: int,
     ):
         num_cached_tokens = num_local_cached_tokens + num_external_cached_tokens
+        assert num_prompt_tokens >= 0
+        assert num_local_cached_tokens >= 0
+        assert num_external_cached_tokens >= 0
         assert num_cached_tokens <= num_prompt_tokens
 
         self.num_prompt_tokens = num_prompt_tokens
@@ -289,6 +307,25 @@ class PrefillStats:
         self.num_cached_tokens = num_cached_tokens
         self.num_local_cached_tokens = num_local_cached_tokens
         self.num_external_cached_tokens = num_external_cached_tokens
+
+    def commit_external_cached_tokens(self, window_tokens: int) -> None:
+        """Record one successfully committed external KV restore window.
+
+        Callers are responsible for invoking this method at most once per
+        committed window.  The update is applied only after validating that
+        the resulting local-plus-external cache total still fits the prompt.
+        """
+        assert window_tokens >= 0
+
+        external_cached_tokens = (
+            self.num_external_cached_tokens + window_tokens
+        )
+        cached_tokens = self.num_local_cached_tokens + external_cached_tokens
+        assert cached_tokens <= self.num_prompt_tokens
+
+        self.num_external_cached_tokens = external_cached_tokens
+        self.num_cached_tokens = cached_tokens
+        self.num_computed_tokens = self.num_prompt_tokens - cached_tokens
 
     def finalize(self, num_cached_tokens: int) -> None:
         assert num_cached_tokens >= 0

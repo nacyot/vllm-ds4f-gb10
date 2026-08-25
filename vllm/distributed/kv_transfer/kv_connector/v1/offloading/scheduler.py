@@ -1,7 +1,9 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+import contextlib
 import os
 import time
+from collections import deque
 from collections.abc import Iterable, Sequence
 from dataclasses import dataclass, field
 from itertools import chain, islice
@@ -12,10 +14,13 @@ from vllm.distributed.kv_events import KVCacheEvent
 from vllm.distributed.kv_transfer.kv_connector.utils import yield_req_data
 from vllm.distributed.kv_transfer.kv_connector.v1.base import KVConnectorMetadata
 from vllm.distributed.kv_transfer.kv_connector.v1.offloading.common import (
+    NodeHeadroomConfig,
+    NodeHeadroomSample,
     OffloadingConnectorMetadata,
     OffloadingWorkerMetadata,
     ReqId,
     TransferJob,
+    read_mem_available_bytes,
 )
 from vllm.distributed.kv_transfer.kv_connector.v1.offloading.events import (
     OffloadingEventGroupSpec,
@@ -64,6 +69,21 @@ MATCHER_MEDIUM_KEY = "medium"
 MATCHER_LOCALITY_KEY = "locality"
 
 
+def _resolve_bounded_restore_capacity(
+    spec: OffloadingSpec, strict_restore_enabled: bool
+) -> int | None:
+    """Resolve the usable row budget without changing the mmap allocation."""
+    if not strict_restore_enabled:
+        return None
+    capacity = int(getattr(spec, "num_blocks", 0))
+    if capacity <= 0:
+        return None
+    max_rows = getattr(spec, "extra_config", {}).get("bounded_restore_max_rows", 0)
+    if isinstance(max_rows, bool) or not isinstance(max_rows, int) or max_rows < 0:
+        raise ValueError("bounded_restore_max_rows must be a non-negative integer")
+    return min(capacity, max_rows) if max_rows > 0 else capacity
+
+
 @dataclass(slots=True)
 class TransferJobStatus:
     """Tracks scheduler-side state for a single transfer job."""
@@ -81,6 +101,19 @@ class TransferJobStatus:
     # Store src block IDs that may be freed before the request finishes.
     # Registered in _block_id_to_pending_jobs at store creation time.
     sliding_window_block_ids: list[int] | None = None
+    # Number of workers that reported a failed transfer.  This is accumulated
+    # across metadata updates because ranks may acknowledge in different
+    # scheduler steps.
+    failed_count: int = 0
+    # Worker identities already consumed for this job.  Completion counts are
+    # intentionally not used for TP acknowledgement deduplication.
+    reported_ranks: set[int] = field(default_factory=set)
+    failed_ranks: set[int] = field(default_factory=set)
+    # Number of external tokens represented by this bounded load window.
+    # Store jobs leave this at zero.
+    external_window_tokens: int = 0
+    # Protect commit-time prefill accounting if completion metadata is replayed.
+    external_stats_committed: bool = False
 
 
 class GroupOffloadConfig(NamedTuple):
@@ -458,10 +491,28 @@ class OffloadingConnectorScheduler:
         self.manager: OffloadingManager = spec.get_manager()
         self._connector_stats = OffloadingConnectorStats()
         self._bounded_restore_capacity: int | None = None
-        if os.environ.get("DSPARK_BOUNDED_WARM_RESTORE") == "1":
-            capacity = int(getattr(spec, "num_blocks", 0))
-            if capacity > 0:
-                self._bounded_restore_capacity = capacity
+        self._strict_restore_fifo_enabled = (
+            os.environ.get("DSPARK_BOUNDED_WARM_RESTORE") == "1"
+        )
+        self._bounded_restore_capacity = _resolve_bounded_restore_capacity(
+            spec, self._strict_restore_fifo_enabled
+        )
+        self._node_headroom_config = NodeHeadroomConfig.from_extra_config(
+            getattr(spec, "extra_config", {}),
+            strict_restore_enabled=self._strict_restore_fifo_enabled,
+        )
+        self._node_headroom_generation = 0
+        self._node_headroom_samples: dict[int, NodeHeadroomSample] = {}
+        self._node_headroom_received_at: dict[int, float] = {}
+
+        # Bounded restore requests share one primary-tier staging/promotion
+        # budget.  Keep admission state here, next to the canonical request
+        # state, so a deferred request can reuse the existing None/False
+        # scheduler path without issuing a lookup or promotion.
+        self._restore_fifo_owner_req_id: ReqId | None = None
+        self._restore_fifo_wait_queue: deque[ReqId] = deque()
+        self._restore_fifo_waiting_req_ids: set[ReqId] = set()
+        self._restore_fifo_release_pending = False
         self._restore_diagnostics = (
             os.environ.get("DSPARK_BOUNDED_RESTORE_DIAGNOSTICS") == "1"
         )
@@ -518,6 +569,188 @@ class OffloadingConnectorScheduler:
 
         self._events_tracker = OffloadingEventsTracker(spec.kv_events_config)
 
+    def _restore_fifo_is_enabled(self) -> bool:
+        return getattr(self, "_strict_restore_fifo_enabled", False)
+
+    def _node_headroom_is_ready(self) -> bool:
+        """Return whether every worker has a fresh, passing heartbeat."""
+        config = self._node_headroom_config
+        if config is None:
+            return True
+
+        local_available = read_mem_available_bytes()
+        if local_available is None or local_available < config.threshold_bytes:
+            return False
+
+        expected_ranks = set(range(self.config.num_workers))
+        if set(self._node_headroom_samples) != expected_ranks:
+            return False
+
+        now = time.monotonic()
+        max_age = config.heartbeat_max_age_ms / 1000.0
+        for rank in expected_ranks:
+            sample = self._node_headroom_samples[rank]
+            if sample.generation != self._node_headroom_generation:
+                return False
+            if (
+                sample.available_bytes is None
+                or sample.available_bytes < config.threshold_bytes
+            ):
+                return False
+            received_at = self._node_headroom_received_at.get(rank)
+            if received_at is None or now - received_at > max_age:
+                return False
+        return True
+
+    def _record_node_headroom(self, meta: OffloadingWorkerMetadata) -> None:
+        """Record rank-preserving worker heartbeats, rejecting stale order."""
+        if self._node_headroom_config is None:
+            return
+
+        samples = dict(meta.node_headroom_by_rank)
+        if meta.worker_rank is not None and meta.node_headroom is not None:
+            samples[meta.worker_rank] = meta.node_headroom
+
+        now = time.monotonic()
+        expected_ranks = set(range(self.config.num_workers))
+        for rank, sample in samples.items():
+            if rank not in expected_ranks:
+                continue
+            if sample.generation != self._node_headroom_generation:
+                continue
+            previous = self._node_headroom_samples.get(rank)
+            if previous is not None and sample.sequence <= previous.sequence:
+                continue
+            self._node_headroom_samples[rank] = sample
+            self._node_headroom_received_at[rank] = now
+
+    def _restore_fifo_remove_queued(self, req_id: ReqId) -> None:
+        """Remove a request that never acquired the restore owner."""
+        waiting = getattr(self, "_restore_fifo_waiting_req_ids", None)
+        queue = getattr(self, "_restore_fifo_wait_queue", None)
+        if waiting is None or queue is None or req_id not in waiting:
+            return
+        waiting.discard(req_id)
+        # Keep the membership set authoritative if a completion races a prior
+        # queue handoff or a test/cleanup path removed the entry.
+        with contextlib.suppress(ValueError):
+            queue.remove(req_id)
+
+    def _restore_fifo_try_acquire(self, req_id: ReqId) -> bool:
+        """Enqueue once and admit only the FIFO head."""
+        if not self._restore_fifo_is_enabled():
+            return True
+
+        owner = self._restore_fifo_owner_req_id
+        if owner is not None:
+            if owner == req_id:
+                return True
+            if req_id not in self._restore_fifo_waiting_req_ids:
+                self._restore_fifo_wait_queue.append(req_id)
+                self._restore_fifo_waiting_req_ids.add(req_id)
+            return False
+
+        if req_id not in self._restore_fifo_waiting_req_ids:
+            self._restore_fifo_wait_queue.append(req_id)
+            self._restore_fifo_waiting_req_ids.add(req_id)
+
+        if not self._restore_fifo_wait_queue:
+            return False
+        if self._restore_fifo_wait_queue[0] != req_id:
+            return False
+
+        self._restore_fifo_wait_queue.popleft()
+        self._restore_fifo_waiting_req_ids.discard(req_id)
+        self._restore_fifo_owner_req_id = req_id
+        self._restore_fifo_release_pending = False
+        return True
+
+    def _restore_fifo_release_if_idle(
+        self,
+        req_id: ReqId,
+        req_status: RequestOffloadState | None,
+        *,
+        force: bool = False,
+    ) -> None:
+        """Release the owner once its load/promotion state is drained.
+
+        ``force`` is reserved for terminal lookup outcomes and failed loads;
+        those paths have already established that no future restore window is
+        possible.  Normal request completion waits for the connector's
+        finished signal so final store preparation cannot race admission.
+        """
+        if self._restore_fifo_owner_req_id != req_id:
+            return
+        if not force:
+            if req_status is None:
+                return
+            if req_status.transfer_jobs or not req_status.finished_signaled:
+                return
+        elif req_status is not None and req_status.transfer_jobs:
+            # A failed/cancelled request still holding a load must keep the
+            # owner until update_connector_output drains that job.
+            return
+
+        self._restore_fifo_owner_req_id = None
+        self._restore_fifo_release_pending = False
+
+    def _restore_fifo_mark_finished(
+        self, req_id: ReqId, req_status: RequestOffloadState
+    ) -> None:
+        """Mark an admitted request terminal, or remove a queued request."""
+        if not self._restore_fifo_is_enabled():
+            return
+        if self._restore_fifo_owner_req_id == req_id:
+            self._restore_fifo_release_pending = True
+            self._restore_fifo_release_if_idle(req_id, req_status)
+        else:
+            self._restore_fifo_remove_queued(req_id)
+
+    def _restore_fifo_mark_lookup_result(
+        self,
+        req_status: RequestOffloadState,
+        num_computed_tokens: int,
+        num_hit_tokens: int | None,
+    ) -> None:
+        """Advance owner lifetime after one bounded lookup window."""
+        if not self._restore_fifo_is_enabled():
+            return
+        req_id = req_status.req.request_id
+        if self._restore_fifo_owner_req_id != req_id:
+            return
+
+        if num_hit_tokens == 0:
+            # A miss is the terminal bounded lookup.  No load can be created
+            # for this result, so the next FIFO head may enter immediately.
+            self._restore_fifo_release_pending = True
+            self._restore_fifo_release_if_idle(req_id, req_status, force=True)
+            return
+
+        if num_hit_tokens is not None:
+            prompt_tokens = getattr(req_status.req, "num_prompt_tokens", 0)
+            # Hybrid DSv4 deliberately recomputes the prompt's last token
+            # after a full restore.  Treat prompt-1 as the terminal boundary
+            # so that this deliberate tail does not strand the FIFO owner.
+            final_window_tokens = max(0, prompt_tokens - 1)
+            if num_computed_tokens + num_hit_tokens >= final_window_tokens:
+                # The final hit window may still have an asynchronous load.
+                # Keep the owner until that job reports completion.
+                self._restore_fifo_release_pending = True
+
+    def _restore_fifo_is_external_lookup(
+        self, req_status: RequestOffloadState, num_computed_tokens: int
+    ) -> bool:
+        """Return whether this call can start a bounded prompt restore."""
+        if not self._restore_fifo_is_enabled():
+            return False
+        request = req_status.req
+        if getattr(request, "skip_reading_prefix_cache", False):
+            return False
+        prompt_tokens = getattr(request, "num_prompt_tokens", 0)
+        # Decode/general-generation calls are deliberately outside the FIFO;
+        # only prompt restore windows compete for the bounded staging budget.
+        return prompt_tokens > 0 and num_computed_tokens < prompt_tokens
+
     def _maybe_observe_lookup_async_delay(
         self, req_status: RequestOffloadState
     ) -> None:
@@ -537,8 +770,10 @@ class OffloadingConnectorScheduler:
 
     def _remove_pending_job(self, job_id: int, block_ids: list[int] | None) -> None:
         for bid in block_ids or ():
-            pending = self._block_id_to_pending_jobs[bid]
-            pending.remove(job_id)
+            pending = self._block_id_to_pending_jobs.get(bid)
+            if pending is None:
+                continue
+            pending.discard(job_id)
             if not pending:
                 del self._block_id_to_pending_jobs[bid]
 
@@ -956,6 +1191,17 @@ class OffloadingConnectorScheduler:
         for group_state in req_status.group_states:
             group_state.block_ids.clear()
 
+        if getattr(request, "skip_reading_prefix_cache", False):
+            # This request cannot issue a restore lookup.  A queued request is
+            # removed immediately; an admitted request has no read job on this
+            # path and can hand the owner to the next FIFO head.
+            self._restore_fifo_mark_finished(req_status.req.request_id, req_status)
+            if self._restore_fifo_owner_req_id == request.request_id:
+                self._restore_fifo_release_pending = True
+                self._restore_fifo_release_if_idle(
+                    request.request_id, req_status, force=True
+                )
+
         if req_status.transfer_jobs:
             logger.debug(
                 "Delaying request %s since it still has in-flight transfers",
@@ -967,9 +1213,24 @@ class OffloadingConnectorScheduler:
         req_status.num_locally_computed_tokens = num_computed_tokens
 
         num_hit_tokens: int | None
-        if request.skip_reading_prefix_cache:
+        if getattr(request, "skip_reading_prefix_cache", False):
             num_hit_tokens = 0
         else:
+            if not self._node_headroom_is_ready():
+                # A node-headroom miss is a transient scheduler defer.  Keep
+                # it before FIFO ownership and lookup/promotion so no staging
+                # row or GPU lease is acquired while any expected TP rank is
+                # missing, stale, or below the configured threshold.
+                return None, False
+
+            if self._restore_fifo_is_external_lookup(
+                req_status, num_computed_tokens
+            ) and not self._restore_fifo_try_acquire(request.request_id):
+                # Reuse the connector's existing defer contract.  In
+                # particular, do not call manager.lookup(), which may initiate
+                # a tier promotion before this request owns the staging rows.
+                return None, False
+
             lookup_start = time.monotonic()
             num_hit_tokens = self._lookup(req_status)
             self._connector_stats.observe_histogram(
@@ -981,6 +1242,9 @@ class OffloadingConnectorScheduler:
                     req_status.deferred_lookup_start_time = lookup_start
             else:
                 self._maybe_observe_lookup_async_delay(req_status)
+            self._restore_fifo_mark_lookup_result(
+                req_status, num_computed_tokens, num_hit_tokens
+            )
         req_status.update_num_hit_chunks(num_computed_tokens + (num_hit_tokens or 0))
 
         self._touch(req_status)
@@ -1018,13 +1282,11 @@ class OffloadingConnectorScheduler:
             num_gpu_blocks = cdiv(num_cached_tokens, tokens_per_block)
 
             assert len(group_blocks) >= num_gpu_blocks
-            num_locally_computed_gpu_blocks = (
-                self._first_pending_gpu_block_index(
-                    group_blocks,
-                    num_gpu_blocks=num_gpu_blocks,
-                    num_locally_computed_tokens=num_locally_computed_tokens,
-                    tokens_per_block=tokens_per_block,
-                )
+            num_locally_computed_gpu_blocks = self._first_pending_gpu_block_index(
+                group_blocks,
+                num_gpu_blocks=num_gpu_blocks,
+                num_locally_computed_tokens=num_locally_computed_tokens,
+                tokens_per_block=tokens_per_block,
             )
 
             assert (
@@ -1083,6 +1345,7 @@ class OffloadingConnectorScheduler:
             pending_count=self.config.num_workers,
             keys=set(keys_to_load),
             is_store=False,
+            external_window_tokens=num_external_tokens,
         )
 
         if self._chunks_being_loaded is not None:
@@ -1403,6 +1666,7 @@ class OffloadingConnectorScheduler:
             load_jobs=self._current_batch_load_jobs,
             store_jobs=self._build_store_jobs(scheduler_output),
             jobs_to_flush=self._current_batch_jobs_to_flush,
+            node_headroom_generation=self._node_headroom_generation,
         )
 
         # All prepare_store calls for finished requests have been issued.
@@ -1413,6 +1677,7 @@ class OffloadingConnectorScheduler:
                 continue
             req_status.finished_signaled = True
             self.manager.on_request_finished(req_status.req_context)
+            self._restore_fifo_mark_finished(req_id, req_status)
             if not req_status.transfer_jobs:
                 del self._req_status[req_id]
         self._current_batch_load_jobs = {}
@@ -1426,7 +1691,73 @@ class OffloadingConnectorScheduler:
         While True, build_connector_meta() and update_connector_output()
         continue to be called even when no requests are scheduled.
         """
-        return bool(self._jobs) or self.manager.has_pending_work()
+        return (
+            bool(self._jobs)
+            or self.manager.has_pending_work()
+            or (
+                bool(self._req_status)
+                and self._node_headroom_config is not None
+                and not self._node_headroom_is_ready()
+            )
+        )
+
+    def _worker_ack_ranks(
+        self, meta: OffloadingWorkerMetadata, job_id: int
+    ) -> tuple[set[int], set[int]]:
+        """Return valid completion/failure ranks for one job.
+
+        Worker metadata carries identity-preserving sets after normal
+        aggregation. The single-worker fallback keeps hand-built metadata
+        useful in unit tests; multi-worker count-only metadata is deliberately
+        ignored because it cannot prove distinct TP acknowledgements.
+        """
+        completed_ranks = set(meta.completed_job_ranks.get(job_id, ()))
+        failed_ranks = set(meta.failed_job_ranks.get(job_id, ()))
+        if not completed_ranks and not failed_ranks and meta.worker_rank is not None:
+            if job_id in meta.completed_jobs:
+                completed_ranks.add(meta.worker_rank)
+            if job_id in meta.failed_jobs:
+                failed_ranks.add(meta.worker_rank)
+        if (
+            not completed_ranks
+            and not failed_ranks
+            and self.config.num_workers == 1
+            and (
+                meta.completed_jobs.get(job_id, 0) > 0
+                or meta.failed_jobs.get(job_id, 0) > 0
+            )
+        ):
+            completed_ranks.add(0)
+            if meta.failed_jobs.get(job_id, 0) > 0:
+                failed_ranks.add(0)
+
+        expected_ranks = set(range(self.config.num_workers))
+        return (
+            (completed_ranks | failed_ranks) & expected_ranks,
+            failed_ranks & expected_ranks,
+        )
+
+    def _commit_external_window(
+        self,
+        job_status: TransferJobStatus,
+        req_status: RequestOffloadState,
+    ) -> None:
+        """Commit one successful bounded H2D window to prefill statistics."""
+        if (
+            job_status.is_store
+            or not self._restore_fifo_is_enabled()
+            or job_status.external_window_tokens <= 0
+            or job_status.external_stats_committed
+            or req_status.req.status is RequestStatus.FINISHED_ABORTED
+        ):
+            return
+
+        prefill_stats = req_status.req.prefill_stats
+        if prefill_stats is None:
+            return
+
+        prefill_stats.commit_external_cached_tokens(job_status.external_window_tokens)
+        job_status.external_stats_committed = True
 
     def update_connector_output(self, connector_output: KVConnectorOutput):
         """
@@ -1440,6 +1771,7 @@ class OffloadingConnectorScheduler:
         if not isinstance(meta, OffloadingWorkerMetadata):
             assert meta is None
             meta = OffloadingWorkerMetadata()
+        self._record_node_headroom(meta)
         if not meta.transfer_stats.is_empty():
             transfer_stats = OffloadingConnectorStats()
             if not meta.transfer_stats.load.is_empty():
@@ -1470,8 +1802,16 @@ class OffloadingConnectorScheduler:
                     )
             self._connector_stats.aggregate(transfer_stats)
 
-        for job_id, count in meta.completed_jobs.items():
-            assert count > 0
+        # failed_jobs is a subset of completed_jobs for worker-generated
+        # metadata, but include its keys as well so hand-built/legacy
+        # metadata cannot strand a failed job.
+        job_completion_ids = (
+            set(meta.completed_jobs)
+            | set(meta.failed_jobs)
+            | set(meta.completed_job_ranks)
+            | set(meta.failed_job_ranks)
+        )
+        for job_id in job_completion_ids:
             if job_id < self._stale_job_threshold:
                 logger.debug(
                     "Skipping stale completed job %d (pre-reset counter: %d)",
@@ -1479,17 +1819,55 @@ class OffloadingConnectorScheduler:
                     self._stale_job_threshold,
                 )
                 continue
-            job_status = self._jobs[job_id]
-            job_status.pending_count -= count
+            job_status = self._jobs.get(job_id)
+            if job_status is None:
+                # Duplicate completion metadata can arrive after the first
+                # update removed the job.  Its cleanup has already happened.
+                logger.debug("Ignoring duplicate completed job %d", job_id)
+                continue
+            ack_ranks, failed_ranks = self._worker_ack_ranks(meta, job_id)
+            new_ranks = ack_ranks - job_status.reported_ranks
+            if not new_ranks:
+                # Reordered/duplicate metadata from a rank already consumed.
+                continue
+            job_status.reported_ranks.update(new_ranks)
+            job_status.failed_ranks.update(failed_ranks & new_ranks)
+            job_status.failed_count = len(job_status.failed_ranks)
+            job_status.pending_count = max(
+                0, self.config.num_workers - len(job_status.reported_ranks)
+            )
             if job_status.pending_count > 0:
                 continue
-            assert job_status.pending_count == 0
 
-            req_status = self._req_status[job_status.req_id]
+            req_status = self._req_status.get(job_status.req_id)
+            if req_status is None:
+                # The request may have been removed during reset/abort.  Drop
+                # the connector job without calling a manager completion hook.
+                if not job_status.is_store and self._chunks_being_loaded:
+                    self._chunks_being_loaded.difference_update(job_status.keys)
+                self._remove_pending_job(job_id, job_status.sliding_window_block_ids)
+                self._remove_pending_job(
+                    job_id, job_status.non_sliding_window_block_ids
+                )
+                del self._jobs[job_id]
+                continue
+            failed = bool(job_status.failed_ranks)
             if job_status.is_store:
-                self.manager.complete_store(job_status.keys, req_status.req_context)
+                if failed:
+                    self.manager.complete_store(
+                        job_status.keys, req_status.req_context, success=False
+                    )
+                else:
+                    self.manager.complete_store(job_status.keys, req_status.req_context)
             else:
-                self.manager.complete_load(job_status.keys, req_status.req_context)
+                if failed:
+                    self.manager.abort_load(job_status.keys, req_status.req_context)
+                else:
+                    complete_result = self.manager.complete_load(
+                        job_status.keys, req_status.req_context
+                    )
+                    if complete_result is not False:
+                        self._commit_external_window(job_status, req_status)
                 if self._chunks_being_loaded:
                     self._chunks_being_loaded.difference_update(job_status.keys)
             if self._block_id_to_pending_jobs:
@@ -1504,7 +1882,25 @@ class OffloadingConnectorScheduler:
                     )
 
             del self._jobs[job_id]
-            req_status.transfer_jobs.remove(job_id)
+            req_status.transfer_jobs.discard(job_id)
+            if not job_status.is_store and failed:
+                # A failed load is terminal for this bounded restore attempt;
+                # release only after all expected workers acknowledged it.
+                self._restore_fifo_release_pending = True
+                self._restore_fifo_release_if_idle(
+                    job_status.req_id, req_status, force=True
+                )
+            elif getattr(self, "_restore_fifo_release_pending", False):
+                # Final successful load and finished-request store paths both
+                # arrive here only after their last in-flight job is removed.
+                self._restore_fifo_release_if_idle(
+                    job_status.req_id,
+                    req_status,
+                    force=(
+                        not job_status.is_store
+                        or req_status.req.status is RequestStatus.FINISHED_ABORTED
+                    ),
+                )
             if req_status.finished_signaled and not req_status.transfer_jobs:
                 del self._req_status[job_status.req_id]
 
@@ -1542,12 +1938,21 @@ class OffloadingConnectorScheduler:
         if req_status is None:
             # Untracked request (offloading never started): no in-flight jobs,
             # nothing was deferred, so finalize immediately.
+            self._restore_fifo_remove_queued(request.request_id)
             req_context = _create_req_context(request)
             self.manager.on_new_request(req_context)
             self.manager.on_request_finished(req_context)
             return False, None
 
         self._maybe_observe_lookup_async_delay(req_status)
+        self._restore_fifo_mark_finished(request.request_id, req_status)
+        if request.status is RequestStatus.FINISHED_ABORTED:
+            # Aborts do not have a later final-store decision.  Release an
+            # idle owner now; an in-flight transfer keeps it until its output
+            # path drains the job.
+            self._restore_fifo_release_if_idle(
+                request.request_id, req_status, force=True
+            )
 
         # Update offload keys with final block hash so _build_store_jobs can
         # create store jobs for the last block(s) on the next schedule step.
@@ -1592,6 +1997,7 @@ class OffloadingConnectorScheduler:
             if status.req.is_finished():
                 if not status.finished_signaled:
                     self.manager.on_request_finished(status.req_context)
+                self._restore_fifo_mark_finished(req_id, status)
                 del self._req_status[req_id]
 
         # Reset offloading manager cache
@@ -1616,6 +2022,17 @@ class OffloadingConnectorScheduler:
         # The load flush IDs collected above must be delivered to workers.
         if self._chunks_being_loaded is not None:
             self._chunks_being_loaded.clear()
+        self._restore_fifo_owner_req_id = None
+        self._restore_fifo_release_pending = False
+        self._restore_fifo_wait_queue.clear()
+        self._restore_fifo_waiting_req_ids.clear()
+        self._node_headroom_generation += 1
+        self._node_headroom_samples.clear()
+        self._node_headroom_received_at.clear()
 
     def shutdown(self) -> None:
+        self._restore_fifo_owner_req_id = None
+        self._restore_fifo_release_pending = False
+        self._restore_fifo_wait_queue.clear()
+        self._restore_fifo_waiting_req_ids.clear()
         self.manager.shutdown()

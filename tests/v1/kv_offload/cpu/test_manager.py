@@ -384,6 +384,24 @@ def test_cpu_manager_clears_write_usage_after_failed_store():
     check_split_usage_stats(manager, write=0.0, read=0.0, total=0.0)
 
 
+def test_cpu_manager_aborts_load_and_ignores_duplicate_cleanup():
+    manager = make_cpu_manager(num_blocks=1)
+    key = to_key(1)
+
+    manager.prepare_store([key], _EMPTY_REQ_CTX)
+    manager.complete_store([key], _EMPTY_REQ_CTX)
+    manager.prepare_load([key], _EMPTY_REQ_CTX)
+
+    manager.abort_load([key], _EMPTY_REQ_CTX)
+    manager.abort_load([key], _EMPTY_REQ_CTX)
+
+    assert manager.lookup(key, _EMPTY_REQ_CTX) is LookupResult.HIT
+    block = manager._policy.get(key)
+    assert block is not None
+    assert block.ref_cnt == 0
+    assert manager._num_evictable_cache_blocks == 1
+
+
 def test_cpu_manager():
     """
     Tests CPUOffloadingManager with lru policy.

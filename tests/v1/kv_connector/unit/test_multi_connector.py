@@ -879,6 +879,25 @@ def test_multi_connector_prefer_cross_layer_blocks(mc):
     assert mc.prefer_cross_layer_blocks is True
 
 
+def test_multi_connector_requires_unanimous_incremental_commit_capabilities(mc):
+    for connector in mc._connectors:
+        connector.supports_incremental_kv_load = True
+        connector.supports_commit_time_prefill_stats = True
+    assert mc.supports_incremental_kv_load
+    assert mc.supports_commit_time_prefill_stats
+
+    mc._connectors[1].supports_incremental_kv_load = False
+    assert not mc.supports_incremental_kv_load
+    with pytest.raises(ValueError, match="must agree"):
+        mc._validate_incremental_capabilities()
+
+    mc._connectors[1].supports_incremental_kv_load = True
+    mc._connectors[1].supports_commit_time_prefill_stats = False
+    assert not mc.supports_commit_time_prefill_stats
+    with pytest.raises(ValueError, match="must agree"):
+        mc._validate_incremental_capabilities()
+
+
 def test_multi_connector_worker_metadata(mc):
     class MockConnectorWorkerMetadata(KVConnectorWorkerMetadata):
         def __init__(self, data: set[str]):

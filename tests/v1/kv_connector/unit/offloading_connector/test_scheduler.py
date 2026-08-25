@@ -1,5 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+import time
 from types import SimpleNamespace
 from unittest.mock import MagicMock, call
 
@@ -12,7 +13,11 @@ from tests.v1.kv_connector.unit.offloading_connector.utils import (
 )
 from tests.v1.kv_connector.unit.utils import EOS_TOKEN_ID
 from vllm.distributed.kv_events import MEDIUM_CPU, BlockRemoved, BlockStored
+from vllm.distributed.kv_transfer.kv_connector.v1.offloading import (
+    scheduler as offloading_scheduler_module,
+)
 from vllm.distributed.kv_transfer.kv_connector.v1.offloading.common import (
+    NodeHeadroomSample,
     OffloadingConnectorMetadata,
     OffloadingWorkerMetadata,
 )
@@ -23,6 +28,8 @@ from vllm.distributed.kv_transfer.kv_connector.v1.offloading.metrics import (
 from vllm.distributed.kv_transfer.kv_connector.v1.offloading.scheduler import (
     OffloadingConnectorScheduler,
     RequestOffloadState,
+    TransferJobStatus,
+    _resolve_bounded_restore_capacity,
     is_store_reachable_swa_chunk,
 )
 from vllm.v1.core.kv_cache_utils import BlockHash
@@ -57,6 +64,14 @@ def _reduce_kv_connector_stats(runner):
         for key, value in stats.reduce().items():
             reduced[key] = reduced.get(key, 0) + value
     return reduced
+
+
+def _patch_mem_available(monkeypatch, available_bytes: int | None):
+    monkeypatch.setattr(
+        offloading_scheduler_module,
+        "read_mem_available_bytes",
+        lambda: available_bytes,
+    )
 
 
 def test_scheduler_reports_allocation_failure(request_runner):
@@ -1569,22 +1584,108 @@ def test_complete_store_waits_for_all_worker_acks(
     runner.connector_scheduler.update_connector_output(
         KVConnectorOutput(
             kv_connector_worker_meta=OffloadingWorkerMetadata(
-                completed_jobs={job_id: 1}
+                completed_jobs={job_id: 1},
+                completed_job_ranks={job_id: {0}},
             )
         )
     )
     assert runner.manager.complete_store.call_count == 0
     assert runner.connector_scheduler._jobs[job_id].pending_count == 2
 
+    # A duplicate rank acknowledgement cannot advance the job.
     runner.connector_scheduler.update_connector_output(
         KVConnectorOutput(
             kv_connector_worker_meta=OffloadingWorkerMetadata(
-                completed_jobs={job_id: 2}
+                completed_jobs={job_id: 1},
+                completed_job_ranks={job_id: {0}},
+            )
+        )
+    )
+    assert runner.connector_scheduler._jobs[job_id].pending_count == 2
+
+    runner.connector_scheduler.update_connector_output(
+        KVConnectorOutput(
+            kv_connector_worker_meta=OffloadingWorkerMetadata(
+                completed_jobs={job_id: 2},
+                completed_job_ranks={job_id: {1, 2}},
             )
         )
     )
     assert runner.manager.complete_store.call_count == 1
     assert job_id not in runner.connector_scheduler._jobs
+
+
+@pytest.mark.parametrize("async_scheduling", [True, False])
+def test_failed_load_waits_for_all_worker_acks_and_aborts_once(
+    request_runner, async_scheduling: bool
+):
+    """A failure on one rank fails the aggregate load without complete_load."""
+    block_size = 4
+    blocks_per_chunk = 3
+    tokens_per_chunk = block_size * blocks_per_chunk
+    runner = request_runner(
+        blocks_per_chunk=blocks_per_chunk,
+        block_size=block_size,
+        num_gpu_blocks=100,
+        async_scheduling=async_scheduling,
+        worker_count=2,
+    )
+
+    # Force one external-cache hit, then leave the resulting load in flight.
+    # The RequestRunner has one in-process worker connector even when the
+    # scheduler is configured with multiple TP workers, so seeding a store via
+    # runner.run() would wait forever for synthetic ranks that do not exist.
+    runner.new_request(token_ids=[0] * tokens_per_chunk)
+    runner.connector_scheduler._maximal_prefix_lookup = lambda keys, ctx, *_: 1
+    runner.run(decoded_tokens=[], complete_transfers=False)
+
+    cs = runner.connector_scheduler
+    assert len(cs._jobs) == 1
+    job_id = next(iter(cs._jobs))
+    runner.manager.complete_load.reset_mock()
+    runner.manager.abort_load.reset_mock()
+
+    # One rank fails; the aggregate must wait for the other rank while
+    # retaining the failure state.
+    cs.update_connector_output(
+        KVConnectorOutput(
+            kv_connector_worker_meta=OffloadingWorkerMetadata(
+                completed_jobs={job_id: 1},
+                failed_jobs={job_id: 1},
+                completed_job_ranks={job_id: {0}},
+                failed_job_ranks={job_id: {0}},
+            )
+        )
+    )
+    assert cs._jobs[job_id].pending_count == 1
+    runner.manager.complete_load.assert_not_called()
+    runner.manager.abort_load.assert_not_called()
+
+    cs.update_connector_output(
+        KVConnectorOutput(
+            kv_connector_worker_meta=OffloadingWorkerMetadata(
+                completed_jobs={job_id: 1},
+                completed_job_ranks={job_id: {1}},
+            )
+        )
+    )
+    runner.manager.complete_load.assert_not_called()
+    runner.manager.abort_load.assert_called_once()
+    assert job_id not in cs._jobs
+    assert cs._chunks_being_loaded == set()
+
+    # Duplicate completion metadata is ignored after cleanup.
+    cs.update_connector_output(
+        KVConnectorOutput(
+            kv_connector_worker_meta=OffloadingWorkerMetadata(
+                completed_jobs={job_id: 2},
+                failed_jobs={job_id: 2},
+                completed_job_ranks={job_id: {0, 1}},
+                failed_job_ranks={job_id: {0, 1}},
+            )
+        )
+    )
+    runner.manager.abort_load.assert_called_once()
 
 
 @pytest.mark.parametrize("async_scheduling", [True, False])
@@ -2127,11 +2228,615 @@ def test_bounded_restore_reserves_rows_for_hybrid_groups(request_runner):
     )
 
 
+def test_bounded_restore_max_rows_caps_primary_capacity():
+    spec = SimpleNamespace(
+        num_blocks=66,
+        extra_config={"bounded_restore_max_rows": 8},
+    )
+
+    assert _resolve_bounded_restore_capacity(spec, True) == 8
+    assert _resolve_bounded_restore_capacity(spec, False) is None
+
+
+@pytest.mark.parametrize("invalid", [True, -1, 1.5, "8"])
+def test_bounded_restore_max_rows_rejects_invalid_values(invalid):
+    spec = SimpleNamespace(
+        num_blocks=66,
+        extra_config={"bounded_restore_max_rows": invalid},
+    )
+
+    with pytest.raises(ValueError, match="bounded_restore_max_rows"):
+        _resolve_bounded_restore_capacity(spec, True)
+
+
+def test_bounded_restore_fifo_keeps_owner_across_windows(request_runner, monkeypatch):
+    """Only the FIFO head may lookup, and it keeps admission across windows."""
+    monkeypatch.setenv("DSPARK_BOUNDED_WARM_RESTORE", "1")
+    runner = request_runner(
+        block_size=4,
+        num_gpu_blocks=16,
+        async_scheduling=False,
+    )
+    runner.new_request(token_ids=[0] * 8)
+    owner_id = str(runner.req_id)
+    runner.new_request(token_ids=[1] * 8)
+    queued_id = str(runner.req_id)
+    runner.new_request(token_ids=[2] * 8)
+    tail_id = str(runner.req_id)
+
+    scheduler = runner.connector_scheduler
+    scheduler._bounded_restore_capacity = 1
+    runner.manager.lookup.return_value = LookupResult.HIT
+
+    owner = runner.scheduler.requests[owner_id]
+    queued = runner.scheduler.requests[queued_id]
+    tail = runner.scheduler.requests[tail_id]
+
+    # One bounded window is four tokens.  The owner remains admitted for the
+    # second window; neither queued request is allowed to call manager.lookup.
+    assert scheduler.get_num_new_matched_tokens(owner, 0) == (4, True)
+    lookup_calls = runner.manager.lookup.call_count
+    assert scheduler.get_num_new_matched_tokens(queued, 0) == (None, False)
+    assert scheduler.get_num_new_matched_tokens(tail, 0) == (None, False)
+    assert runner.manager.lookup.call_count == lookup_calls
+
+    assert scheduler._restore_fifo_owner_req_id == owner_id
+    assert list(scheduler._restore_fifo_wait_queue) == [queued_id, tail_id]
+
+    assert scheduler.get_num_new_matched_tokens(owner, 4) == (4, True)
+    assert scheduler._restore_fifo_owner_req_id == owner_id
+
+    # The final miss releases the owner; the next request enters exactly at
+    # the head, while the tail remains deferred.
+    runner.manager.lookup.return_value = LookupResult.MISS
+    assert scheduler.get_num_new_matched_tokens(owner, 8) == (0, False)
+    assert scheduler._restore_fifo_owner_req_id is None
+
+    runner.manager.lookup.return_value = LookupResult.HIT
+    lookup_calls = runner.manager.lookup.call_count
+    assert scheduler.get_num_new_matched_tokens(queued, 0) == (4, True)
+    assert runner.manager.lookup.call_count > lookup_calls
+    lookup_calls = runner.manager.lookup.call_count
+    assert scheduler.get_num_new_matched_tokens(tail, 0) == (None, False)
+    assert runner.manager.lookup.call_count == lookup_calls
+
+
+def test_node_headroom_gate_allows_exact_threshold_and_defers_below(
+    request_runner, monkeypatch
+):
+    monkeypatch.setenv("DSPARK_BOUNDED_WARM_RESTORE", "1")
+    runner = request_runner(
+        block_size=4,
+        num_gpu_blocks=16,
+        async_scheduling=False,
+        extra_config_overrides={
+            "node_headroom_gate": True,
+            "node_headroom_reserve_bytes": 10,
+            "node_headroom_j_bytes": 5,
+            "node_headroom_heartbeat_max_age_ms": 1000,
+        },
+    )
+    runner.new_request(token_ids=[0] * 4)
+    request = runner.scheduler.requests[str(runner.req_id)]
+    scheduler = runner.connector_scheduler
+    threshold = scheduler._node_headroom_config.threshold_bytes
+    sample = NodeHeadroomSample(
+        generation=scheduler._node_headroom_generation,
+        sequence=1,
+        available_bytes=threshold,
+    )
+    scheduler._node_headroom_samples = {0: sample}
+    scheduler._node_headroom_received_at = {0: time.monotonic()}
+    monkeypatch.setattr(
+        "vllm.distributed.kv_transfer.kv_connector.v1.offloading.scheduler.read_mem_available_bytes",
+        lambda: threshold,
+    )
+    runner.manager.lookup.return_value = LookupResult.MISS
+
+    # Equality at reserve + J is admitted and reaches the canonical lookup.
+    assert scheduler.get_num_new_matched_tokens(request, 0) == (0, False)
+    assert runner.manager.lookup.call_count == 1
+
+    # One byte below the threshold defers before any second lookup/promotion.
+    monkeypatch.setattr(
+        "vllm.distributed.kv_transfer.kv_connector.v1.offloading.scheduler.read_mem_available_bytes",
+        lambda: threshold - 1,
+    )
+    assert scheduler.get_num_new_matched_tokens(request, 0) == (None, False)
+    assert runner.manager.lookup.call_count == 1
+
+
+def test_node_headroom_gate_requires_all_fresh_ranks(request_runner, monkeypatch):
+    monkeypatch.setenv("DSPARK_BOUNDED_WARM_RESTORE", "1")
+    runner = request_runner(
+        block_size=4,
+        num_gpu_blocks=16,
+        async_scheduling=False,
+        worker_count=2,
+        extra_config_overrides={
+            "node_headroom_gate": True,
+            "node_headroom_reserve_bytes": 10,
+            "node_headroom_j_bytes": 5,
+            "node_headroom_heartbeat_max_age_ms": 100,
+        },
+    )
+    runner.new_request(token_ids=[0] * 4)
+    request = runner.scheduler.requests[str(runner.req_id)]
+    scheduler = runner.connector_scheduler
+    threshold = scheduler._node_headroom_config.threshold_bytes
+    monkeypatch.setattr(
+        "vllm.distributed.kv_transfer.kv_connector.v1.offloading.scheduler.read_mem_available_bytes",
+        lambda: threshold,
+    )
+    sample = NodeHeadroomSample(
+        generation=scheduler._node_headroom_generation,
+        sequence=1,
+        available_bytes=threshold,
+    )
+
+    # A single rank cannot satisfy the all-TP-ranks admission contract.
+    scheduler._node_headroom_samples = {0: sample}
+    scheduler._node_headroom_received_at = {0: time.monotonic()}
+    assert scheduler.get_num_new_matched_tokens(request, 0) == (None, False)
+    runner.manager.lookup.assert_not_called()
+
+    # A stale second rank remains closed even when its value is high enough.
+    scheduler._node_headroom_samples = {0: sample, 1: sample}
+    scheduler._node_headroom_received_at = {
+        0: time.monotonic(),
+        1: time.monotonic() - 1,
+    }
+    assert scheduler.get_num_new_matched_tokens(request, 0) == (None, False)
+    runner.manager.lookup.assert_not_called()
+
+
+def test_node_headroom_reset_requires_new_generation(request_runner, monkeypatch):
+    monkeypatch.setenv("DSPARK_BOUNDED_WARM_RESTORE", "1")
+    runner = request_runner(
+        block_size=4,
+        num_gpu_blocks=16,
+        async_scheduling=False,
+        extra_config_overrides={
+            "node_headroom_gate": True,
+            "node_headroom_reserve_bytes": 10,
+            "node_headroom_j_bytes": 5,
+            "node_headroom_heartbeat_max_age_ms": 1000,
+        },
+    )
+    runner.new_request(token_ids=[0] * 4)
+    request = runner.scheduler.requests[str(runner.req_id)]
+    scheduler = runner.connector_scheduler
+    threshold = scheduler._node_headroom_config.threshold_bytes
+    monkeypatch.setattr(
+        "vllm.distributed.kv_transfer.kv_connector.v1.offloading.scheduler.read_mem_available_bytes",
+        lambda: threshold,
+    )
+    sample = NodeHeadroomSample(
+        generation=scheduler._node_headroom_generation,
+        sequence=1,
+        available_bytes=threshold,
+    )
+    scheduler._node_headroom_samples = {0: sample}
+    scheduler._node_headroom_received_at = {0: time.monotonic()}
+    runner.manager.lookup.return_value = LookupResult.MISS
+    assert scheduler.get_num_new_matched_tokens(request, 0) == (0, False)
+    old_generation = scheduler._node_headroom_generation
+
+    scheduler.reset_cache()
+
+    assert scheduler._node_headroom_generation == old_generation + 1
+    assert scheduler.get_num_new_matched_tokens(request, 0) == (None, False)
+    assert runner.manager.lookup.call_count == 1
+
+
+def test_node_headroom_gate_is_disabled_without_strict_restore(
+    request_runner, monkeypatch
+):
+    monkeypatch.delenv("DSPARK_BOUNDED_WARM_RESTORE", raising=False)
+    runner = request_runner(
+        block_size=4,
+        num_gpu_blocks=16,
+        async_scheduling=False,
+        extra_config_overrides={
+            "node_headroom_gate": True,
+            "node_headroom_reserve_bytes": 10,
+            "node_headroom_j_bytes": 5,
+            "node_headroom_heartbeat_max_age_ms": 1000,
+        },
+    )
+    runner.new_request(token_ids=[0] * 4)
+    request = runner.scheduler.requests[str(runner.req_id)]
+    scheduler = runner.connector_scheduler
+    assert scheduler._node_headroom_config is None
+    runner.manager.lookup.return_value = LookupResult.MISS
+
+    assert scheduler.get_num_new_matched_tokens(request, 0) == (0, False)
+    runner.manager.lookup.assert_called_once()
+
+
+def test_bounded_restore_fifo_releases_dsv4_final_window_owner(
+    request_runner, monkeypatch
+):
+    """The deliberate DSv4 prompt-tail recompute must not strand the owner."""
+    monkeypatch.setenv("DSPARK_BOUNDED_WARM_RESTORE", "1")
+    runner = request_runner(
+        block_size=4,
+        num_gpu_blocks=16,
+        async_scheduling=False,
+    )
+    runner.new_request(token_ids=[0] * 8)
+    req_id = str(runner.req_id)
+    request = runner.scheduler.requests[req_id]
+    scheduler = runner.connector_scheduler
+    scheduler._bounded_restore_capacity = 1
+    scheduler._lookup = MagicMock(side_effect=[4, 3])
+
+    assert scheduler.get_num_new_matched_tokens(request, 0) == (4, True)
+    assert scheduler.get_num_new_matched_tokens(request, 4) == (3, True)
+    # 4 + 3 reaches prompt_tokens - 1, the last token recomputed by DSv4.
+    assert scheduler._restore_fifo_release_pending
+
+    req_status = scheduler._req_status[req_id]
+    key = req_status.group_states[0].offload_keys[0]
+    job_id = 124
+    req_status.transfer_jobs.add(job_id)
+    scheduler._jobs[job_id] = TransferJobStatus(
+        req_id=req_id,
+        pending_count=1,
+        keys={key},
+        is_store=False,
+    )
+    scheduler.update_connector_output(
+        KVConnectorOutput(
+            kv_connector_worker_meta=OffloadingWorkerMetadata(
+                completed_jobs={job_id: 1}
+            )
+        )
+    )
+
+    runner.manager.complete_load.assert_called_once()
+    runner.manager.abort_load.assert_not_called()
+    assert scheduler._restore_fifo_owner_req_id is None
+
+
+def test_bounded_load_commits_one_window_prefill_stats(request_runner, monkeypatch):
+    """A successful H2D load commits its window once, including real wiring."""
+    monkeypatch.setenv("DSPARK_BOUNDED_WARM_RESTORE", "1")
+    runner = request_runner(
+        block_size=4,
+        num_gpu_blocks=32,
+        async_scheduling=False,
+    )
+
+    # Seed one external chunk, then leave its restore in flight.  This drives
+    # update_state_after_alloc(), which records the actual window size.
+    runner.new_request(token_ids=[0] * 4)
+    runner.manager.prepare_store.side_effect = lambda keys, req_context: (
+        generate_store_output(keys)
+    )
+    runner.run(decoded_tokens=[EOS_TOKEN_ID], expected_stored=(0,))
+    runner.scheduler.reset_prefix_cache()
+    runner.new_request(token_ids=[0] * 4)
+    req_id = str(runner.req_id)
+    runner.manager.lookup.return_value = LookupResult.HIT
+    runner.connector_scheduler._maximal_prefix_lookup = lambda keys, ctx, *_: 1
+    runner.run(decoded_tokens=[], complete_transfers=False)
+
+    request = runner.scheduler.requests[req_id]
+    assert request.prefill_stats is not None
+    assert request.prefill_stats.num_external_cached_tokens == 0
+    scheduler = runner.connector_scheduler
+    job_id = next(iter(scheduler._jobs))
+    job_status = scheduler._jobs[job_id]
+    assert job_status.external_window_tokens == 4
+    assert not job_status.external_stats_committed
+
+    runner.manager.complete_load.reset_mock()
+    scheduler.update_connector_output(
+        KVConnectorOutput(
+            kv_connector_worker_meta=OffloadingWorkerMetadata(
+                completed_jobs={job_id: 1}
+            )
+        )
+    )
+
+    runner.manager.complete_load.assert_called_once()
+    assert request.prefill_stats.num_external_cached_tokens == 4
+    assert request.prefill_stats.num_cached_tokens == 4
+    assert request.prefill_stats.num_computed_tokens == 0
+    assert job_status.external_stats_committed
+
+    # A replay after job cleanup cannot commit the same window again.
+    scheduler.update_connector_output(
+        KVConnectorOutput(
+            kv_connector_worker_meta=OffloadingWorkerMetadata(
+                completed_jobs={job_id: 1}
+            )
+        )
+    )
+    runner.manager.complete_load.assert_called_once()
+    assert request.prefill_stats.num_external_cached_tokens == 4
+
+
+def test_bounded_load_commits_four_windows_with_local_cache_and_tp_dedup(
+    request_runner, monkeypatch
+):
+    """Four successful windows sum once while reordered TP acks are deduped."""
+    monkeypatch.setenv("DSPARK_BOUNDED_WARM_RESTORE", "1")
+    runner = request_runner(
+        block_size=4,
+        num_gpu_blocks=32,
+        async_scheduling=False,
+        worker_count=3,
+    )
+    runner.new_request(token_ids=[0] * 20)
+    req_id = str(runner.req_id)
+    request = runner.scheduler.requests[req_id]
+    assert request.prefill_stats is not None
+    request.prefill_stats.initialize(num_prompt_tokens=20, num_local_cached_tokens=4)
+    scheduler = runner.connector_scheduler
+    req_status = scheduler._req_status[req_id]
+    scheduler._restore_fifo_owner_req_id = req_id
+    previous_external = 0
+
+    for window_idx in range(4):
+        job_id = 200 + window_idx
+        key = make_offload_key(f"f2-window-{window_idx}".encode(), 0)
+        job_status = TransferJobStatus(
+            req_id=req_id,
+            pending_count=3,
+            keys={key},
+            is_store=False,
+            external_window_tokens=4,
+        )
+        req_status.transfer_jobs.add(job_id)
+        scheduler._jobs[job_id] = job_status
+
+        # The first window exercises a duplicate before the remaining ranks;
+        # later windows use a different order to cover reordered acks.
+        rank_order = (2, 2, 0, 1) if window_idx == 0 else (1, 0, 2)
+        for ack_idx, rank in enumerate(rank_order):
+            scheduler.update_connector_output(
+                KVConnectorOutput(
+                    kv_connector_worker_meta=OffloadingWorkerMetadata(
+                        completed_jobs={job_id: 1},
+                        completed_job_ranks={job_id: {rank}},
+                    )
+                )
+            )
+            if ack_idx < len(rank_order) - 1:
+                assert request.prefill_stats.num_external_cached_tokens == (
+                    previous_external
+                )
+
+        previous_external += 4
+        assert request.prefill_stats.num_external_cached_tokens == previous_external
+        assert request.prefill_stats.num_local_cached_tokens == 4
+        assert job_status.external_stats_committed
+
+    assert runner.manager.complete_load.call_count == 4
+    assert request.prefill_stats.num_cached_tokens == 20
+    assert request.prefill_stats.num_computed_tokens == 0
+
+
+def test_bounded_load_failure_on_second_window_does_not_commit(
+    request_runner, monkeypatch
+):
+    """A failed second window aborts without changing committed statistics."""
+    monkeypatch.setenv("DSPARK_BOUNDED_WARM_RESTORE", "1")
+    runner = request_runner(
+        block_size=4,
+        num_gpu_blocks=32,
+        async_scheduling=False,
+        worker_count=2,
+    )
+    runner.new_request(token_ids=[0] * 8)
+    req_id = str(runner.req_id)
+    request = runner.scheduler.requests[req_id]
+    assert request.prefill_stats is not None
+    request.prefill_stats.initialize(num_prompt_tokens=8, num_local_cached_tokens=0)
+    scheduler = runner.connector_scheduler
+    req_status = scheduler._req_status[req_id]
+
+    first_job = 300
+    first_status = TransferJobStatus(
+        req_id=req_id,
+        pending_count=2,
+        keys={make_offload_key(b"f2-first", 0)},
+        is_store=False,
+        external_window_tokens=4,
+    )
+    req_status.transfer_jobs.add(first_job)
+    scheduler._jobs[first_job] = first_status
+    scheduler.update_connector_output(
+        KVConnectorOutput(
+            kv_connector_worker_meta=OffloadingWorkerMetadata(
+                completed_jobs={first_job: 1},
+                completed_job_ranks={first_job: {0, 1}},
+            )
+        )
+    )
+    assert request.prefill_stats.num_external_cached_tokens == 4
+
+    second_job = 301
+    second_status = TransferJobStatus(
+        req_id=req_id,
+        pending_count=2,
+        keys={make_offload_key(b"f2-second", 0)},
+        is_store=False,
+        external_window_tokens=4,
+    )
+    req_status.transfer_jobs.add(second_job)
+    scheduler._jobs[second_job] = second_status
+    runner.manager.complete_load.reset_mock()
+    runner.manager.abort_load.reset_mock()
+
+    scheduler.update_connector_output(
+        KVConnectorOutput(
+            kv_connector_worker_meta=OffloadingWorkerMetadata(
+                completed_jobs={second_job: 1},
+                failed_jobs={second_job: 1},
+                completed_job_ranks={second_job: {1}},
+                failed_job_ranks={second_job: {1}},
+            )
+        )
+    )
+    assert request.prefill_stats.num_external_cached_tokens == 4
+    assert runner.manager.abort_load.call_count == 0
+
+    scheduler.update_connector_output(
+        KVConnectorOutput(
+            kv_connector_worker_meta=OffloadingWorkerMetadata(
+                completed_jobs={second_job: 1},
+                completed_job_ranks={second_job: {0}},
+            )
+        )
+    )
+    runner.manager.complete_load.assert_not_called()
+    runner.manager.abort_load.assert_called_once()
+    assert request.prefill_stats.num_external_cached_tokens == 4
+    assert not second_status.external_stats_committed
+
+    # Replayed failure metadata is harmless after abort cleanup.
+    scheduler.update_connector_output(
+        KVConnectorOutput(
+            kv_connector_worker_meta=OffloadingWorkerMetadata(
+                completed_jobs={second_job: 2},
+                failed_jobs={second_job: 2},
+                completed_job_ranks={second_job: {0, 1}},
+                failed_job_ranks={second_job: {0, 1}},
+            )
+        )
+    )
+    runner.manager.abort_load.assert_called_once()
+    assert request.prefill_stats.num_external_cached_tokens == 4
+
+    # A request aborted while a load is in flight must not add a window even
+    # if the H2D completion itself arrives successfully.
+    request.status = RequestStatus.FINISHED_ABORTED
+    aborted_job = 302
+    aborted_status = TransferJobStatus(
+        req_id=req_id,
+        pending_count=2,
+        keys={make_offload_key(b"f2-aborted", 0)},
+        is_store=False,
+        external_window_tokens=4,
+    )
+    req_status.transfer_jobs.add(aborted_job)
+    scheduler._jobs[aborted_job] = aborted_status
+    scheduler.update_connector_output(
+        KVConnectorOutput(
+            kv_connector_worker_meta=OffloadingWorkerMetadata(
+                completed_jobs={aborted_job: 1},
+                completed_job_ranks={aborted_job: {0, 1}},
+            )
+        )
+    )
+    assert request.prefill_stats.num_external_cached_tokens == 4
+    assert not aborted_status.external_stats_committed
+
+
+def test_bounded_restore_fifo_queued_cancel_and_reset_release(
+    request_runner, monkeypatch
+):
+    """Queued cancellation removes only that entry; reset clears the owner."""
+    monkeypatch.setenv("DSPARK_BOUNDED_WARM_RESTORE", "1")
+    runner = request_runner(
+        block_size=4,
+        num_gpu_blocks=16,
+        async_scheduling=False,
+    )
+    runner.new_request(token_ids=[0] * 4)
+    owner_id = str(runner.req_id)
+    runner.new_request(token_ids=[1] * 4)
+    queued_id = str(runner.req_id)
+    scheduler = runner.connector_scheduler
+    scheduler._bounded_restore_capacity = 1
+    runner.manager.lookup.return_value = LookupResult.HIT
+
+    owner = runner.scheduler.requests[owner_id]
+    queued = runner.scheduler.requests[queued_id]
+    assert scheduler.get_num_new_matched_tokens(owner, 0) == (4, True)
+    assert scheduler.get_num_new_matched_tokens(queued, 0) == (None, False)
+
+    queued.status = RequestStatus.FINISHED_ABORTED
+    scheduler.request_finished(queued)
+    assert queued_id not in scheduler._restore_fifo_waiting_req_ids
+    assert list(scheduler._restore_fifo_wait_queue) == []
+    assert scheduler._restore_fifo_owner_req_id == owner_id
+
+    scheduler.reset_cache()
+    assert scheduler._restore_fifo_owner_req_id is None
+    assert not scheduler._restore_fifo_wait_queue
+    assert not scheduler._restore_fifo_waiting_req_ids
+
+
+def test_bounded_restore_fifo_failed_load_releases_after_all_ranks(
+    request_runner, monkeypatch
+):
+    """A single-rank failure releases FIFO admission only after aggregation."""
+    monkeypatch.setenv("DSPARK_BOUNDED_WARM_RESTORE", "1")
+    runner = request_runner(
+        block_size=4,
+        num_gpu_blocks=16,
+        async_scheduling=False,
+        worker_count=2,
+    )
+    runner.new_request(token_ids=[0] * 4)
+    req_id = str(runner.req_id)
+    scheduler = runner.connector_scheduler
+    scheduler._bounded_restore_capacity = 1
+    request = runner.scheduler.requests[req_id]
+    runner.manager.lookup.return_value = LookupResult.HIT
+    assert scheduler.get_num_new_matched_tokens(request, 0) == (4, True)
+    assert scheduler._restore_fifo_owner_req_id == req_id
+
+    req_status = scheduler._req_status[req_id]
+    key = req_status.group_states[0].offload_keys[0]
+    job_id = 123
+    req_status.transfer_jobs.add(job_id)
+    scheduler._jobs[job_id] = TransferJobStatus(
+        req_id=req_id,
+        pending_count=2,
+        keys={key},
+        is_store=False,
+    )
+    if scheduler._chunks_being_loaded is not None:
+        scheduler._chunks_being_loaded.add(key)
+
+    runner.manager.complete_load.reset_mock()
+    runner.manager.abort_load.reset_mock()
+    scheduler.update_connector_output(
+        KVConnectorOutput(
+            kv_connector_worker_meta=OffloadingWorkerMetadata(
+                completed_jobs={job_id: 1},
+                failed_jobs={job_id: 1},
+                completed_job_ranks={job_id: {0}},
+                failed_job_ranks={job_id: {0}},
+            )
+        )
+    )
+    assert scheduler._restore_fifo_owner_req_id == req_id
+
+    scheduler.update_connector_output(
+        KVConnectorOutput(
+            kv_connector_worker_meta=OffloadingWorkerMetadata(
+                completed_jobs={job_id: 1},
+                completed_job_ranks={job_id: {1}},
+            )
+        )
+    )
+    runner.manager.complete_load.assert_not_called()
+    runner.manager.abort_load.assert_called_once()
+    assert scheduler._restore_fifo_owner_req_id is None
+    assert not scheduler._jobs
+    if scheduler._chunks_being_loaded is not None:
+        assert not scheduler._chunks_being_loaded
+
+
 def test_incremental_load_ignores_pending_blocks_before_resume_boundary():
     """An earlier SWA window must not be counted as pending again."""
-    blocks = [
-        SimpleNamespace(is_null=True, block_hash=None) for _ in range(10)
-    ]
+    blocks = [SimpleNamespace(is_null=True, block_hash=None) for _ in range(10)]
     # An active block from the completed first window remains visible before
     # the resume boundary. The next window has one active destination at 9.
     blocks[6] = SimpleNamespace(is_null=False, block_hash=None)

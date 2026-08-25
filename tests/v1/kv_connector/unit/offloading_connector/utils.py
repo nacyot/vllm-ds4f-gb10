@@ -84,6 +84,12 @@ class MockOffloadingWorker(OffloadingWorker):
         self.waiting_jobs: set[int] = set()
         self.completed_jobs: list[int] = []
         self.flushed_jobs: set[int] = set()
+        self.load_admission_guard: Callable[[bool], bool] | None = None
+
+    def set_load_admission_guard(
+        self, guard: Callable[[bool], bool]
+    ) -> None:
+        self.load_admission_guard = guard
 
     def get_finished(self) -> list[TransferResult]:
         finished = self.completed_transfers

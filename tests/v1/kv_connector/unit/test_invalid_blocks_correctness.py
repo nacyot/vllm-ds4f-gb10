@@ -24,6 +24,7 @@ from .utils import (
     create_request,
     create_scheduler,
     create_vllm_config,
+    make_kv_cache_config,
 )
 
 pytestmark = pytest.mark.cpu_test
@@ -177,6 +178,51 @@ def test_sync_recompute_blocks_not_freed_for_running_requests(
     assert (
         request.request_id in scheduled_req_ids or len(recompute_scheduler.running) > 0
     ), "Request should be reschedulable for recomputation"
+
+
+def test_sync_recompute_invalid_block_in_non_first_hybrid_group():
+    """A failed block in a non-first hybrid group truncates the request."""
+    block_size = 16
+    vllm_config = create_vllm_config(
+        block_size=block_size,
+        max_model_len=128,
+        kv_load_failure_policy="recompute",
+    )
+    scheduler = create_scheduler(
+        vllm_config,
+        num_blocks=100,
+        kv_cache_config=make_kv_cache_config(
+            block_size=block_size, mamba_enabled=True, num_blocks=100
+        ),
+    )
+
+    request = create_request(num_tokens=4 * block_size)
+    scheduler.add_request(request)
+    scheduler.connector = Mock()
+    scheduler.connector.get_num_new_matched_tokens.side_effect = (
+        _make_get_num_new_matched_tokens(
+            {request.request_id: 3 * block_size}, async_load=False
+        )
+    )
+    scheduler.connector.request_finished.return_value = (False, None)
+    scheduler.connector.take_events.return_value = ()
+
+    scheduler_output = scheduler.schedule()
+    group_block_ids = scheduler.kv_cache_manager.get_block_ids(request.request_id)
+    # Mamba's first two entries are null/skipped blocks in this fixture.
+    # Select the first real destination block in the non-first group.
+    invalid_block_ids = {group_block_ids[1][2]}
+
+    scheduler.update_from_output(
+        scheduler_output,
+        create_model_runner_output(
+            [request], invalid_block_ids=invalid_block_ids, use_eos=False
+        ),
+    )
+
+    assert request.status == RequestStatus.RUNNING
+    assert request.num_computed_tokens == 2 * block_size
+    assert request in scheduler.running
 
 
 def test_sync_fail_invalid_blocks_evicted(fail_scheduler: Scheduler):
@@ -432,6 +478,10 @@ def test_async_recompute_blocks_not_cached_when_invalid(
         f"Invalid block {invalid_block_id} should not be cached before recompute "
         f"(hash should be None), but hash is {block.block_hash}"
     )
+
+    # The failed external entry is no longer a valid retry source. Model the
+    # connector's post-failure lookup as a miss so the suffix is recomputed.
+    req_num_new_matched_tokens[request.request_id] = 0
 
     # critical end-to-end test: spy on cache_blocks to verify it's called with
     # the truncated num_computed_tokens value

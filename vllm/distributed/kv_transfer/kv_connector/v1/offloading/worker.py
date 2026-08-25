@@ -1,5 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+import os
 from collections import defaultdict
 from dataclasses import replace
 
@@ -10,9 +11,12 @@ from vllm.distributed.kv_transfer.kv_connector.v1.offloading.canonical_mapping i
     derive_canonical_mappings,
 )
 from vllm.distributed.kv_transfer.kv_connector.v1.offloading.common import (
+    NodeHeadroomConfig,
+    NodeHeadroomSample,
     OffloadingConnectorMetadata,
     OffloadingWorkerMetadata,
     ReqId,
+    read_mem_available_bytes,
 )
 from vllm.distributed.kv_transfer.kv_connector.v1.offloading.config import (
     is_kv_cache_tensor_packed,
@@ -51,20 +55,119 @@ class OffloadingConnectorWorker:
         self.vllm_config = vllm_config
         self.kv_cache_config = kv_cache_config
         self.worker: OffloadingWorker | None = None
+        self._strict_restore_fifo_enabled = (
+            os.environ.get("DSPARK_BOUNDED_WARM_RESTORE") == "1"
+        )
+        self._node_headroom_config = NodeHeadroomConfig.from_extra_config(
+            getattr(spec, "extra_config", {}),
+            strict_restore_enabled=self._strict_restore_fifo_enabled,
+        )
+        self._node_headroom_generation = 0
+        self._node_headroom_sequence = 0
         # Non-writers still ack: pending_count waits for world_size per job.
         self._is_store_writer = (
             not self.spec.replicated_layout or self.spec.config.parallel.rank == 0
         )
+        self._worker_rank = int(self.spec.config.parallel.rank)
 
         # job_id -> req_id for in-flight loads.
         self._load_jobs: dict[int, ReqId] = {}
+        # job_id -> GPU destination block IDs for failed-load reporting.
+        self._load_block_ids: dict[int, set[int]] = {}
+        # Failed loads are surfaced through KVConnectorOutput.invalid_block_ids
+        # and still complete the request's receive notification.
+        self._invalid_block_ids: set[int] = set()
+        self._finished_recving: set[ReqId] = set()
+        # Jobs currently accepted by this worker.  Removing a job at its first
+        # terminal outcome makes late backend duplicates harmless without an
+        # unbounded reported-job tombstone.
+        self._active_job_ids: set[int] = set()
         self._unsubmitted_store_jobs: list[
             tuple[int, GPULoadStoreSpec, LoadStoreSpec]
         ] = []
-        self._connector_worker_meta = OffloadingWorkerMetadata()
+        self._connector_worker_meta = OffloadingWorkerMetadata(
+            worker_rank=self._worker_rank
+        )
 
     def _init_worker(self, kv_caches: CanonicalKVCaches) -> None:
         self.worker = self.spec.get_worker(kv_caches)
+        if self._node_headroom_config is not None:
+            self.worker.set_load_admission_guard(
+                self._all_rank_h2d_headroom_admission
+            )
+
+    def _all_rank_h2d_headroom_admission(self, local_ready: bool) -> bool:
+        """Fail closed unless every TP rank is ready immediately before H2D."""
+        config = self._node_headroom_config
+        if config is None:
+            return local_ready
+
+        available_bytes = read_mem_available_bytes()
+        local_ok = (
+            local_ready
+            and available_bytes is not None
+            and available_bytes >= config.threshold_bytes
+        )
+
+        from torch import distributed as dist
+
+        from vllm.distributed.parallel_state import get_tp_group
+
+        tp_group = get_tp_group()
+        vote = torch.tensor(
+            [1 if local_ok else 0], device="cpu", dtype=torch.int32
+        )
+        if tp_group.world_size > 1:
+            dist.all_reduce(
+                vote,
+                group=tp_group.cpu_group,
+                op=dist.ReduceOp.MIN,
+            )
+        admitted = bool(vote.item())
+        if not admitted:
+            logger.warning(
+                "Rejecting H2D load on all TP ranks: rank=%d "
+                "local_ready=%s MemAvailable=%s threshold=%d",
+                self._worker_rank,
+                local_ready,
+                available_bytes,
+                config.threshold_bytes,
+            )
+        return admitted
+
+    def _record_completion(
+        self,
+        job_id: int,
+        success: bool,
+        *,
+        is_load: bool,
+        req_id: ReqId | None = None,
+        block_ids: set[int] | None = None,
+    ) -> bool:
+        """Record one worker completion and return whether it was new."""
+        if job_id not in self._active_job_ids:
+            return False
+        self._active_job_ids.remove(job_id)
+
+        if success:
+            self._connector_worker_meta.mark_completed(job_id)
+        else:
+            self._connector_worker_meta.mark_failed(job_id)
+            if is_load:
+                self._invalid_block_ids.update(block_ids or ())
+
+        if is_load and req_id is not None:
+            self._finished_recving.add(req_id)
+        return True
+
+    def _submit_store(
+        self, job_id: int, src_spec: GPULoadStoreSpec, dst_spec: LoadStoreSpec
+    ) -> None:
+        assert self.worker is not None
+        self._active_job_ids.add(job_id)
+        success = self.worker.submit_store(job_id, src_spec, dst_spec)
+        if not success:
+            self._record_completion(job_id, False, is_load=False)
 
     def register_kv_caches(self, kv_caches: dict[str, torch.Tensor]):
         kv_cache_config = self.kv_cache_config
@@ -225,11 +328,22 @@ class OffloadingConnectorWorker:
                 # verify all layers in the group reference the exact same tensors
                 assert len({len(tensors_per_block[n]) for n in tensor_layer_names}) == 1
                 assert (
-                    len({tensors_per_block[n][0].data_ptr() for n in tensor_layer_names})
+                    len(
+                        {
+                            tensors_per_block[n][0].data_ptr()
+                            for n in tensor_layer_names
+                        }
+                    )
                     == 1
                 )
                 assert (
-                    len({tensors_per_block[n][0].stride() for n in tensor_layer_names}) == 1
+                    len(
+                        {
+                            tensors_per_block[n][0].stride()
+                            for n in tensor_layer_names
+                        }
+                    )
+                    == 1
                 )
 
                 # pick the first layer to represent the group
@@ -332,8 +446,9 @@ class OffloadingConnectorWorker:
             for job_id in kv_connector_metadata.jobs_to_flush:
                 entry = kv_connector_metadata.store_jobs.pop(job_id, None)
                 if entry is not None:
+                    self._active_job_ids.add(job_id)
                     if not self._is_store_writer:
-                        self._connector_worker_meta.mark_completed(job_id)
+                        self._record_completion(job_id, True, is_load=False)
                         continue
                     assert isinstance(entry.src_spec, GPULoadStoreSpec)
                     self._unsubmitted_store_jobs.append(
@@ -343,8 +458,7 @@ class OffloadingConnectorWorker:
         # Submit deferred stores from previous step (and jobs_to_flush above).
         for job_id, src_spec, dst_spec in self._unsubmitted_store_jobs:
             assert isinstance(src_spec, GPULoadStoreSpec)
-            success = self.worker.submit_store(job_id, src_spec, dst_spec)
-            assert success
+            self._submit_store(job_id, src_spec, dst_spec)
         self._unsubmitted_store_jobs.clear()
 
         if kv_connector_metadata.jobs_to_flush:
@@ -352,22 +466,61 @@ class OffloadingConnectorWorker:
 
     def start_kv_transfers(self, metadata: OffloadingConnectorMetadata):
         assert self.worker is not None
+        if self._node_headroom_config is not None:
+            self._node_headroom_generation = metadata.node_headroom_generation
         for job_id, src_spec, dst_spec in self._unsubmitted_store_jobs:
-            success = self.worker.submit_store(job_id, src_spec, dst_spec)
-            assert success
+            self._submit_store(job_id, src_spec, dst_spec)
         self._unsubmitted_store_jobs.clear()
 
         for job_id, entry in metadata.load_jobs.items():
+            if job_id in self._active_job_ids:
+                continue
             self._load_jobs[job_id] = entry.req_id
             assert isinstance(entry.dst_spec, GPULoadStoreSpec)
+            block_ids = {int(block_id) for block_id in entry.dst_spec.block_ids}
+            valid_block_ids = {
+                block_id
+                for block_id in block_ids
+                if 0 < block_id < self.kv_cache_config.num_blocks
+            }
+            self._load_block_ids[job_id] = valid_block_ids
+            self._active_job_ids.add(job_id)
+            if len(valid_block_ids) != len(block_ids):
+                logger.error(
+                    "Rejecting load job %d with invalid destination block IDs %s",
+                    job_id,
+                    sorted(block_ids - valid_block_ids),
+                )
+                req_id = self._load_jobs.pop(job_id)
+                block_ids = self._load_block_ids.pop(job_id)
+                self._record_completion(
+                    job_id,
+                    False,
+                    is_load=True,
+                    req_id=req_id,
+                    block_ids=block_ids,
+                )
+                continue
             success = self.worker.submit_load(job_id, entry.src_spec, entry.dst_spec)
-            assert success
+            if not success:
+                req_id = self._load_jobs.pop(job_id)
+                block_ids = self._load_block_ids.pop(job_id)
+                self._record_completion(
+                    job_id,
+                    False,
+                    is_load=True,
+                    req_id=req_id,
+                    block_ids=block_ids,
+                )
 
     def prepare_store_kv(self, metadata: OffloadingConnectorMetadata):
         for job_id, entry in metadata.store_jobs.items():
+            if job_id in self._active_job_ids:
+                continue
+            self._active_job_ids.add(job_id)
             if not self._is_store_writer:
                 # Gate before queueing: no _unsubmitted_store_jobs entry.
-                self._connector_worker_meta.mark_completed(job_id)
+                self._record_completion(job_id, True, is_load=False)
                 continue
             # NOTE(orozery): defer the store to the beginning of the next
             # engine step, so that offloading starts AFTER transfers related
@@ -388,12 +541,22 @@ class OffloadingConnectorWorker:
             blocked on remote KV (and free aborted-during-load reqs).
         """
         assert self.worker is not None
-        finished_recving: set[str] = set()
+        if self._node_headroom_config is not None:
+            self._node_headroom_sequence += 1
+            self._connector_worker_meta.node_headroom = NodeHeadroomSample(
+                generation=self._node_headroom_generation,
+                sequence=self._node_headroom_sequence,
+                available_bytes=read_mem_available_bytes(),
+            )
+        finished_recving = self._finished_recving
+        self._finished_recving = set()
         for transfer_result in self.worker.get_finished():
-            # we currently do not support job failures
             job_id = transfer_result.job_id
-            assert transfer_result.success
+            if job_id not in self._active_job_ids:
+                continue
             is_load = job_id in self._load_jobs
+            req_id = self._load_jobs.pop(job_id, None)
+            block_ids = self._load_block_ids.pop(job_id, None)
             if (
                 transfer_result.transfer_time is not None
                 and transfer_result.transfer_size is not None
@@ -407,24 +570,51 @@ class OffloadingConnectorWorker:
                     transfer_result.transfer_time,
                 )
 
-            self._connector_worker_meta.mark_completed(job_id)
-            req_id = self._load_jobs.pop(job_id, None)
-            if req_id is not None:
-                finished_recving.add(req_id)
+            self._record_completion(
+                job_id,
+                transfer_result.success,
+                is_load=is_load,
+                req_id=req_id,
+                block_ids=block_ids,
+            )
+
+        # _record_completion also queues receive notifications for backend
+        # completions; merge those with submit-time rejection notifications
+        # drained at the start of this call.
+        finished_recving.update(self._finished_recving)
+        self._finished_recving.clear()
 
         return set(), finished_recving
 
     def build_connector_worker_meta(self) -> OffloadingWorkerMetadata | None:
         """Return completed transfer job IDs since the last call."""
-        if not self._connector_worker_meta.completed_jobs:
+        if not (
+            self._connector_worker_meta.completed_jobs
+            or self._connector_worker_meta.failed_jobs
+            or self._connector_worker_meta.node_headroom is not None
+        ):
             return None
         meta = self._connector_worker_meta
-        self._connector_worker_meta = OffloadingWorkerMetadata()
+        self._connector_worker_meta = OffloadingWorkerMetadata(
+            worker_rank=self._worker_rank
+        )
         return meta
 
     def shutdown(self) -> None:
         self._unsubmitted_store_jobs.clear()
         self._load_jobs.clear()
-        self._connector_worker_meta = OffloadingWorkerMetadata()
+        self._load_block_ids.clear()
+        self._invalid_block_ids.clear()
+        self._finished_recving.clear()
+        self._active_job_ids.clear()
+        self._connector_worker_meta = OffloadingWorkerMetadata(
+            worker_rank=self._worker_rank
+        )
         if self.worker is not None:
             self.worker.shutdown()
+
+    def get_block_ids_with_load_errors(self) -> set[int]:
+        """Return and clear GPU destination blocks from failed loads."""
+        block_ids = self._invalid_block_ids
+        self._invalid_block_ids = set()
+        return block_ids

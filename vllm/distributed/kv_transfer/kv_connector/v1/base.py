@@ -203,6 +203,17 @@ class KVConnectorBase_V1(ABC):
         """
         return False
 
+    @property
+    def supports_commit_time_prefill_stats(self) -> bool:
+        """Whether external prefill cache hits are committed on completion.
+
+        Connectors that report external prefix hits before their asynchronous
+        load succeeds must opt in so prompt metrics can defer counting those
+        tokens until the transfer is committed.  The default preserves the
+        historical lookup-time accounting for existing connectors.
+        """
+        return False
+
     def __init__(
         self,
         vllm_config: "VllmConfig",

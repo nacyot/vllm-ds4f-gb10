@@ -1222,6 +1222,116 @@ def test_prefix_cache_stats_counted_once_for_retried_then_scheduled_request():
     )
 
 
+def test_prefill_stats_initialization_waits_for_successful_allocation(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    block_size = 16
+    scheduler = create_scheduler(
+        enable_prefix_caching=True,
+        use_kv_connector=mock_kv(
+            matched_tokens=block_size,
+            is_async=True,
+        ),
+        block_size=block_size,
+    )
+    assert scheduler.connector is not None
+    assert not scheduler.connector.supports_commit_time_prefill_stats
+
+    request = create_requests(
+        num_requests=1,
+        num_tokens=block_size * 2,
+        block_size=block_size,
+    )[0]
+    scheduler.add_request(request)
+
+    monkeypatch.setattr(
+        type(scheduler.connector),
+        "supports_commit_time_prefill_stats",
+        property(lambda _self: True),
+        raising=False,
+    )
+    original_allocate_slots = scheduler.kv_cache_manager.allocate_slots
+    attempts = 0
+
+    def reject_first_allocation(*args, **kwargs):
+        nonlocal attempts
+        attempts += 1
+        if attempts == 1:
+            return None
+        return original_allocate_slots(*args, **kwargs)
+
+    scheduler.kv_cache_manager.allocate_slots = reject_first_allocation
+
+    assert not scheduler.schedule().scheduled_new_reqs
+    assert request.prefill_stats is not None
+    assert request.prefill_stats.num_prompt_tokens == 0
+
+    scheduler.schedule()
+    assert request.prefill_stats.num_prompt_tokens == request.num_prompt_tokens
+    assert request.prefill_stats.num_local_cached_tokens == 0
+    assert request.prefill_stats.num_external_cached_tokens == 0
+
+
+def test_prefill_stats_legacy_connector_counts_initial_external_lookup():
+    block_size = 16
+    scheduler = create_scheduler(
+        enable_prefix_caching=True,
+        use_kv_connector=mock_kv(
+            matched_tokens=block_size,
+            is_async=True,
+        ),
+        block_size=block_size,
+    )
+    assert scheduler.connector is not None
+    assert not scheduler.connector.supports_commit_time_prefill_stats
+
+    request = create_requests(
+        num_requests=1,
+        num_tokens=block_size * 2,
+        block_size=block_size,
+    )[0]
+    scheduler.add_request(request)
+    scheduler.schedule()
+
+    assert request.prefill_stats is not None
+    assert request.prefill_stats.num_external_cached_tokens == block_size
+    assert request.prefill_stats.num_cached_tokens == block_size
+
+
+def test_prefill_stats_bounded_external_lookup_starts_uncommitted(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    block_size = 16
+    scheduler = create_scheduler(
+        enable_prefix_caching=True,
+        use_kv_connector=mock_kv(
+            matched_tokens=block_size,
+            is_async=True,
+        ),
+        block_size=block_size,
+    )
+    assert scheduler.connector is not None
+    monkeypatch.setattr(
+        type(scheduler.connector),
+        "supports_commit_time_prefill_stats",
+        property(lambda _self: True),
+        raising=False,
+    )
+    request = create_requests(
+        num_requests=1,
+        num_tokens=block_size * 2,
+        block_size=block_size,
+    )[0]
+    scheduler.add_request(request)
+    scheduler.schedule()
+
+    assert request.status == RequestStatus.WAITING_FOR_REMOTE_KVS
+    assert request.prefill_stats is not None
+    assert request.prefill_stats.num_external_cached_tokens == 0
+    assert request.prefill_stats.num_cached_tokens == 0
+    assert request.prefill_stats.num_computed_tokens == request.num_prompt_tokens
+
+
 def test_scheduler_reset_prefix_cache():
     scheduler = create_scheduler(enable_prefix_caching=True)
     requests = create_requests(num_requests=10)

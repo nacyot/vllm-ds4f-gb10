@@ -13,6 +13,7 @@ from unittest.mock import Mock
 
 import pytest
 
+from vllm.distributed.kv_transfer.kv_connector.v1.base import SupportsHMA
 from vllm.v1.core.sched.scheduler import Scheduler
 from vllm.v1.request import Request, RequestStatus
 
@@ -21,9 +22,31 @@ from .utils import (
     create_request,
     create_scheduler,
     create_vllm_config,
+    make_kv_cache_config,
 )
 
 pytestmark = pytest.mark.cpu_test
+
+
+class _MockHMAConnector(SupportsHMA):
+    def __init__(self):
+        self.get_num_new_matched_tokens = Mock()
+        self.take_events = Mock(return_value=())
+
+    def request_finished_all_groups(self, request, block_ids):
+        return False, None
+
+    def update_state_after_alloc(self, request, blocks, num_tokens):
+        return None
+
+    def build_connector_meta(self, scheduler_output):
+        return None
+
+    def update_connector_output(self, connector_output):
+        return None
+
+    def get_kv_connector_stats(self):
+        return None
 
 
 def _make_get_num_new_matched_tokens(
@@ -161,3 +184,49 @@ def test_invalid_blocks_evicted_prevents_cache_pollution(
         assert block_id not in cached_block_ids, (
             f"invalid block {block_id} at index {idx} should not be in cache hash table"
         )
+
+
+def test_hybrid_invalid_group_suffix_evicted_without_polluting_other_group():
+    """Failing one hybrid group evicts only that group's dependent suffix."""
+    block_size = 16
+    vllm_config = create_vllm_config(
+        block_size=block_size,
+        max_model_len=128,
+        kv_load_failure_policy="fail",
+    )
+    scheduler = create_scheduler(
+        vllm_config,
+        num_blocks=100,
+        kv_cache_config=make_kv_cache_config(
+            block_size=block_size, mamba_enabled=True, num_blocks=100
+        ),
+    )
+    request = create_request(num_tokens=4 * block_size)
+    scheduler.add_request(request)
+    scheduler.connector = _MockHMAConnector()
+    scheduler.connector.get_num_new_matched_tokens.side_effect = (
+        _make_get_num_new_matched_tokens(
+            {request.request_id: 3 * block_size}, async_load=False
+        )
+    )
+
+    scheduler_output = scheduler.schedule()
+    group_block_ids = scheduler.kv_cache_manager.get_block_ids(request.request_id)
+    scheduler.kv_cache_manager.cache_blocks(request, 3 * block_size)
+    # Mamba's first two entries are null/skipped blocks in this fixture.
+    invalid_block_id = group_block_ids[1][2]
+
+    scheduler.update_from_output(
+        scheduler_output,
+        create_model_runner_output(
+            [request], invalid_block_ids={invalid_block_id}, use_eos=False
+        ),
+    )
+
+    assert request.status == RequestStatus.FINISHED_ERROR
+    for block_id in group_block_ids[1][2:]:
+        assert scheduler.kv_cache_manager.block_pool.blocks[block_id].block_hash is None
+    assert (
+        scheduler.kv_cache_manager.block_pool.blocks[group_block_ids[0][1]].block_hash
+        is not None
+    )

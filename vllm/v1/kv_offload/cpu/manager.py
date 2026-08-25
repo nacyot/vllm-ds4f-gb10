@@ -61,6 +61,10 @@ class CPUOffloadingManager(OffloadingManager):
         self._num_evictable_cache_blocks: int = 0
         # Track blocks with an in-flight store (ref_cnt -1, not yet completed).
         self._num_write_pending_blocks: int = 0
+        # Number of outstanding load/read reservations holding each block
+        # pinned. Keeping this separate from ref_cnt makes cleanup tolerant of
+        # duplicate completion callbacks.
+        self._pending_loads: dict[OffloadKey, int] = {}
 
         self.store_threshold: int = store_threshold
         self.max_tracker_size: int = max_tracker_size
@@ -103,6 +107,29 @@ class CPUOffloadingManager(OffloadingManager):
     ) -> CPULoadStoreSpec:
         return CPULoadStoreSpec([block.block_id for block in blocks])
 
+    def _release_load_refs(self, keys: Collection[OffloadKey]) -> None:
+        """Release one pin per prepared load, tolerating duplicate cleanup."""
+        for key in keys:
+            pending = self._pending_loads.get(key, 0)
+            if pending == 0:
+                continue
+
+            block = self._policy.get(key)
+            if block is None or block.ref_cnt <= 0:
+                self._pending_loads.pop(key, None)
+                continue
+
+            block.ref_cnt -= 1
+            pending -= 1
+            if pending:
+                self._pending_loads[key] = pending
+                continue
+
+            del self._pending_loads[key]
+            if block.ref_cnt == 0:
+                self._num_evictable_cache_blocks += 1
+                self._policy.mark_evictable(key)
+
     # --- OffloadingManager interface ---
 
     @override
@@ -142,6 +169,7 @@ class CPUOffloadingManager(OffloadingManager):
                 self._num_evictable_cache_blocks -= 1  # ref_cnt 0 -> 1
                 assert self._num_evictable_cache_blocks >= 0
             block.ref_cnt += 1
+            self._pending_loads[key] = self._pending_loads.get(key, 0) + 1
             blocks.append(block)
         return self._get_load_store_spec(keys, blocks)
 
@@ -153,14 +181,13 @@ class CPUOffloadingManager(OffloadingManager):
     def complete_load(
         self, keys: Collection[OffloadKey], req_context: ReqContext
     ) -> None:
-        for key in keys:
-            block = self._policy.get(key)
-            assert block is not None, f"Block {key!r} not found"
-            assert block.ref_cnt > 0, f"Block {key!r} ref_cnt is already 0"
-            block.ref_cnt -= 1
-            if block.ref_cnt == 0:
-                self._num_evictable_cache_blocks += 1  # ref_cnt 1 -> 0
-                self._policy.mark_evictable(key)
+        self._release_load_refs(keys)
+
+    @override
+    def abort_load(
+        self, keys: Collection[OffloadKey], req_context: ReqContext
+    ) -> None:
+        self._release_load_refs(keys)
 
     @override
     def prepare_store(
@@ -283,6 +310,7 @@ class CPUOffloadingManager(OffloadingManager):
         self._policy.clear()
         self._num_evictable_cache_blocks = 0
         self._num_write_pending_blocks = 0
+        self._pending_loads.clear()
 
         self._free_list.clear()
         self._num_allocated_blocks = 0

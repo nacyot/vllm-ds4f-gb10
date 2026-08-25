@@ -62,6 +62,12 @@ class OffloadingConnector(KVConnectorBase_V1, SupportsHMA):
     def supports_incremental_kv_load(self) -> bool:
         return os.environ.get("DSPARK_BOUNDED_WARM_RESTORE") == "1"
 
+    @property
+    def supports_commit_time_prefill_stats(self) -> bool:
+        # Commit-time accounting is needed only for the bounded incremental
+        # restore path.  Keep the historical lookup-time accounting otherwise.
+        return self.supports_incremental_kv_load
+
     def __init__(
         self,
         vllm_config: VllmConfig,
@@ -137,6 +143,10 @@ class OffloadingConnector(KVConnectorBase_V1, SupportsHMA):
         self.connector_worker.prepare_store_kv(self._connector_metadata)
 
         return self.connector_worker.get_finished(finished_req_ids)
+
+    def get_block_ids_with_load_errors(self) -> set[int]:
+        assert self.connector_worker is not None
+        return self.connector_worker.get_block_ids_with_load_errors()
 
     def build_connector_worker_meta(self) -> OffloadingWorkerMetadata | None:
         if self.connector_worker is not None:

@@ -1,5 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+import pytest
+
 from vllm.v1.core.sched.output import ScheduledEncoderInputStats, SchedulerOutput
 from vllm.v1.engine import EngineCoreOutputs, FinishReason
 from vllm.v1.metrics.stats import (
@@ -288,3 +290,79 @@ def test_prompt_token_stats_full_external_transfer_recompute():
     assert stats.external_kv_transfer == 999
     assert stats.cached_tokens == 999
     assert stats.total == 1000
+
+
+def test_prefill_stats_commit_one_external_window():
+    prefill_stats = PrefillStats()
+    prefill_stats.initialize(
+        num_prompt_tokens=1000,
+        num_local_cached_tokens=100,
+    )
+
+    prefill_stats.commit_external_cached_tokens(250)
+
+    assert prefill_stats.num_local_cached_tokens == 100
+    assert prefill_stats.num_external_cached_tokens == 250
+    assert prefill_stats.num_cached_tokens == 350
+    assert prefill_stats.num_computed_tokens == 650
+
+
+def test_prefill_stats_commit_four_external_windows():
+    prefill_stats = PrefillStats()
+    prefill_stats.initialize(
+        num_prompt_tokens=1_000_000,
+        num_local_cached_tokens=0,
+    )
+
+    for _ in range(4):
+        prefill_stats.commit_external_cached_tokens(250_000)
+
+    assert prefill_stats.num_external_cached_tokens == 1_000_000
+    assert prefill_stats.num_cached_tokens == 1_000_000
+    assert prefill_stats.num_computed_tokens == 0
+
+
+def test_prefill_stats_commit_external_windows_with_local_cache():
+    prefill_stats = PrefillStats()
+    prefill_stats.initialize(
+        num_prompt_tokens=1000,
+        num_local_cached_tokens=300,
+    )
+
+    prefill_stats.commit_external_cached_tokens(200)
+    prefill_stats.commit_external_cached_tokens(300)
+
+    assert prefill_stats.num_local_cached_tokens == 300
+    assert prefill_stats.num_external_cached_tokens == 500
+    assert prefill_stats.num_cached_tokens == 800
+    assert prefill_stats.num_computed_tokens == 200
+
+
+def test_prefill_stats_rejects_external_cache_overflow():
+    prefill_stats = PrefillStats()
+    prefill_stats.initialize(
+        num_prompt_tokens=1000,
+        num_local_cached_tokens=300,
+    )
+    prefill_stats.commit_external_cached_tokens(600)
+
+    with pytest.raises(AssertionError):
+        prefill_stats.commit_external_cached_tokens(101)
+
+    assert prefill_stats.num_external_cached_tokens == 600
+    assert prefill_stats.num_cached_tokens == 900
+    assert prefill_stats.num_computed_tokens == 100
+
+
+def test_prefill_stats_finalize_after_external_cache_commits():
+    prefill_stats = PrefillStats()
+    prefill_stats.initialize(
+        num_prompt_tokens=1000,
+        num_local_cached_tokens=100,
+    )
+    prefill_stats.commit_external_cached_tokens(300)
+
+    prefill_stats.finalize(num_cached_tokens=800)
+
+    assert prefill_stats.num_cached_tokens == 400
+    assert prefill_stats.num_cache_creation_tokens == 400

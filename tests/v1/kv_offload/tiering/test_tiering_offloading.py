@@ -439,6 +439,56 @@ class TestTieringOffloadingManager:
         self._simulate_on_schedule_end()
         assert self.manager.lookup(blocks[5], _CTX) is LookupResult.HIT_PENDING
 
+    def test_bounded_promotion_retries_then_promotes_once(
+        self, manager_setup, monkeypatch
+    ):
+        """A transient primary admission block defers without leasing twice."""
+        monkeypatch.setenv("DSPARK_BOUNDED_WARM_RESTORE", "1")
+        blocks = to_keys(range(6))
+        for block in blocks:
+            self.secondary_tier1.blocks[block] = True
+
+        self.secondary_tier1.submit_load = MagicMock(
+            wraps=self.secondary_tier1.submit_load
+        )
+
+        # The first five rows consume the primary staging capacity and remain
+        # protected in this step.  The secondary HIT for the sixth row must
+        # defer instead of becoming a cold miss.
+        for block in blocks[:5]:
+            assert self.manager.lookup(block, _CTX) is LookupResult.HIT_PENDING
+        assert self.manager.lookup(blocks[5], _CTX) is LookupResult.RETRY
+        assert self.manager.lookup(blocks[5], _CTX) is LookupResult.RETRY
+        assert self.primary_tier._policy.get(blocks[5]) is None
+        assert all(
+            blocks[5] not in pending.keys
+            for pending_by_req in self.manager._pending_load_submissions.values()
+            for pending in pending_by_req.values()
+        )
+
+        # Drain the first window.  Its rows are now reusable, so exactly one
+        # promotion for the deferred sixth row can be admitted.
+        self._simulate_on_schedule_end()
+        self._simulate_on_schedule_end()
+        assert self.manager.lookup(blocks[5], _CTX) is LookupResult.HIT_PENDING
+        self._simulate_on_schedule_end()
+
+        promoted_calls = [
+            call.args[0]
+            for call in self.secondary_tier1.submit_load.call_args_list
+            if blocks[5] in call.args[0].keys
+        ]
+        assert len(promoted_calls) == 1
+
+    def test_bounded_source_miss_remains_miss(self, manager_setup, monkeypatch):
+        """Bounded retry applies only after a confirmed secondary HIT."""
+        monkeypatch.setenv("DSPARK_BOUNDED_WARM_RESTORE", "1")
+        missing = to_keys([999])[0]
+
+        assert self.manager.lookup(missing, _CTX) is LookupResult.MISS
+        assert self.manager._pending_load_submissions == {}
+        assert self.primary_tier._policy.get(missing) is None
+
     def test_promotion_capacity_reuses_primary_across_four_windows(
         self, manager_setup
     ):
@@ -636,6 +686,50 @@ class TestTieringOffloadingManager:
         # submit_store was never called on either secondary tier
         self.secondary_tier1.submit_store.assert_not_called()
         self.secondary_tier2.submit_store.assert_not_called()
+
+    def test_failed_promotion_releases_primary_slot_and_keeps_source(
+        self, manager_setup
+    ):
+        """A failed secondary load cleans staging state without deleting source data."""
+        block = to_keys([0])[0]
+        self.secondary_tier1.blocks[block] = True
+
+        def fail_load(job_metadata: JobMetadata) -> None:
+            self.secondary_tier1.completed_jobs.append(
+                JobResult(job_id=job_metadata.job_id, success=False)
+            )
+
+        self.secondary_tier1.submit_load = fail_load
+
+        assert self.manager.lookup(block, _CTX) is LookupResult.HIT_PENDING
+        self._simulate_on_schedule_end()
+        assert self.manager._transfer_jobs
+
+        # The first poll sees the failed secondary job and releases the
+        # primary write-pending slot; no successful load completion is issued.
+        self._simulate_on_schedule_end()
+
+        assert self.manager._transfer_jobs == {}
+        assert self.primary_tier._num_write_pending_blocks == 0
+        assert self.primary_tier.lookup(block, _CTX) is LookupResult.MISS
+        assert self.secondary_tier1.lookup(block, _CTX) is LookupResult.HIT
+
+    def test_abort_load_releases_primary_read_pin(self, manager_setup):
+        """A failed GPU load releases the primary read reservation once."""
+        block = to_keys([1])[0]
+        self._start_request()
+        self.manager.prepare_store([block], _CTX)
+        self.manager.complete_store([block], _CTX, success=True)
+        self._simulate_on_schedule_end()
+        self._simulate_on_schedule_end()
+
+        self.manager.prepare_load([block], _CTX)
+        self.manager.abort_load([block], _CTX)
+        self.manager.abort_load([block], _CTX)
+
+        primary_block = self.primary_tier._policy.get(block)
+        assert primary_block is not None
+        assert primary_block.ref_cnt == 0
 
     def test_lookup_batches_submit_load_per_request(self, manager_setup):
         """lookup() defers submit_load until on_schedule_end(), one per request.

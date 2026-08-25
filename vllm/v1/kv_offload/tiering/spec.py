@@ -71,6 +71,28 @@ def _env_int(name: str, default: int = 1) -> int:
         return default
 
 
+def _read_exact_file(path: str, expected_bytes: int, source: str) -> bytes | None:
+    """Read one offload payload only when its size matches the layout."""
+    try:
+        with open(path, "rb") as file:
+            data = file.read()
+    except OSError as exc:
+        logger.warning("%s read failed for %s: %s", source, path, exc)
+        return None
+
+    actual_bytes = len(data)
+    if actual_bytes != expected_bytes:
+        logger.warning(
+            "%s read length mismatch for %s: expected=%d actual=%d",
+            source,
+            path,
+            expected_bytes,
+            actual_bytes,
+        )
+        return None
+    return data
+
+
 class TieringOffloadingSpec(CPUOffloadingSpec):
     """
     Spec for multi-tier KV cache offloading.
@@ -234,8 +256,7 @@ class TieringOffloadingSpec(CPUOffloadingSpec):
                     for _tier in secondary_tiers:
                         if hasattr(_tier, "file_mapper"):
                             _tier._layout_path = (
-                                f"/dev/shm/vllm_offload_{self._engine_id}"
-                                ".layout.json"
+                                f"/dev/shm/vllm_offload_{self._engine_id}.layout.json"
                             )
                 tiering_manager = TieringOffloadingManager(
                     primary_tier=primary_tier,
@@ -318,7 +339,7 @@ class TieringOffloadingSpec(CPUOffloadingSpec):
             # (absolute paths on a shared mount), fill this worker's mmap
             # rows from the files first, then run the normal load.
             _row = self.kv_bytes_per_chunk
-            _orig_submit_load = _worker.submit_load
+            _submit_prepared_load = _worker.submit_prepared_load
             # DSPARK_FS_PREAD_SKIP: on the node that ran the promotion (the
             # scheduler node in the current single-writer scheme), this
             # worker's mmap was already filled during promotion, so the
@@ -333,9 +354,12 @@ class TieringOffloadingSpec(CPUOffloadingSpec):
                 # Removes the shared-storage requirement and moves the cross-node
                 # copy onto the fast link. Replicated KV -> one read suffices.
                 import os as _relay_os
+
                 if entries and _relay_os.environ.get("DSPARK_RELAY_RESTORE") == "1":
                     import torch as _t
+
                     from vllm.distributed.parallel_state import get_tp_group
+
                     _tp = get_tp_group()
                     if _tp.world_size > 1:
                         _is_src = _tp.rank_in_group == 0
@@ -349,59 +373,124 @@ class TieringOffloadingSpec(CPUOffloadingSpec):
                         )
                         _win_bytes = 268435456
                         try:
-                            _win_bytes = int(_relay_os.environ.get(
-                                "DSPARK_RELAY_WINDOW_BYTES", "268435456"))
+                            _win_bytes = int(
+                                _relay_os.environ.get(
+                                    "DSPARK_RELAY_WINDOW_BYTES", "268435456"
+                                )
+                            )
                         except (ValueError, TypeError):
                             _win_bytes = 268435456
+                        # Reuse one bounded device buffer for the whole relay.
+                        # In particular, do not leave one CUDA allocation per
+                        # file/window in the caching allocator: on GB10 those
+                        # allocations consume the same unified-memory budget as
+                        # the destination KV load that follows this loop.
+                        _relay_capacity = max(
+                            min(
+                                _win_bytes,
+                                sum(_ln for _off, _path, _ln in _items),
+                            ),
+                            max((_ln for _off, _path, _ln in _items), default=0),
+                        )
+                        _relay_buf = None
+                        _buf = None
                         _wi = 0
                         while _wi < len(_items):
                             _wb = 0
                             _wj = _wi
                             while _wj < len(_items) and (
-                                    _wj == _wi
-                                    or _wb + _items[_wj][2] <= _win_bytes):
+                                _wj == _wi or _wb + _items[_wj][2] <= _win_bytes
+                            ):
                                 _wb += _items[_wj][2]
                                 _wj += 1
                             _window = _items[_wi:_wj]
-                            if _is_src:
+                            _window_data: list[bytes] | None = []
+                            if _is_src and not _pread_skip:
                                 for _off, _path, _ln in _window:
-                                    try:
-                                        with open(_path, "rb") as _f:
-                                            _data = _f.read()
-                                    except OSError as _e2:
-                                        logger.warning(
-                                            "relay src read failed for %s: %s",
-                                            _path, _e2,
-                                        )
-                                        continue
-                                    _g = _t.frombuffer(
-                                        bytearray(_data), dtype=_t.uint8
-                                    ).cuda()
-                                    _flat[_off : _off + len(_data)].copy_(_g)
-                                _t.cuda.synchronize()
-                            _buf = _t.empty(_wb, dtype=_t.uint8, device="cuda")
+                                    _data = _read_exact_file(_path, _ln, "relay source")
+                                    if _data is None:
+                                        _window_data = None
+                                        break
+                                    _window_data.append(_data)
+
+                            _status = _t.tensor(
+                                [1 if _window_data is not None else 0],
+                                dtype=_t.uint8,
+                                device="cuda",
+                            )
+                            _tp.broadcast(_status, src=0)
+                            if int(_status.item()) == 0:
+                                del _status
+                                if _relay_buf is not None:
+                                    _buf = None
+                                    _relay_buf = None
+                                    _t.accelerator.empty_cache()
+                                return _submit_prepared_load(
+                                    job_id,
+                                    src_spec,
+                                    dst_spec,
+                                    local_ready=False,
+                                )
+
+                            if _relay_buf is None:
+                                _relay_buf = _t.empty(
+                                    _relay_capacity,
+                                    dtype=_t.uint8,
+                                    device="cuda",
+                                )
+                            _buf = _relay_buf[:_wb]
                             if _is_src:
                                 _pos = 0
-                                for _off, _p, _ln in _window:
-                                    _buf[_pos : _pos + _ln].copy_(
-                                        _flat[_off : _off + _ln])
-                                    _pos += _ln
+                                if _pread_skip:
+                                    # Scheduler-side promotion already exact-read
+                                    # and populated this mmap. Re-reading the same
+                                    # files here doubles head NVMe traffic and
+                                    # transient memory without adding validation.
+                                    for _off, _path, _ln in _window:
+                                        _buf[_pos : _pos + _ln].copy_(
+                                            _flat[_off : _off + _ln]
+                                        )
+                                        _pos += _ln
+                                else:
+                                    assert _window_data is not None
+                                    for (_off, _path, _ln), _data in zip(
+                                        _window, _window_data
+                                    ):
+                                        _buf[_pos : _pos + _ln].copy_(
+                                            _t.frombuffer(
+                                                bytearray(_data), dtype=_t.uint8
+                                            )
+                                        )
+                                        _pos += _ln
+                                    del _window_data
+                            del _status
                             _tp.broadcast(_buf, src=0)
-                            if not _is_src:
+                            if not (_is_src and _pread_skip):
                                 _pos = 0
                                 for _off, _p, _ln in _window:
                                     _flat[_off : _off + _ln].copy_(
-                                        _buf[_pos : _pos + _ln])
+                                        _buf[_pos : _pos + _ln]
+                                    )
                                     _pos += _ln
                             _t.cuda.synchronize()
-                            del _buf
                             _wi = _wj
+                        if _relay_buf is not None:
+                            _buf = None
+                            _relay_buf = None
+                            # The final all-rank headroom vote must observe the
+                            # memory required by the actual H2D load, not a free
+                            # relay scratch buffer retained by PyTorch's cache.
+                            _t.accelerator.empty_cache()
                         _total = sum(_ln for _o, _p, _ln in _items)
                         logger.debug(
                             "relay restore: src=%s chunks=%d bytes=%d",
-                            _is_src, len(_items), _total,
+                            _is_src,
+                            len(_items),
+                            _total,
                         )
-                        return _orig_submit_load(job_id, src_spec, dst_spec)
+                        return _submit_prepared_load(
+                            job_id, src_spec, dst_spec, local_ready=True
+                        )
                 logger.debug(
                     "wk_load job=%s spec=%s fs=%s",
                     job_id,
@@ -433,21 +522,18 @@ class TieringOffloadingSpec(CPUOffloadingSpec):
                             thread_name_prefix="fs_pread",
                         )
                     items = [
-                        (int(_bid) * _row + int(_ent[1]), _ent[0])
+                        (
+                            int(_bid) * _row + int(_ent[1]),
+                            _ent[0],
+                            int(_ent[2]),
+                        )
                         for _bid, _ent in zip(src_spec.block_ids, entries)
                         if _ent
                     ]
 
                     def _read_one(item):
-                        _off, _path = item
-                        try:
-                            with open(_path, "rb") as _f:
-                                return _f.read()
-                        except OSError as _e:
-                            logger.warning(
-                                "fs direct read failed for %s: %s", _path, _e
-                            )
-                            return None
+                        _off, _path, _ln = item
+                        return _read_exact_file(_path, _ln, "fs direct")
 
                     _flat = _t.frombuffer(
                         memoryview(worker_mmap.mmap_obj), dtype=_t.uint8
@@ -456,10 +542,16 @@ class TieringOffloadingSpec(CPUOffloadingSpec):
                     for _i in range(0, len(items), window):
                         _chunk = items[_i : _i + window]
                         _datas = list(pool.map(_read_one, _chunk))
+                        if any(_data is None for _data in _datas):
+                            return _submit_prepared_load(
+                                job_id,
+                                src_spec,
+                                dst_spec,
+                                local_ready=False,
+                            )
                         _staged = []
-                        for (_off, _path), _data in zip(_chunk, _datas):
-                            if _data is None:
-                                continue
+                        for (_off, _path, _ln), _data in zip(_chunk, _datas):
+                            assert _data is not None
                             # Route the write through the GPU: letting the
                             # CPU dirty pinned pages that the device then
                             # reads has produced Xid 13 channel errors on
@@ -487,31 +579,35 @@ class TieringOffloadingSpec(CPUOffloadingSpec):
                         if not _ent:
                             continue
                         _path, _soff, _ln = _ent
-                        try:
-                            with open(_path, "rb") as _f:
-                                _data = _f.read()
-                            _off = int(_bid) * _row + int(_soff)
-                            # Route the write through the GPU: letting the
-                            # CPU dirty pinned pages that the device then
-                            # reads has produced Xid 13 channel errors on
-                            # GB10, so upload the file bytes and let device
-                            # DMA write them into the pinned mmap.
-                            import torch as _t
-                            _src_gpu = _t.frombuffer(
-                                bytearray(_data), dtype=_t.uint8
-                            ).cuda()
-                            _flat = _t.frombuffer(
-                                memoryview(worker_mmap.mmap_obj), dtype=_t.uint8
+                        _data = _read_exact_file(_path, int(_ln), "fs direct")
+                        if _data is None:
+                            return _submit_prepared_load(
+                                job_id,
+                                src_spec,
+                                dst_spec,
+                                local_ready=False,
                             )
-                            _flat[_off : _off + len(_data)].copy_(_src_gpu)
-                            _t.cuda.synchronize()
-                            _n_read += 1
-                        except OSError as _e:
-                            logger.warning(
-                                "fs direct read failed for %s: %s", _path, _e
-                            )
+                        _off = int(_bid) * _row + int(_soff)
+                        # Route the write through the GPU: letting the
+                        # CPU dirty pinned pages that the device then
+                        # reads has produced Xid 13 channel errors on
+                        # GB10, so upload the file bytes and let device
+                        # DMA write them into the pinned mmap.
+                        import torch as _t
+
+                        _src_gpu = _t.frombuffer(
+                            bytearray(_data), dtype=_t.uint8
+                        ).cuda()
+                        _flat = _t.frombuffer(
+                            memoryview(worker_mmap.mmap_obj), dtype=_t.uint8
+                        )
+                        _flat[_off : _off + len(_data)].copy_(_src_gpu)
+                        _t.cuda.synchronize()
+                        _n_read += 1
                     logger.debug("fs-direct preads: %d", _n_read)
-                return _orig_submit_load(job_id, src_spec, dst_spec)
+                return _submit_prepared_load(
+                    job_id, src_spec, dst_spec, local_ready=True
+                )
 
             _worker.submit_load = _fs_submit_load
 
@@ -543,9 +639,7 @@ class TieringOffloadingSpec(CPUOffloadingSpec):
                         "KV offload layout sidecar written: %s %s", _sc, _slices
                     )
                 except Exception as _e:  # noqa: BLE001
-                    logger.warning(
-                        "KV offload layout sidecar write failed: %s", _e
-                    )
+                    logger.warning("KV offload layout sidecar write failed: %s", _e)
             return _worker
         except Exception:
             worker_mmap.cleanup()

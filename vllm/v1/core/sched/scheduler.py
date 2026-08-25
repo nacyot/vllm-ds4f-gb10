@@ -854,15 +854,6 @@ class Scheduler(SchedulerInterface):
                         step_skipped_waiting.prepend_request(request)
                         continue
 
-                    # Track first scheduled prefill, not post-preemption repeat prefills
-                    if request.prefill_stats and request.num_preemptions <= 0:
-                        assert num_computed_tokens <= request.num_prompt_tokens
-                        request.prefill_stats.set(
-                            num_prompt_tokens=request.num_prompt_tokens,
-                            num_local_cached_tokens=num_new_local_computed_tokens,
-                            num_external_cached_tokens=num_external_computed_tokens,
-                        )
-
                 elif incremental_external_lookup:
                     # The previous async window is already attached to this
                     # request. Ask the opt-in connector for the next suffix and
@@ -1035,6 +1026,33 @@ class Scheduler(SchedulerInterface):
                     if request.has_encoder_inputs:
                         self.encoder_cache_manager.free(request)
                     break
+
+                # Track first admitted prefill, not an unscheduled lookup or a
+                # post-preemption repeat prefill.  Commit-time connectors defer
+                # external-hit accounting until their load completion; other
+                # connectors retain the historical lookup-time accounting.
+                if did_prefix_cache_lookup and request.prefill_stats:
+                    if request.num_preemptions <= 0:
+                        assert num_computed_tokens <= request.num_prompt_tokens
+                        if (
+                            self.connector is not None
+                            and getattr(
+                                self.connector,
+                                "supports_commit_time_prefill_stats",
+                                False,
+                            )
+                            is True
+                        ):
+                            request.prefill_stats.initialize(
+                                num_prompt_tokens=request.num_prompt_tokens,
+                                num_local_cached_tokens=num_new_local_computed_tokens,
+                            )
+                        else:
+                            request.prefill_stats.set(
+                                num_prompt_tokens=request.num_prompt_tokens,
+                                num_local_cached_tokens=num_new_local_computed_tokens,
+                                num_external_cached_tokens=num_external_computed_tokens,
+                            )
 
                 # KVTransfer: the connector uses this info to determine
                 # if a load is needed. Note that
@@ -2848,21 +2866,48 @@ class Scheduler(SchedulerInterface):
             is_affected = False
             marked_invalid_block = False
             req_id = request.request_id
-            # TODO (davidb): add support for hybrid memory allocator
-            (req_block_ids,) = self.kv_cache_manager.get_block_ids(req_id)
             # We iterate only over blocks that may contain externally computed
             # tokens
             req_num_computed_tokens = (
                 request.num_computed_tokens - num_scheduled_tokens.get(req_id, 0)
             )
 
-            req_num_computed_blocks = (
-                req_num_computed_tokens + self.block_size - 1
-            ) // self.block_size
-            for idx, block_id in zip(range(req_num_computed_blocks), req_block_ids):
-                if block_id not in invalid_block_ids:
-                    continue
+            # Block IDs come from a shared pool, so the flat invalid_block_ids
+            # interface is sufficient to identify a failed block in any KV
+            # cache group.  The block tables themselves are per-group and may
+            # use different block sizes, so collect locations before applying
+            # the first-failure truncation.  Sorting is important when a later
+            # group has a smaller block size: group iteration order must not
+            # decide which failure is considered first.
+            invalid_block_locations: list[tuple[int, int, list[int], int]] = []
+            for manager, req_block_ids in zip(
+                self.kv_cache_manager.coordinator.single_type_managers,
+                self.kv_cache_manager.get_block_ids(req_id),
+                strict=True,
+            ):
+                req_num_computed_blocks = (
+                    req_num_computed_tokens + manager.block_size - 1
+                ) // manager.block_size
+                invalid_block_locations.extend(
+                    (
+                        idx * manager.block_size,
+                        block_id,
+                        req_block_ids,
+                        idx,
+                    )
+                    for idx, block_id in enumerate(
+                        req_block_ids[:req_num_computed_blocks]
+                    )
+                    if block_id in invalid_block_ids
+                )
 
+            invalid_block_locations.sort(key=lambda location: location[0])
+            for (
+                _block_start_token,
+                block_id,
+                req_block_ids,
+                idx,
+            ) in invalid_block_locations:
                 is_affected = True
 
                 if block_id in marked_invalid_block_ids:
@@ -2876,6 +2921,12 @@ class Scheduler(SchedulerInterface):
 
                 marked_invalid_block_ids.add(block_id)
 
+                # A failed block invalidates the suffix of its own group. In
+                # a hybrid table, another group can fail at the same token
+                # boundary, so collect each group's suffix independently.
+                if evict_blocks:
+                    blocks_to_evict.update(req_block_ids[idx:])
+
                 if marked_invalid_block:
                     # This request has already marked an invalid block for
                     # recomputation and updated its num_computed_tokens.
@@ -2883,15 +2934,11 @@ class Scheduler(SchedulerInterface):
 
                 marked_invalid_block = True
                 # Truncate the computed tokens at the first failed block
-                request.num_computed_tokens = idx * self.block_size
+                request.num_computed_tokens = _block_start_token
                 num_affected_tokens = (
                     req_num_computed_tokens - request.num_computed_tokens
                 )
                 total_affected_tokens += num_affected_tokens
-
-                # collect invalid block and all downstream dependent blocks
-                if evict_blocks:
-                    blocks_to_evict.update(req_block_ids[idx:])
 
             if is_affected:
                 if not marked_invalid_block:

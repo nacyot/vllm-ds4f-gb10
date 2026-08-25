@@ -184,6 +184,8 @@ class MultiConnector(KVConnectorBase_V1, SupportsHMA):
             self._connectors.append(connector_cls(temp_config, role, kv_cache_config))
             self._ktc_kv_transfer_config.append(temp_config.kv_transfer_config)
 
+        self._validate_incremental_capabilities()
+
         assert vllm_config.kv_transfer_config is not None
         self._all_support_hma = MultiConnector.all_children_support_hma(
             vllm_config.kv_transfer_config
@@ -203,6 +205,21 @@ class MultiConnector(KVConnectorBase_V1, SupportsHMA):
         # Propagated from scheduler to worker side via the connector metadata.
         self._extra_async_saves: dict[str, int] = {}
 
+    def _validate_incremental_capabilities(self) -> None:
+        """Reject child mixes whose scheduler accounting contracts disagree."""
+        modes = {
+            (
+                bool(connector.supports_incremental_kv_load),
+                bool(connector.supports_commit_time_prefill_stats),
+            )
+            for connector in self._connectors
+        }
+        if len(modes) > 1:
+            raise ValueError(
+                "MultiConnector children must agree on incremental KV load "
+                "and commit-time prefill accounting capabilities"
+            )
+
     @property
     def prefer_cross_layer_blocks(self) -> bool:
         if not self._connectors:
@@ -212,6 +229,23 @@ class MultiConnector(KVConnectorBase_V1, SupportsHMA):
     @property
     def requires_kv_delivery(self) -> bool:
         return any(c.requires_kv_delivery for c in self._connectors)
+
+    @property
+    def supports_incremental_kv_load(self) -> bool:
+        # The core scheduler sees MultiConnector as one connector.  Resume an
+        # external lookup only when every possible selected load child follows
+        # the incremental-window contract.
+        return bool(self._connectors) and all(
+            c.supports_incremental_kv_load for c in self._connectors
+        )
+
+    @property
+    def supports_commit_time_prefill_stats(self) -> bool:
+        # Likewise, defer hit accounting only when every load candidate commits
+        # its external-token count after transfer success.
+        return bool(self._connectors) and all(
+            c.supports_commit_time_prefill_stats for c in self._connectors
+        )
 
     @classmethod
     def _get_connector_classes_and_configs(

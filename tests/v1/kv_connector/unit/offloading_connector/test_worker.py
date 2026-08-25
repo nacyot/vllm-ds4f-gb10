@@ -1,12 +1,14 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 from collections import defaultdict
+from types import SimpleNamespace
 from unittest.mock import MagicMock
 
 import pytest
 import torch
 
 from vllm.distributed.kv_transfer.kv_connector.v1.offloading.common import (
+    NodeHeadroomConfig,
     OffloadingConnectorMetadata,
     TransferJob,
 )
@@ -31,6 +33,7 @@ from vllm.v1.kv_offload.base import (
     OffloadingManager,
     OffloadingSpec,
     OffloadingWorker,
+    TransferResult,
 )
 from vllm.v1.kv_offload.config import (
     OffloadingCacheConfig,
@@ -157,13 +160,18 @@ def _store_metadata(job_id: int) -> OffloadingConnectorMetadata:
     )
 
 
-def _load_metadata(job_id: int) -> OffloadingConnectorMetadata:
+def _load_metadata(
+    job_id: int, block_ids: list[int] | None = None
+) -> OffloadingConnectorMetadata:
+    block_ids = [0] if block_ids is None else block_ids
     return OffloadingConnectorMetadata(
         load_jobs={
             job_id: TransferJob(
                 req_id="req",
                 src_spec=LoadStoreSpec(),
-                dst_spec=GPULoadStoreSpec([0], group_sizes=(1,), block_indices=(0,)),
+                dst_spec=GPULoadStoreSpec(
+                    block_ids, group_sizes=(len(block_ids),), block_indices=(0,)
+                ),
             )
         },
         store_jobs={},
@@ -225,6 +233,7 @@ def test_prepare_store_kv_non_writer_marks_completed_without_submit():
     meta = worker.build_connector_worker_meta()
     assert meta is not None
     assert meta.completed_jobs == {7: 1}
+    assert meta.worker_rank == 1
 
 
 def test_prepare_store_kv_writer_submits_store():
@@ -282,16 +291,167 @@ def test_handle_preemptions_non_writer_acks_flushed_store():
 
 def test_start_kv_transfers_non_writer_still_submits_load():
     worker, _ = _make_worker(
-        KVCacheConfig(num_blocks=0, kv_cache_tensors=[], kv_cache_groups=[]),
+        KVCacheConfig(num_blocks=4, kv_cache_tensors=[], kv_cache_groups=[]),
         replicated_layout=True,
         rank=1,
     )
 
-    worker.start_kv_transfers(_load_metadata(10))
+    worker.start_kv_transfers(_load_metadata(10, block_ids=[1]))
 
     assert worker.worker is not None
     worker.worker.submit_load.assert_called_once()
     assert worker.build_connector_worker_meta() is None
+
+
+def test_init_worker_installs_final_h2d_headroom_guard():
+    worker, spec = _make_worker(
+        KVCacheConfig(num_blocks=0, kv_cache_tensors=[], kv_cache_groups=[])
+    )
+    worker._node_headroom_config = NodeHeadroomConfig(
+        reserve_bytes=10,
+        j_bytes=5,
+        heartbeat_max_age_ms=100,
+    )
+    backend = MagicMock()
+    spec.get_worker.return_value = backend
+
+    worker._init_worker(MagicMock())
+
+    backend.set_load_admission_guard.assert_called_once_with(
+        worker._all_rank_h2d_headroom_admission
+    )
+
+
+def test_final_h2d_headroom_vote_uses_all_rank_min(monkeypatch):
+    worker, _ = _make_worker(
+        KVCacheConfig(num_blocks=0, kv_cache_tensors=[], kv_cache_groups=[])
+    )
+    worker._node_headroom_config = NodeHeadroomConfig(
+        reserve_bytes=10,
+        j_bytes=5,
+        heartbeat_max_age_ms=100,
+    )
+
+    import vllm.distributed.parallel_state as parallel_state
+    from vllm.distributed.kv_transfer.kv_connector.v1.offloading import (
+        worker as worker_module,
+    )
+
+    cpu_group = object()
+    monkeypatch.setattr(worker_module, "read_mem_available_bytes", lambda: 15)
+    monkeypatch.setattr(
+        parallel_state,
+        "get_tp_group",
+        lambda: SimpleNamespace(world_size=2, cpu_group=cpu_group),
+    )
+
+    def remote_rank_veto(vote, *, group, op):
+        assert group is cpu_group
+        assert op is torch.distributed.ReduceOp.MIN
+        assert vote.item() == 1
+        vote.zero_()
+
+    monkeypatch.setattr(torch.distributed, "all_reduce", remote_rank_veto)
+
+    assert worker._all_rank_h2d_headroom_admission(local_ready=True) is False
+
+
+def test_final_h2d_headroom_vote_includes_local_prepare_failure(monkeypatch):
+    worker, _ = _make_worker(
+        KVCacheConfig(num_blocks=0, kv_cache_tensors=[], kv_cache_groups=[])
+    )
+    worker._node_headroom_config = NodeHeadroomConfig(
+        reserve_bytes=10,
+        j_bytes=5,
+        heartbeat_max_age_ms=100,
+    )
+
+    import vllm.distributed.parallel_state as parallel_state
+    from vllm.distributed.kv_transfer.kv_connector.v1.offloading import (
+        worker as worker_module,
+    )
+
+    cpu_group = object()
+    monkeypatch.setattr(worker_module, "read_mem_available_bytes", lambda: 100)
+    monkeypatch.setattr(
+        parallel_state,
+        "get_tp_group",
+        lambda: SimpleNamespace(world_size=2, cpu_group=cpu_group),
+    )
+
+    def observe_vote(vote, *, group, op):
+        assert group is cpu_group
+        assert op is torch.distributed.ReduceOp.MIN
+        assert vote.item() == 0
+
+    monkeypatch.setattr(torch.distributed, "all_reduce", observe_vote)
+
+    assert worker._all_rank_h2d_headroom_admission(local_ready=False) is False
+
+
+def test_submit_load_rejection_reports_invalid_destinations_without_asserting():
+    worker, _ = _make_worker(
+        KVCacheConfig(num_blocks=4, kv_cache_tensors=[], kv_cache_groups=[])
+    )
+    assert worker.worker is not None
+    worker.worker.submit_load.return_value = False
+
+    worker.start_kv_transfers(_load_metadata(11, block_ids=[1]))
+
+    assert worker.get_finished(set()) == (set(), {"req"})
+    assert worker._load_jobs == {}
+    assert worker._load_block_ids == {}
+    assert worker.get_block_ids_with_load_errors() == {1}
+    meta = worker.build_connector_worker_meta()
+    assert meta is not None
+    assert meta.completed_jobs == {11: 1}
+    assert meta.failed_jobs == {11: 1}
+    assert worker.get_block_ids_with_load_errors() == set()
+
+
+def test_async_failed_load_reports_once_and_cleans_worker_state():
+    worker, _ = _make_worker(
+        KVCacheConfig(num_blocks=4, kv_cache_tensors=[], kv_cache_groups=[])
+    )
+    assert worker.worker is not None
+    worker.worker.get_finished.return_value = [
+        TransferResult(job_id=12, success=False)
+    ]
+
+    worker.start_kv_transfers(_load_metadata(12, block_ids=[1]))
+    assert worker.get_finished(set()) == (set(), {"req"})
+    assert worker._load_jobs == {}
+    assert worker._load_block_ids == {}
+    assert worker.get_block_ids_with_load_errors() == {1}
+
+    meta = worker.build_connector_worker_meta()
+    assert meta is not None
+    assert meta.completed_jobs == {12: 1}
+    assert meta.failed_jobs == {12: 1}
+    assert meta.worker_rank == 0
+
+    # A stale duplicate backend result must not re-emit completion or failure.
+    assert worker.get_finished(set()) == (set(), set())
+    assert worker.build_connector_worker_meta() is None
+    assert worker.get_block_ids_with_load_errors() == set()
+
+
+def test_invalid_load_destinations_fail_before_submit_and_report_valid_blocks():
+    worker, _ = _make_worker(
+        KVCacheConfig(num_blocks=4, kv_cache_tensors=[], kv_cache_groups=[])
+    )
+    assert worker.worker is not None
+    worker.worker.submit_load.return_value = True
+
+    worker.start_kv_transfers(_load_metadata(13, block_ids=[1, -1, 4]))
+
+    worker.worker.submit_load.assert_not_called()
+    assert worker.get_finished(set()) == (set(), {"req"})
+    assert worker.get_block_ids_with_load_errors() == {1}
+    meta = worker.build_connector_worker_meta()
+    assert meta is not None
+    assert meta.completed_jobs == {13: 1}
+    assert meta.failed_jobs == {13: 1}
 
 
 def test_offloading_connector_worker_accepts_plugin_spec_default_layout():

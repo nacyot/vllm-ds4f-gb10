@@ -4,7 +4,7 @@ import functools
 import os
 import time
 from collections import deque
-from collections.abc import Sequence
+from collections.abc import Callable, Sequence
 from dataclasses import dataclass
 from typing import NamedTuple
 
@@ -29,7 +29,6 @@ from vllm.v1.kv_offload.base import (
 )
 from vllm.v1.kv_offload.cpu.shared_offload_region import SharedOffloadRegion
 from vllm.v1.kv_offload.cpu.swap_blocks_triton import (
-    THRESHOLD_BYTES,
     swap_blocks_batch,
 )
 
@@ -623,7 +622,8 @@ class SingleDirectionOffloadingHandler:
                 f"block accounting mismatch: src {src_offset}/{num_src_blocks} "
                 f"dst {dst_offset}/{num_dst_blocks} "
                 f"g2c={self.gpu_to_cpu} "
-                f"src_bpc={self.src_blocks_per_chunk} dst_bpc={self.dst_blocks_per_chunk} "
+                f"src_bpc={self.src_blocks_per_chunk} "
+                f"dst_bpc={self.dst_blocks_per_chunk} "
                 f"group_sizes={list(group_sizes)} block_indices={list(block_indices)}"
             )
         # Writer rotation may skip non-writer blocks, leaving op_idx below
@@ -834,6 +834,28 @@ class CPUOffloadingWorker(OffloadingWorker):
             gpu_to_cpu=False,
             canonical_layout=canonical_layout,
         )
+        self._load_admission_guard: Callable[[bool], bool] | None = None
+
+    def set_load_admission_guard(
+        self, guard: Callable[[bool], bool]
+    ) -> None:
+        self._load_admission_guard = guard
+
+    def submit_prepared_load(
+        self,
+        job_id: int,
+        src_spec: LoadStoreSpec,
+        dst_spec: GPULoadStoreSpec,
+        *,
+        local_ready: bool,
+    ) -> bool:
+        """Vote after rank-local preparation and immediately before H2D."""
+        if self._load_admission_guard is not None:
+            if not self._load_admission_guard(local_ready):
+                return False
+        elif not local_ready:
+            return False
+        return self._load_handler.transfer_async(job_id, src_spec, dst_spec)
 
     def submit_store(
         self, job_id: int, src_spec: GPULoadStoreSpec, dst_spec: LoadStoreSpec
@@ -845,7 +867,9 @@ class CPUOffloadingWorker(OffloadingWorker):
         self, job_id: int, src_spec: LoadStoreSpec, dst_spec: GPULoadStoreSpec
     ) -> bool:
         """Async CPU -> GPU."""
-        return self._load_handler.transfer_async(job_id, src_spec, dst_spec)
+        return self.submit_prepared_load(
+            job_id, src_spec, dst_spec, local_ready=True
+        )
 
     def get_finished(self) -> list[TransferResult]:
         return self._store_handler.get_finished() + self._load_handler.get_finished()

@@ -294,10 +294,17 @@ class TieringOffloadingManager(OffloadingManager):
             for completed_job in tier.get_finished_jobs():
                 job_id = completed_job.job_id
                 job_metadata = self._transfer_jobs.pop(job_id, None)
-                assert job_metadata is not None, (
-                    f"Finished job_id {job_id} from tier #{i}"
-                    f" ({tier.tier_type}) not in _transfer_jobs"
-                )
+                if job_metadata is None:
+                    # A tier may report a completion more than once while a
+                    # reset or duplicate poll is being drained.  The first
+                    # completion already released the primary reservation.
+                    logger.debug(
+                        "Ignoring duplicate/unknown job_id %s from tier #%d (%s)",
+                        job_id,
+                        i,
+                        tier.tier_type,
+                    )
+                    continue
 
                 if job_metadata.is_promotion:
                     # secondary→primary transfer (promotion) completed.
@@ -352,9 +359,10 @@ class TieringOffloadingManager(OffloadingManager):
             HIT       — block is ready in the primary tier.
             HIT_PENDING — block found but not yet readable (write
                         in-flight on the primary tier).
-            RETRY     — promotion started or a secondary tier is busy.
-            MISS      — block not found in any tier, or primary is full
-                        and cannot accept a promotion.
+            RETRY     — promotion started, a secondary tier is busy, or a
+                        bounded restore promotion is temporarily blocked.
+            MISS      — block not found in any tier, or an unbounded restore
+                        cannot accept a promotion.
         """
         # Poll first so a promotion that finished since the last call is
         # already reflected as HIT (not stale HIT_PENDING/MISS) below, and
@@ -421,11 +429,20 @@ class TieringOffloadingManager(OffloadingManager):
                 # Backport of #51840: return HIT_PENDING when a promotion
                 # was triggered -- the request keeps progressing while
                 # promotion, load and release drain as a pipeline.
-                return (
-                    LookupResult.MISS
-                    if not promoted
-                    else LookupResult.HIT_PENDING
-                )
+                if promoted:
+                    return LookupResult.HIT_PENDING
+                if os.environ.get("DSPARK_BOUNDED_WARM_RESTORE") == "1":
+                    # A secondary HIT is still usable, but primary admission
+                    # can be transiently blocked by capacity, pins, or
+                    # write-pending rows.  Do not turn that state into a cold
+                    # miss; retry after the current staging window drains.
+                    if (
+                        req_state is not None
+                        and req_state.secondary_lookup_start_time is None
+                    ):
+                        req_state.secondary_lookup_start_time = lookup_start
+                    return LookupResult.RETRY
+                return LookupResult.MISS
             if result is LookupResult.RETRY:
                 any_retry = True
                 if self._restore_diagnostics:
@@ -670,6 +687,11 @@ class TieringOffloadingManager(OffloadingManager):
                 len(keys),
                 *self._primary_debug_counts(),
             )
+
+    @override
+    def abort_load(self, keys: Collection[OffloadKey], req_context: ReqContext):
+        """Release primary-tier pins after a failed GPU load."""
+        self.primary_tier.abort_load(keys, req_context)
 
     @override
     def prepare_store(

@@ -5,7 +5,7 @@ Core abstractions for KV cache offloading in vLLM v1.
 """
 
 from abc import ABC, abstractmethod
-from collections.abc import Collection, Iterable, Sequence
+from collections.abc import Callable, Collection, Iterable, Sequence
 from dataclasses import dataclass, field
 from enum import Enum, auto
 from typing import TYPE_CHECKING, Any, ClassVar, NamedTuple, NewType, TypeVar
@@ -178,6 +178,7 @@ The class provides the following primitives:
         blocks that are cached by the GPU prefix cache.
     complete_load() - mark blocks which were previously prepared to be
         loaded as done loading. This is to re-allow their eviction.
+    abort_load() - release blocks prepared for a load that failed.
     prepare_store() - prepare the given blocks to be written.
         Returns a StoreSpec encapsulating offloading information,
         as well as a list of blocks that were evicted as a result.
@@ -277,6 +278,24 @@ class OffloadingManager(ABC):
         """
         return
 
+    def abort_load(self, keys: Collection[OffloadKey], req_context: ReqContext):
+        """Release resources reserved by a failed load.
+
+        ``prepare_load`` may pin source blocks (or otherwise reserve load
+        state) before the data reaches the GPU.  A failed transfer must use
+        this path so those reservations are released without being treated as
+        a successful load.
+
+        Args:
+            keys: Blocks whose load reservation should be released.
+            req_context: Per-request context.
+        """
+        return
+
+    def fail_load(self, keys: Collection[OffloadKey], req_context: ReqContext):
+        """Compatibility alias for :meth:`abort_load`."""
+        return self.abort_load(keys, req_context)
+
     @abstractmethod
     def prepare_store(
         self,
@@ -339,7 +358,8 @@ class OffloadingManager(ABC):
         By the time this is called, the scheduler will issue no more
         submit-side calls for this request, such as prepare_store() and
         prepare_load(). Completion callbacks for already-submitted transfers
-        (complete_store() and complete_load()) may still arrive afterward.
+        (complete_store(), complete_load(), and abort_load()) may still arrive
+        afterward.
 
         This hook does NOT imply the data has been persisted. Asynchronous
         transfers already submitted for this request may still be in flight.
@@ -564,6 +584,20 @@ class OffloadingWorker(ABC):
 
     @abstractmethod
     def wait(self, job_ids: set[int]) -> None: ...
+
+    def set_load_admission_guard(
+        self, guard: Callable[[bool], bool]
+    ) -> None:
+        """Install a final load-admission vote before offload-to-GPU copies.
+
+        Workers that support this optional safety hook must override it. The
+        boolean passed to ``guard`` reports whether rank-local preparation
+        succeeded; the returned verdict must be identical on every worker
+        participating in the load.
+        """
+        raise NotImplementedError(
+            f"{type(self).__name__} does not support load admission guards"
+        )
 
     def shutdown(self) -> None:
         return

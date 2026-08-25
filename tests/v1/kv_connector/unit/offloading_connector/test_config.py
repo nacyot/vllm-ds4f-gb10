@@ -13,6 +13,9 @@ from vllm.config import KVTransferConfig, ParallelConfig, VllmConfig
 from vllm.distributed.kv_transfer.kv_connector.v1.offloading.config import (
     build_offloading_config,
 )
+from vllm.distributed.kv_transfer.kv_connector.v1.offloading_connector import (
+    OffloadingConnector,
+)
 from vllm.distributed.kv_transfer.kv_connector.v1.offloading.scheduler import (
     SchedulerOffloadConfig,
     is_store_reachable_swa_chunk,
@@ -89,6 +92,19 @@ def _make_kv_cache_config() -> KVCacheConfig:
             )
         ],
     )
+
+
+def test_commit_time_prefill_stats_requires_bounded_restore(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    connector = object.__new__(OffloadingConnector)
+
+    monkeypatch.delenv("DSPARK_BOUNDED_WARM_RESTORE", raising=False)
+    assert not connector.supports_commit_time_prefill_stats
+
+    monkeypatch.setenv("DSPARK_BOUNDED_WARM_RESTORE", "1")
+    assert connector.supports_incremental_kv_load
+    assert connector.supports_commit_time_prefill_stats
 
 
 def _make_sizing_kv_cache_config(packed: bool) -> KVCacheConfig:
