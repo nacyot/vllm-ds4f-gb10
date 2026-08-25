@@ -368,6 +368,8 @@ class DFlashSpeculator(DraftModelSpeculator):
                     "query_start_loc": input_batch.query_start_loc,
                     "batch_size": num_reqs,
                     "num_rejected_tokens": num_rejected,
+                "row_map": input_batch.idx_mapping[:num_reqs],
+                    "row_map": input_batch.idx_mapping[:num_reqs],
                 }
             self.model.precompute_and_store_context_kv(
                 context_hidden_states,
