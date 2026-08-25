@@ -465,24 +465,18 @@ class DFlashSpeculator(DraftModelSpeculator):
 
         # Rebuild the draft attention metadata even when replaying the FULL
         # graph so that any attention metadata builder state is updated.
-        # [ctxkv-p1] Unless the draft never runs vLLM attention at all (DSpark
-        # ring-cache drafter): then the metadata and slot mappings are never
-        # read, and building them is pure per-step CPU cost.
-        draft_attn_metadata: dict[str, Any] | None = None
-        draft_slot_mappings_by_layer: dict[str, torch.Tensor] | None = None
-        if getattr(self.model, "uses_vllm_attention", True):
-            draft_attn_metadata = self._build_draft_attn_metadata(
-                num_reqs=num_reqs,
-                num_reqs_padded=num_reqs_padded,
-                num_tokens_padded=num_tokens_padded,
-                seq_lens_cpu_upper_bound=input_batch.seq_lens_cpu_upper_bound,
-                step=self.num_query_per_req,
-                causal=self._group_causal,
-            )
-            draft_slot_mappings_by_layer = build_slot_mappings_by_layer(
-                self.block_tables.slot_mappings[:, :num_tokens_padded],
-                self.kv_cache_config,
-            )
+        draft_attn_metadata = self._build_draft_attn_metadata(
+            num_reqs=num_reqs,
+            num_reqs_padded=num_reqs_padded,
+            num_tokens_padded=num_tokens_padded,
+            seq_lens_cpu_upper_bound=input_batch.seq_lens_cpu_upper_bound,
+            step=self.num_query_per_req,
+            causal=self._group_causal,
+        )
+        draft_slot_mappings_by_layer = build_slot_mappings_by_layer(
+            self.block_tables.slot_mappings[:, :num_tokens_padded],
+            self.kv_cache_config,
+        )
 
         # DFlash processes all speculative tokens in one forward pass,
         # so the real token count is num_query_tokens.
