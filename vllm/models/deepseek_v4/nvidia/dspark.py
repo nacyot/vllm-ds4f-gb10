@@ -716,6 +716,11 @@ class DSparkDeepseekV4ForCausalLM(nn.Module):
     """DSpark draft model for fixed-block speculative decoding."""
 
     uses_query_start_loc_context_kv = True
+    # [ctxkv-p1] This draft never calls its vLLM attention layers' forward: the
+    # draft attends over the per-request ring cache (_main_kv_cache) with the
+    # Triton kernel in _dspark_attention. The speculator therefore skips the
+    # per-step draft attention-metadata / slot-mapping builds (dead work).
+    uses_vllm_attention = False
     # Full-vocab draft: draft ids are target ids, no remapping needed. Declared
     # because DSparkSpeculator.load_draft_model reads it unconditionally, and an
     # nn.Module without the attribute raises AttributeError from __getattr__
