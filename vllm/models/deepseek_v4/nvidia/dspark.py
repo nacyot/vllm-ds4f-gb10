@@ -221,6 +221,14 @@ class DeepSeekV4DSparkLayer(nn.Module):
             ),
             persistent=False,
         )
+        # [rowmap] persistent-request-index row map for the ring cache
+        # (fixed-address buffer: written outside CUDA graphs in store_main_kv,
+        # read inside graphs by _dspark_attention via index_select).
+        self.register_buffer(
+            "_ctx_row_map",
+            torch.arange(max_batch, dtype=torch.int64),
+            persistent=False,
+        )
         self.use_materialized_attention = _spec_bool(
             vllm_config,
             "dspark_materialized_attention",
@@ -380,14 +388,19 @@ class DeepSeekV4DSparkLayer(nn.Module):
         query_start_loc: torch.Tensor,
         batch_size: int,
         num_rejected_tokens: torch.Tensor | None = None,
+        row_map: torch.Tensor | None = None,
     ) -> None:
         if main_x.numel() == 0:
             return
+        if row_map is not None:
+            self._ctx_row_map[:batch_size].copy_(
+                row_map[:batch_size].to(torch.int64).clamp(min=0)
+            )
         if self.use_triton_context_kv_store:
             main_kv_raw = self._project_main_kv_raw(main_x)
             dspark_context_kv_store(
                 main_kv_raw,
-                self._main_kv_cache[:batch_size],
+                self._main_kv_cache,
                 main_positions,
                 query_start_loc,
                 batch_size,
@@ -395,6 +408,7 @@ class DeepSeekV4DSparkLayer(nn.Module):
                 self.attn.kv_norm.weight.data,
                 self.attn.rotary_emb.cos_sin_cache,
                 self.attn.eps,
+                row_map=self._ctx_row_map,
             )
             return
 
@@ -411,9 +425,9 @@ class DeepSeekV4DSparkLayer(nn.Module):
                 continue
             req_positions = main_positions[start:end].long()
             slots = torch.remainder(req_positions, window)
-            self._main_kv_cache[req_idx, slots] = main_kv[start:end].to(
-                self._main_kv_cache.dtype
-            )
+            self._main_kv_cache[self._ctx_row_map[req_idx], slots] = main_kv[
+                start:end
+            ].to(self._main_kv_cache.dtype)
 
     def _project_draft_q_kv(
         self,
@@ -462,7 +476,9 @@ class DeepSeekV4DSparkLayer(nn.Module):
         q = q.view(batch_size, block_size, self.attn.n_local_heads, self.attn.head_dim)
         draft_kv = draft_kv.view(batch_size, block_size, self.attn.head_dim)
 
-        cache_kv = self._main_kv_cache[:batch_size].to(draft_kv.dtype)
+        cache_kv = self._main_kv_cache.index_select(
+            0, self._ctx_row_map[:batch_size]
+        ).to(draft_kv.dtype)
         if self.use_triton_attention:
             o = dspark_triton_attention(
                 q,
@@ -840,6 +856,7 @@ class DSparkDeepseekV4ForCausalLM(nn.Module):
         query_start_loc: torch.Tensor | None = None,
         batch_size: int | None = None,
         num_rejected_tokens: torch.Tensor | None = None,
+        row_map: torch.Tensor | None = None,
     ) -> torch.Tensor | None:
         del context_slot_mapping
         if query_start_loc is None or context_states.numel() == 0:
@@ -860,6 +877,7 @@ class DSparkDeepseekV4ForCausalLM(nn.Module):
                 query_start_loc,
                 batch_size,
                 num_rejected_tokens,
+                row_map,
             )
         return main_x
 

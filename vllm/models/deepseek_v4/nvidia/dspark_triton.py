@@ -110,6 +110,10 @@ def dspark_qkv_postprocess(
     if num_tokens == 0:
         return torch.empty_like(q), torch.empty_like(kv)
     rope_dim = cos_sin_cache.shape[-1]
+    if row_map is None:
+        _row_map = torch.arange(batch_size, device=kv.device, dtype=torch.int64)
+    else:
+        _row_map = row_map
     block_d = triton.next_power_of_2(head_dim)
     q_out = torch.empty_like(q)
     kv_out = torch.empty_like(kv)
@@ -135,6 +139,7 @@ def _dspark_context_kv_store_kernel(
     kv_ptr,
     cache_ptr,
     positions_ptr,
+    row_map_ptr,
     query_start_loc_ptr,
     rejected_ptr,
     kv_weight_ptr,
@@ -162,6 +167,9 @@ def _dspark_context_kv_store_kernel(
         in_request = (token_pid >= start) & (token_pid < end)
         req_idx = tl.where(in_request, batch_idx, req_idx)
         should_store = should_store | in_request
+    # [rowmap] persistent request-state row: the ring cache must not be keyed
+    # by the volatile batch row (it shifts when batch composition changes).
+    req_row = tl.load(row_map_ptr + req_idx)
 
     offs = tl.arange(0, block_d)
     mask = offs < head_dim
@@ -209,7 +217,7 @@ def _dspark_context_kv_store_kernel(
     )
     out = tl.where(offs < nope_dim, norm, rope)
 
-    cache_row = cache_ptr + req_idx * cache_batch_stride + slot * cache_window_stride
+    cache_row = cache_ptr + req_row * cache_batch_stride + slot * cache_window_stride
     tl.store(cache_row + offs, out, mask=mask & should_store)
 
 
@@ -223,6 +231,7 @@ def dspark_context_kv_store(
     kv_weight: torch.Tensor,
     cos_sin_cache: torch.Tensor,
     eps: float,
+    row_map: torch.Tensor | None = None,
 ) -> None:
     """Fuse DSpark context KV RMSNorm+RoPE and circular cache scatter."""
     if kv.dim() != 2:
