@@ -194,10 +194,28 @@ class SingleTypeKVCacheManager(ABC):
         if request_id in self.num_cached_block:
             # Fast-path: a running request won't have any new prefix-cache hits.
             assert len(new_computed_blocks) == 0
+            # Incremental external restores can advance beyond a sliding/local
+            # attention window. The request block table then contains (or will
+            # be padded with) null placeholders for skipped logical positions.
+            # Mirror allocate_external_computed_blocks here so admission counts
+            # only physical destination blocks, not those placeholders.
+            external_target_blocks = cdiv(total_computed_tokens, self.block_size)
+            num_skipped_blocks = min(
+                self.get_num_skipped_tokens(total_computed_tokens)
+                // self.block_size,
+                external_target_blocks,
+            )
+            simulated_num_req_blocks = max(num_req_blocks, num_skipped_blocks)
+            num_external_blocks = max(
+                external_target_blocks - simulated_num_req_blocks, 0
+            )
+            simulated_num_req_blocks += num_external_blocks
             # NOTE: With speculative decoding, request's blocks may be allocated
             # for draft tokens which are later rejected. In this case,
             # num_required_blocks may be smaller than num_req_blocks.
-            return max(num_required_blocks - num_req_blocks, 0)
+            return num_external_blocks + max(
+                num_required_blocks - simulated_num_req_blocks, 0
+            )
 
         num_skipped_tokens = self.get_num_skipped_tokens(total_computed_tokens)
         num_local_computed_blocks = len(new_computed_blocks) + num_req_blocks
@@ -309,19 +327,25 @@ class SingleTypeKVCacheManager(ABC):
         num_total_computed_tokens = (
             num_local_computed_tokens + num_external_computed_tokens
         )
-        num_skipped_tokens = self.get_num_skipped_tokens(num_total_computed_tokens)
-        if num_skipped_tokens > 0:
-            # Some external computed tokens may be skipped too.
-            num_external_computed_tokens = min(
-                num_total_computed_tokens - num_skipped_tokens,
-                num_external_computed_tokens,
-            )
         if num_external_computed_tokens <= 0:
             return
 
         req_blocks = self.req_to_blocks[request_id]
+        target_num_blocks = cdiv(num_total_computed_tokens, self.block_size)
+        num_skipped_blocks = min(
+            self.get_num_skipped_tokens(num_total_computed_tokens) // self.block_size,
+            target_num_blocks,
+        )
+        # Incremental connector restores may advance farther than a local
+        # attention window. The newly skipped logical range has never had GPU
+        # blocks allocated, so preserve its indices with null placeholders
+        # instead of allocating throwaway destination blocks for it.
+        if len(req_blocks) < num_skipped_blocks:
+            req_blocks.extend(
+                [self._null_block] * (num_skipped_blocks - len(req_blocks))
+            )
         allocated_blocks = self.block_pool.get_new_blocks(
-            cdiv(num_total_computed_tokens, self.block_size) - len(req_blocks)
+            target_num_blocks - len(req_blocks)
         )
         req_blocks.extend(allocated_blocks)
         if self._record_new_block_ids:

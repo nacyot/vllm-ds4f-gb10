@@ -2,11 +2,13 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 import random
+from types import SimpleNamespace
 
 import pytest
 import torch
 
 from vllm.v1.core.block_pool import BlockPool
+from vllm.v1.core.kv_cache_coordinator import KVCacheCoordinator
 from vllm.v1.core.kv_cache_utils import (
     BlockHash,
     KVCacheBlock,
@@ -452,6 +454,105 @@ def test_evictable_cached_blocks_not_double_allocated():
     )
     assert len(new_blocks) == 1
     assert len(manager.req_to_blocks[request_id]) == 2
+
+
+def test_incremental_external_allocation_pads_new_sliding_window_gap():
+    """A later restore window must not allocate skipped logical blocks."""
+    block_size = 2
+    spec = SlidingWindowSpec(
+        block_size=block_size,
+        num_kv_heads=1,
+        head_size=1,
+        dtype=torch.float32,
+        sliding_window=8,
+    )
+    block_pool = BlockPool(
+        num_gpu_blocks=100, enable_caching=True, hash_block_size=block_size
+    )
+    manager = get_sliding_window_manager(spec, block_pool)
+    request_id = "incremental-restore"
+
+    manager.add_local_computed_blocks(
+        request_id,
+        [],
+        num_local_computed_tokens=0,
+        num_external_computed_tokens=12,
+    )
+    manager.allocate_external_computed_blocks(
+        request_id,
+        num_local_computed_tokens=0,
+        num_external_computed_tokens=12,
+    )
+    assert [block.is_null for block in manager.req_to_blocks[request_id]] == [
+        True,
+        True,
+        False,
+        False,
+        False,
+        False,
+    ]
+
+    # Simulate completion of the first restore window, then jump far enough
+    # that the next restore window has a newly skipped gap which has never had
+    # request blocks allocated for it.
+    manager.remove_skipped_blocks(request_id, processed_computed_tokens=24)
+    coordinator = SimpleNamespace(single_type_managers=(manager,))
+    KVCacheCoordinator.allocate_new_computed_blocks(
+        coordinator,
+        request_id=request_id,
+        new_computed_blocks=([],),
+        num_local_computed_tokens=12,
+        num_external_computed_tokens=12,
+    )
+
+    blocks = manager.req_to_blocks[request_id]
+    assert len(blocks) == 12
+    assert [block.is_null for block in blocks] == [True] * 8 + [False] * 4
+
+
+def test_incremental_external_allocation_predicts_only_physical_blocks():
+    """Admission must not charge newly skipped logical blocks as GPU blocks."""
+    block_size = 2
+    spec = SlidingWindowSpec(
+        block_size=block_size,
+        num_kv_heads=1,
+        head_size=1,
+        dtype=torch.float32,
+        sliding_window=8,
+    )
+    block_pool = BlockPool(
+        num_gpu_blocks=100, enable_caching=True, hash_block_size=block_size
+    )
+    manager = get_sliding_window_manager(spec, block_pool)
+    request_id = "incremental-restore-predictor"
+
+    manager.add_local_computed_blocks(
+        request_id,
+        [],
+        num_local_computed_tokens=0,
+        num_external_computed_tokens=12,
+    )
+    manager.allocate_external_computed_blocks(
+        request_id,
+        num_local_computed_tokens=0,
+        num_external_computed_tokens=12,
+    )
+
+    # At 24 computed tokens, eight of the twelve logical blocks are outside
+    # the sliding window. The second restore therefore needs four physical
+    # destination blocks, even though six logical positions are not yet in the
+    # request block table.
+    manager.remove_skipped_blocks(request_id, processed_computed_tokens=24)
+    predicted = manager.get_num_blocks_to_allocate(
+        request_id=request_id,
+        num_tokens=24,
+        new_computed_blocks=[],
+        total_computed_tokens=24,
+        num_local_computed_tokens=12,
+        num_tokens_main_model=24,
+    )
+
+    assert predicted == 4
 
 
 def test_chunked_local_attention_get_num_blocks_to_allocate():
