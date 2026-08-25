@@ -24,6 +24,13 @@ source "$CONFIG_FILE"
 set +a
 
 KV_LOAD_FAILURE_POLICY=${KV_LOAD_FAILURE_POLICY:-recompute}
+TRIAL_NODE_HEADROOM_GATE=${TRIAL_NODE_HEADROOM_GATE:-false}
+TRIAL_NODE_HEADROOM_RESERVE_BYTES=${TRIAL_NODE_HEADROOM_RESERVE_BYTES:-17179869184}
+TRIAL_NODE_HEADROOM_J_BYTES=${TRIAL_NODE_HEADROOM_J_BYTES:-0}
+TRIAL_NODE_HEADROOM_HEARTBEAT_MAX_AGE_MS=${TRIAL_NODE_HEADROOM_HEARTBEAT_MAX_AGE_MS:-30000}
+TRIAL_BOUNDED_RESTORE_MAX_ROWS=${TRIAL_BOUNDED_RESTORE_MAX_ROWS:-0}
+TRIAL_ENFORCE_EAGER=${TRIAL_ENFORCE_EAGER:-false}
+TRIAL_MAX_CUDAGRAPH_CAPTURE_SIZE=${TRIAL_MAX_CUDAGRAPH_CAPTURE_SIZE:-0}
 
 # per-node KV directory (head and worker use distinct subdirs; with the relay on,
 # only the head actually stores and reads there)
@@ -54,7 +61,7 @@ ARGS=(
   --gpu-memory-utilization "$TRIAL_GPUUTIL"
   --kv-cache-memory "$TRIAL_KVMEM"
   --kv-offloading-size "$TRIAL_KVOFF"
-  --kv-transfer-config "{\"kv_connector\":\"OffloadingConnector\",\"kv_role\":\"kv_both\",\"kv_load_failure_policy\":\"$KV_LOAD_FAILURE_POLICY\",\"kv_connector_extra_config\":{\"spec_name\":\"TieringOffloadingSpec\",\"canonical_layout\":$TRIAL_KVCANON,\"dspark_compact_packed\":$TRIAL_KVCOMPACT,\"blocks_per_chunk\":$TRIAL_KVBPC,\"secondary_tiers\":[{\"type\":\"fs\",\"root_dir\":\"$TRIAL_KVFS_DIR\",\"n_read_threads\":$TRIAL_KVRT,\"n_write_threads\":8}]}}"
+  --kv-transfer-config "{\"kv_connector\":\"OffloadingConnector\",\"kv_role\":\"kv_both\",\"kv_load_failure_policy\":\"$KV_LOAD_FAILURE_POLICY\",\"kv_connector_extra_config\":{\"spec_name\":\"TieringOffloadingSpec\",\"canonical_layout\":$TRIAL_KVCANON,\"dspark_compact_packed\":$TRIAL_KVCOMPACT,\"blocks_per_chunk\":$TRIAL_KVBPC,\"bounded_restore_max_rows\":$TRIAL_BOUNDED_RESTORE_MAX_ROWS,\"node_headroom_gate\":$TRIAL_NODE_HEADROOM_GATE,\"node_headroom_reserve_bytes\":$TRIAL_NODE_HEADROOM_RESERVE_BYTES,\"node_headroom_j_bytes\":$TRIAL_NODE_HEADROOM_J_BYTES,\"node_headroom_heartbeat_max_age_ms\":$TRIAL_NODE_HEADROOM_HEARTBEAT_MAX_AGE_MS,\"secondary_tiers\":[{\"type\":\"fs\",\"root_dir\":\"$TRIAL_KVFS_DIR\",\"n_read_threads\":$TRIAL_KVRT,\"n_write_threads\":8}]}}"
   --enable-prefix-caching
   --enable-prompt-tokens-details
   --enable-chunked-prefill
@@ -71,4 +78,12 @@ if [[ "${TRIAL_SPEC:-dspark}" != "none" ]]; then
   ARGS+=(
     --speculative-config "{\"method\":\"$TRIAL_SPEC\",\"num_speculative_tokens\":$TRIAL_SPEC_N}"
   )
+fi
+
+if [[ "$TRIAL_ENFORCE_EAGER" == "true" ]]; then
+  ARGS+=(--enforce-eager)
+fi
+
+if (( TRIAL_MAX_CUDAGRAPH_CAPTURE_SIZE > 0 )); then
+  ARGS+=(--max-cudagraph-capture-size "$TRIAL_MAX_CUDAGRAPH_CAPTURE_SIZE")
 fi
