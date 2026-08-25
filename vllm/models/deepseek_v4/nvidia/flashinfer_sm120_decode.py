@@ -28,6 +28,8 @@ Default on; gate-off behavior is identical to the FlashMLA decode path.
 
 from typing import TYPE_CHECKING
 
+import os
+
 import torch
 
 from vllm.config import get_current_vllm_config
@@ -388,18 +390,29 @@ class DeepseekV4FlashInferSM120DecodeAttention(DeepseekV4FlashMLAAttention):
                 # indexer.py) to per-request-local so block_table[req] maps them
                 # in-range. Without this, req>0 positions overflow into the wrong
                 # request's physical blocks. No-op at num_prefills==1 (cu_base[0]==0).
-                comp_lens = (
-                    swa_metadata.seq_lens[num_decodes:num_reqs] // self.compress_ratio
-                )
-                cu_base = (torch.cumsum(comp_lens, dim=0) - comp_lens).to(torch.int32)
-                req_local = (
-                    swa_metadata.token_to_req_indices[num_decode_tokens:num_tokens]
-                    - num_decodes
-                ).long()
-                base_per_token = cu_base[req_local].unsqueeze(1)
-                prefill_local = torch.where(
-                    prefill_local >= 0, prefill_local - base_per_token, prefill_local
-                )
+                # [sm120-rebase] The rebase above is WRONG for this stack: the
+                # indexer's top_k_per_row_prefill already writes request-local
+                # positions (csrc/libtorch_stable/sampler.cu). Subtracting again
+                # drove every non-first prefill request's positions negative
+                # (-> -1 slots -> compressed context lost). Opt-in for A/B only.
+                if os.environ.get("VLLM_DSV4_C4A_TOPK_REBASE", "0") == "1":
+                    comp_lens = (
+                        swa_metadata.seq_lens[num_decodes:num_reqs]
+                        // self.compress_ratio
+                    )
+                    cu_base = (torch.cumsum(comp_lens, dim=0) - comp_lens).to(
+                        torch.int32
+                    )
+                    req_local = (
+                        swa_metadata.token_to_req_indices[num_decode_tokens:num_tokens]
+                        - num_decodes
+                    ).long()
+                    base_per_token = cu_base[req_local].unsqueeze(1)
+                    prefill_local = torch.where(
+                        prefill_local >= 0,
+                        prefill_local - base_per_token,
+                        prefill_local,
+                    )
                 global_indices, topk_lens = compute_global_topk_indices_and_lens(
                     prefill_local,
                     swa_metadata.token_to_req_indices[num_decode_tokens:num_tokens],
