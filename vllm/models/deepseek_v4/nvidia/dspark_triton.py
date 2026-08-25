@@ -110,10 +110,6 @@ def dspark_qkv_postprocess(
     if num_tokens == 0:
         return torch.empty_like(q), torch.empty_like(kv)
     rope_dim = cos_sin_cache.shape[-1]
-    if row_map is None:
-        _row_map = torch.arange(batch_size, device=kv.device, dtype=torch.int64)
-    else:
-        _row_map = row_map
     block_d = triton.next_power_of_2(head_dim)
     q_out = torch.empty_like(q)
     kv_out = torch.empty_like(kv)
@@ -251,6 +247,10 @@ def dspark_context_kv_store(
     if num_tokens == 0:
         return
     rope_dim = cos_sin_cache.shape[-1]
+    if row_map is None:
+        _row_map = torch.arange(batch_size, device=kv.device, dtype=torch.int64)
+    else:
+        _row_map = row_map
     block_d = triton.next_power_of_2(head_dim)
     rejected = (
         num_rejected_tokens if num_rejected_tokens is not None else query_start_loc
