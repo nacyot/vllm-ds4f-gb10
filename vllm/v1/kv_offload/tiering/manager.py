@@ -1,3 +1,4 @@
+import os
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """
@@ -157,6 +158,23 @@ class _SecondaryTierFacingParent(ParentManager):
     def on_request_finished(self, req_context: ReqContext) -> None:
         return self._m.on_request_finished(req_context, exclude_tier=self._origin)
 
+
+
+_DSPARK_TRACE_ON = os.environ.get("DSPARK_LOOKUP_TRACE") == "1"
+_dspark_trace_counts: dict = {}
+def _dspark_trace(kind, req_id, key):
+    if not _DSPARK_TRACE_ON:
+        return
+    try:
+        from vllm.v1.kv_offload.base import get_offload_group_idx as _ggi
+        g = _ggi(key)
+    except Exception:
+        g = -1
+    k = (req_id, kind, g)
+    n = _dspark_trace_counts.get(k, 0)
+    if n < 60:
+        _dspark_trace_counts[k] = n + 1
+        logger.info("DSPARK_TRACE %s req=%s g=%d n=%d", kind, req_id, g, n)
 
 class TieringOffloadingManager(OffloadingManager):
     """
@@ -353,6 +371,8 @@ class TieringOffloadingManager(OffloadingManager):
                 # Backport of #51840: return HIT_PENDING when a promotion
                 # was triggered -- the request keeps progressing while
                 # promotion, load and release drain as a pipeline.
+                if not promoted:
+                    _dspark_trace("primfull_miss", req_context.req_id, key)
                 return (
                     LookupResult.MISS
                     if not promoted
@@ -366,6 +386,7 @@ class TieringOffloadingManager(OffloadingManager):
             if req_state is not None and req_state.secondary_lookup_start_time is None:
                 req_state.secondary_lookup_start_time = lookup_start
             return LookupResult.RETRY
+        _dspark_trace("secmiss", req_context.req_id, key)
         return LookupResult.MISS
 
     def _accumulate_lookup_sync_delay(
