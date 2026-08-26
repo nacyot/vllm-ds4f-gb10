@@ -287,6 +287,10 @@ class TieringOffloadingManager(OffloadingManager):
                     )
 
     @override
+    def primary_capacity_blocks(self) -> int:
+        """Total block slots in the primary (CPU staging) tier."""
+        return self.primary_tier._num_blocks
+
     def lookup(
         self,
         key: OffloadKey,

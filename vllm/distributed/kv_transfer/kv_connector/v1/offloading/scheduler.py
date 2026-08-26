@@ -1,3 +1,4 @@
+import os
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 import time
@@ -689,6 +690,22 @@ class OffloadingConnectorScheduler:
                 sliding_window_size_in_chunks = (
                     group_config.sliding_window_size_in_chunks
                 )
+
+                # DSPARK reserve-for-SWA: cap full-attention restore at what fits
+                # the primary staging tier, leaving room for SWA tail promotions,
+                # so an oversized session restores its fitting prefix instead of
+                # collapsing to a full recompute (keys loaded stay a subset of
+                # what was promoted, so this is fail-safe).
+                _cap_fn = getattr(self.manager, "primary_capacity_blocks", None)
+                if sliding_window_size_in_chunks is None and _cap_fn is not None:
+                    _reserve = int(os.environ.get("DSPARK_SWA_RESERVE", "15"))
+                    _cap_blocks = _cap_fn() - _reserve
+                    if _cap_blocks >= 1:
+                        _sc = num_computed_tokens // tokens_per_chunk
+                        max_hit_size_tokens = min(
+                            max_hit_size_tokens,
+                            (_sc + _cap_blocks) * tokens_per_chunk,
+                        )
 
                 # For eagle groups, query one extra chunk that will be popped.
                 # We only need to increase the query size for sliding window groups.
