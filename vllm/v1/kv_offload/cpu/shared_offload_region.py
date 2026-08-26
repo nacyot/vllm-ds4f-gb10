@@ -91,7 +91,9 @@ class SharedOffloadRegion:
         self._row_stride = kv_bytes_per_block
         self.total_size_bytes = self.num_blocks * self._row_stride
 
-        self.mmap_path = f"/dev/shm/vllm_offload_{engine_id}.mmap"
+        _mmap_dir = os.environ.get("DSPARK_OFFLOAD_MMAP_DIR", "/dev/shm").rstrip("/")
+        self._on_shm = _mmap_dir == "/dev/shm"
+        self.mmap_path = f"{_mmap_dir}/vllm_offload_{engine_id}.mmap"
         self._creator = False  # set True only if this worker creates the file
         self.rank = rank
         if rank is not None:
@@ -125,7 +127,7 @@ class SharedOffloadRegion:
             # land on a 0-byte stub and spin in _wait_for_file_size
             # for the full 30 s timeout.
             try:
-                check_shm_free_space(self.total_size_bytes)
+                check_shm_free_space(self.total_size_bytes) if self._on_shm else None
                 os.ftruncate(self.fd, self.total_size_bytes)
             except (RuntimeError, OSError):
                 os.unlink(self.mmap_path)
@@ -145,7 +147,11 @@ class SharedOffloadRegion:
             prot=mmap.PROT_READ | mmap.PROT_WRITE,
         )
 
-        populate_write_fn = _get_populate_write_fn(self.mmap_obj)
+        populate_write_fn = (
+            _get_populate_write_fn(self.mmap_obj)
+            if self._on_shm
+            else (lambda _m, _o, _l: None)
+        )
 
         if rank is not None:
             # Populate only this worker's pages (one slot per block row).
