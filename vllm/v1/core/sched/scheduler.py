@@ -65,6 +65,11 @@ from vllm.v1.structured_output import StructuredOutputGrammar, StructuredOutputM
 from vllm.v1.utils import record_function_or_nullcontext
 
 logger = init_logger(__name__)
+
+# [admit-reserved-0271] Apply other in-flight prefills' block reservations to
+# ALL waiting-queue admissions (not only async KV loads). Escape hatch:
+# DSPARK_ADMIT_RESERVED=0. Read once at import.
+DSPARK_ADMIT_RESERVED = os.environ.get("DSPARK_ADMIT_RESERVED", "1") != "0"
 # [issue43-step-diag-0271] per-step scheduler diagnostics gate (issue
 # #43 diag port, log-only). Set DSPARK_ISSUE43_SCHED_DIAG=1 to emit one
 # compact scheduled-tokens summary INFO line per scheduler step.
@@ -1053,6 +1058,21 @@ class Scheduler(SchedulerInterface):
                     # only if it fits in (free - other in-flight reservations), to
                     # avoid deadlock and predictable preemptions.
                     reserved_blocks = self._inflight_prefill_reserved_blocks()
+                elif DSPARK_ADMIT_RESERVED:
+                    # [admit-reserved-0271] Fresh/resumed admissions must also
+                    # leave room for other in-flight prefills' reservations.
+                    # Otherwise N long prompts submitted together each see a
+                    # nearly-free pool (earlier admissions only allocated their
+                    # first chunk), all pass the full-ISL gate, and collide
+                    # mid-prefill into preemption thrash. A request promoted
+                    # back from WAITING_FOR_REMOTE_KVS is still tracked in
+                    # _inflight_prefills at this point, so exclude the
+                    # candidate's own reservation to avoid double-counting it
+                    # against its own admission.
+                    reserved_blocks = self._inflight_prefill_reserved_blocks()
+                    if request in self._inflight_prefills:
+                        reserved_blocks -= self._request_remaining_blocks(request)
+                    reserved_blocks = max(0, reserved_blocks)
 
                 new_blocks = self.kv_cache_manager.allocate_slots(
                     request,

@@ -2,6 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 import itertools
+import os
 from collections.abc import Sequence
 from dataclasses import dataclass
 from typing import Literal, overload
@@ -27,6 +28,11 @@ from vllm.v1.metrics.stats import PrefixCacheStats
 from vllm.v1.request import Request, RequestStatus
 
 logger = init_logger(__name__)
+
+# [admit-reserved-0271] Make the full-sequence-must-fit admission gate respect
+# `reserved_blocks` (blocks other in-flight prefills still need). Escape
+# hatch: DSPARK_ADMIT_RESERVED=0. Read once at import.
+DSPARK_ADMIT_RESERVED = os.environ.get("DSPARK_ADMIT_RESERVED", "1") != "0"
 
 
 @dataclass
@@ -484,7 +490,16 @@ class KVCacheManager:
                 apply_admission_cap=True,
             )
             required_blocks = num_blocks_to_allocate + watermark_blocks
-            if required_blocks > self.block_pool.get_num_free_blocks():
+            free_blocks = self.block_pool.get_num_free_blocks()
+            if DSPARK_ADMIT_RESERVED:
+                # [admit-reserved-0271] The full-sequence gate must also leave
+                # `reserved_blocks` free for other in-flight prefills to
+                # finish; comparing against the raw free-pool over-admits
+                # concurrent long prompts (each only allocates its first
+                # chunk here, so the pool still looks nearly free to the
+                # next candidate).
+                free_blocks -= max(reserved_blocks, 0)
+            if required_blocks > free_blocks:
                 return None
 
         num_tokens_main_model = total_computed_tokens + num_new_tokens
