@@ -492,6 +492,24 @@ class OffloadingConnectorScheduler:
             set() if vllm_config.cache_config.enable_prefix_caching else None
         )
 
+        # DSPARK restore admission gate: at most this many requests may
+        # have fs->staging promotions in flight at once. Concurrent
+        # oversized cold restores need more staging blocks than exist and
+        # evict each other's completed promotions forever (the whole capped
+        # range must be simultaneously staging-resident before
+        # _maximal_prefix_lookup can conclude), degrading every restore to
+        # a full recompute. Requests whose lookup resolves purely from
+        # staging are never gated.
+        try:
+            self._restore_concurrency: int = max(
+                1,
+                int(os.environ.get("DSPARK_RESTORE_CONCURRENCY", "1") or 1),
+            )
+        except ValueError:
+            self._restore_concurrency = 1
+        # req_ids currently allowed to initiate fs->staging promotions.
+        self._promotion_owners: set[ReqId] = set()
+
         # Job ID counter shared by loads and stores.
         self._job_counter: int = 0
         # Threshold value for stale jobs. All job ids >= _stale_job_threshold are
@@ -891,7 +909,30 @@ class OffloadingConnectorScheduler:
             num_hit_tokens = 0
         else:
             lookup_start = time.monotonic()
+            # DSPARK restore admission gate: this request may initiate
+            # fs->staging promotions only if it already owns a slot or one
+            # is free. A gated request that would need a promotion is
+            # deferred by the manager exactly like the existing
+            # HIT_PENDING/RETRY path (lookup returns None; the scheduler
+            # retries the request next step). Lookups resolving purely
+            # from staging never consult the flag's deny path.
+            _owners = self._promotion_owners
+            if _owners:
+                # Lazily drop owners whose request state is gone.
+                _owners.intersection_update(self._req_status)
+            _req_context = req_status.req_context
+            _req_context.dspark_allow_promotion = (
+                request.request_id in _owners
+                or len(_owners) < self._restore_concurrency
+            )
+            _req_context.dspark_promotion_initiated = False
             num_hit_tokens = self._lookup(req_status)
+            if getattr(_req_context, "dspark_promotion_initiated", False):
+                _owners.add(request.request_id)
+            if num_hit_tokens is not None:
+                # Definitive result (hits get pinned via prepare_load this
+                # step, or a definitive miss): release the slot.
+                _owners.discard(request.request_id)
             self._connector_stats.observe_histogram(
                 _ConnectorMetricName.LOOKUP_SYNC_DELAY,
                 time.monotonic() - lookup_start,
@@ -1435,6 +1476,10 @@ class OffloadingConnectorScheduler:
         """
         req_status = self._req_status.get(request.request_id)
 
+        # DSPARK restore admission gate: a finished/aborted request can no
+        # longer drive promotions; release its slot.
+        self._promotion_owners.discard(request.request_id)
+
         if req_status is None:
             # Untracked request (offloading never started): no in-flight jobs,
             # nothing was deferred, so finalize immediately.
@@ -1503,6 +1548,7 @@ class OffloadingConnectorScheduler:
         self._stale_job_threshold = self._job_counter
         self._jobs.clear()
         self._block_id_to_pending_jobs.clear()
+        self._promotion_owners.clear()
 
         # The manager pool is empty; pending event payloads and announced
         # reference counts are stale.
