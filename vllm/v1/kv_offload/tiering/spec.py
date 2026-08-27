@@ -353,6 +353,23 @@ class TieringOffloadingSpec(CPUOffloadingSpec):
                                 "DSPARK_RELAY_WINDOW_BYTES", "268435456"))
                         except (ValueError, TypeError):
                             _win_bytes = 268435456
+                        # DSPARK_RELAY_DIRECT (default 1): source the
+                        # broadcast window straight from the staging mmap
+                        # (_flat) instead of re-reading the chunk files.
+                        # Contract (TieringOffloadingManager.prepare_load +
+                        # _process_finished_jobs): fs_paths are attached only
+                        # for keys in _fs_promoted_keys, i.e. keys whose
+                        # fs->primary promotion already completed into the
+                        # scheduler-side staging mmap, and prepare_load only
+                        # accepts primary-tier HITs and ref-pins them for the
+                        # duration of the load. The scheduler mmap and this
+                        # rank-0 worker mmap are the same file
+                        # (vllm_offload_{engine_id}.mmap has no rank suffix),
+                        # so the bytes are already in _flat and the per-chunk
+                        # pread was a second NVMe read of the same bytes.
+                        # Set DSPARK_RELAY_DIRECT=0 for the legacy preads.
+                        _relay_direct = _relay_os.environ.get(
+                            "DSPARK_RELAY_DIRECT", "1") != "0"
                         _wi = 0
                         while _wi < len(_items):
                             _wb = 0
@@ -363,15 +380,32 @@ class TieringOffloadingSpec(CPUOffloadingSpec):
                                 _wb += _items[_wj][2]
                                 _wj += 1
                             _window = _items[_wi:_wj]
-                            if _is_src:
+                            if _is_src and not _relay_direct:
+                                # Legacy escape hatch only: refresh staging
+                                # from the chunk files before broadcasting.
+                                # On any read failure keep the
+                                # staging-resident bytes (per the
+                                # prepare_load contract they are the correct
+                                # bytes); never partially overwrite or zero
+                                # them here.
                                 for _off, _path, _ln in _window:
                                     try:
                                         with open(_path, "rb") as _f:
                                             _data = _f.read()
                                     except OSError as _e2:
-                                        logger.warning(
-                                            "relay src read failed for %s: %s",
+                                        logger.error(
+                                            "[relay-read-fail] relay src "
+                                            "read failed for %s: %s "
+                                            "(broadcasting staging bytes)",
                                             _path, _e2,
+                                        )
+                                        continue
+                                    if len(_data) != _ln:
+                                        logger.error(
+                                            "[relay-read-fail] relay src "
+                                            "short read for %s: %d != %d "
+                                            "(broadcasting staging bytes)",
+                                            _path, len(_data), _ln,
                                         )
                                         continue
                                     _g = _t.frombuffer(
@@ -433,13 +467,14 @@ class TieringOffloadingSpec(CPUOffloadingSpec):
                             thread_name_prefix="fs_pread",
                         )
                     items = [
-                        (int(_bid) * _row + int(_ent[1]), _ent[0])
+                        (int(_bid) * _row + int(_ent[1]), _ent[0],
+                         int(_ent[2]))
                         for _bid, _ent in zip(src_spec.block_ids, entries)
                         if _ent
                     ]
 
                     def _read_one(item):
-                        _off, _path = item
+                        _off, _path, _ln = item
                         try:
                             with open(_path, "rb") as _f:
                                 return _f.read()
@@ -457,8 +492,31 @@ class TieringOffloadingSpec(CPUOffloadingSpec):
                         _chunk = items[_i : _i + window]
                         _datas = list(pool.map(_read_one, _chunk))
                         _staged = []
-                        for (_off, _path), _data in zip(_chunk, _datas):
-                            if _data is None:
+                        for (_off, _path, _ln), _data in zip(_chunk, _datas):
+                            if _data is None or len(_data) != _ln:
+                                # This pread is the only source for this row
+                                # slice on this node, and the offloading
+                                # connector has no per-job failure channel
+                                # (submit_load's result is asserted, and
+                                # OffloadingConnector never reports
+                                # get_block_ids_with_load_errors), so poison
+                                # the range deterministically instead of
+                                # silently serving stale bytes as restored
+                                # KV.
+                                _why = (
+                                    "failed" if _data is None
+                                    else "short (%d bytes)" % len(_data)
+                                )
+                                logger.error(
+                                    "[relay-read-fail] fs pread %s for %s "
+                                    "(want %d bytes); zero-filling range",
+                                    _why, _path, _ln,
+                                )
+                                _z = _t.zeros(
+                                    _ln, dtype=_t.uint8, device="cuda"
+                                )
+                                _flat[_off : _off + _ln].copy_(_z)
+                                _staged.append(_z)
                                 continue
                             # Route the write through the GPU: letting the
                             # CPU dirty pinned pages that the device then
@@ -483,33 +541,53 @@ class TieringOffloadingSpec(CPUOffloadingSpec):
 
                 if entries:
                     _n_read = 0
+                    import torch as _t
+                    _flat = _t.frombuffer(
+                        memoryview(worker_mmap.mmap_obj), dtype=_t.uint8
+                    )
                     for _bid, _ent in zip(src_spec.block_ids, entries):
                         if not _ent:
                             continue
                         _path, _soff, _ln = _ent
+                        _off = int(_bid) * _row + int(_soff)
+                        _data = None
                         try:
                             with open(_path, "rb") as _f:
                                 _data = _f.read()
-                            _off = int(_bid) * _row + int(_soff)
-                            # Route the write through the GPU: letting the
-                            # CPU dirty pinned pages that the device then
-                            # reads has produced Xid 13 channel errors on
-                            # GB10, so upload the file bytes and let device
-                            # DMA write them into the pinned mmap.
-                            import torch as _t
-                            _src_gpu = _t.frombuffer(
-                                bytearray(_data), dtype=_t.uint8
-                            ).cuda()
-                            _flat = _t.frombuffer(
-                                memoryview(worker_mmap.mmap_obj), dtype=_t.uint8
-                            )
-                            _flat[_off : _off + len(_data)].copy_(_src_gpu)
-                            _t.cuda.synchronize()
-                            _n_read += 1
                         except OSError as _e:
-                            logger.warning(
-                                "fs direct read failed for %s: %s", _path, _e
+                            logger.error(
+                                "[relay-read-fail] fs pread failed for "
+                                "%s: %s; zero-filling range", _path, _e,
                             )
+                        if _data is not None and len(_data) != _ln:
+                            logger.error(
+                                "[relay-read-fail] fs pread short read for "
+                                "%s: %d != %d; zero-filling range",
+                                _path, len(_data), _ln,
+                            )
+                            _data = None
+                        if _data is None:
+                            # No per-job failure channel exists here
+                            # (submit_load's result is asserted, and
+                            # OffloadingConnector never reports
+                            # get_block_ids_with_load_errors), so poison the
+                            # range deterministically instead of silently
+                            # serving stale bytes as restored KV.
+                            _z = _t.zeros(_ln, dtype=_t.uint8, device="cuda")
+                            _flat[_off : _off + _ln].copy_(_z)
+                            _t.cuda.synchronize()
+                            continue
+                        # Route the write through the GPU: letting the
+                        # CPU dirty pinned pages that the device then
+                        # reads has produced Xid 13 channel errors on
+                        # GB10, so upload the file bytes and let device
+                        # DMA write them into the pinned mmap.
+                        _src_gpu = _t.frombuffer(
+                            bytearray(_data), dtype=_t.uint8
+                        ).cuda()
+                        _flat[_off : _off + len(_data)].copy_(_src_gpu)
+                        _t.cuda.synchronize()
+                        _n_read += 1
                     logger.debug("fs-direct preads: %d", _n_read)
                 return _orig_submit_load(job_id, src_spec, dst_spec)
 
