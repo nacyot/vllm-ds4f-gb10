@@ -747,7 +747,27 @@ class OffloadingConnectorScheduler:
                     defer_lookup = True
                 else:
                     if is_eagle_unverified:
-                        num_hit_chunks -= 1
+                        # Pop the volatile trailing draft chunk only when it
+                        # was actually part of the confirmed hit run. The
+                        # extra chunk (one past max_hit_size_tokens) was
+                        # queried only when query_max was raised above
+                        # max_hit_size_tokens; the run reaches it iff
+                        # num_hit_chunks == len(offload_keys). If the extra
+                        # chunk was queried but MISSED, the run already ends
+                        # exactly at the boundary, and popping again would
+                        # tighten the boundary one window chunk below a
+                        # g0-aligned interior cap, cascading the other
+                        # groups downward on every reconciliation pass
+                        # (walkdown to full recompute). At the natural
+                        # end-of-request the extra chunk is never queried
+                        # (query_max is clamped to the key range), so the
+                        # unconditional pop semantics are preserved there.
+                        _extra_chunk_queried = query_max > max_hit_size_tokens
+                        if (
+                            not _extra_chunk_queried
+                            or num_hit_chunks >= len(offload_keys)
+                        ):
+                            num_hit_chunks -= 1
                         eagle_verified.add(group_idx)
 
                     max_hit_size_tokens = min(
