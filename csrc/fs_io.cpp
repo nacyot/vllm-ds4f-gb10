@@ -78,30 +78,30 @@ inline int _store_block(const char* tmp_path, const char* dest_path,
 }
 
 // Core single-block load: dst/size are raw pointer + byte count. Returns 0
-// on success, or the errno of the failing step on failure. On failure,
-// the source file is removed since a partially-read block should not be reused.
+// on success, or the errno of the failing step on failure. Only a short
+// read (evidence of a torn/truncated file) removes the source file:
+// open() failures (ENOENT, EMFILE, O_DIRECT EINVAL) and read errors are
+// transient conditions that must not destroy good cache files.
 inline int _load_block(const char* source_path, char* dst, size_t size,
                        bool use_o_direct) {
   const int o_direct_flag = use_o_direct ? kODirectFlag : 0;
   const int fd = open(source_path, O_RDONLY | o_direct_flag, 0);
   if (fd < 0) {
-    const int err = errno;
-    unlink(source_path);
-    return err;
+    return errno;
   }
 
   const ssize_t bytes_read = read(fd, dst, size);
   if (bytes_read < 0 || static_cast<size_t>(bytes_read) != size) {
     const int err = bytes_read < 0 ? errno : EIO;
     close(fd);
-    unlink(source_path);
+    if (bytes_read >= 0) {
+      unlink(source_path);  // short read: torn file, discard
+    }
     return err;
   }
 
   if (close(fd) != 0) {
-    const int err = errno;
-    unlink(source_path);
-    return err;
+    return errno;
   }
 
   return 0;

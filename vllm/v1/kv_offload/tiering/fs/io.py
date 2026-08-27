@@ -97,8 +97,14 @@ def _store_block(
     """
     Store callback: Writes to a temp file then atomically replaces the destination.
     """
-    # Check if block already exists to avoid redundant writes
+    # Check if block already exists to avoid redundant writes. Refresh its
+    # mtime so the external mtime-ordered pruner treats re-stored (hot)
+    # chunks as fresh instead of evicting them by first-write age.
     if os.path.exists(dest_path):
+        try:
+            os.utime(dest_path, None)
+        except OSError:
+            pass
         return
 
     tmp_path = dest_path + _get_tmp_suffix()
@@ -151,13 +157,19 @@ def _load_block(
         bytes_read = os.readv(fd, [view_slice])
         if bytes_read < block_size:
             raise OSError(f"Short read: expected {block_size} bytes, read {bytes_read}")
-    except Exception:
-        try:
-            os.remove(source_path)
-        except OSError as cleanup_exc:
-            logger.warning(
-                "Failed to remove unreadable file %s: %s", source_path, cleanup_exc
-            )
+    except Exception as exc:
+        # Delete only on evidence of a torn/short file. open() failures and
+        # transient errors (EMFILE, O_DIRECT EINVAL, EIO) must not destroy
+        # good cache files.
+        if isinstance(exc, OSError) and "Short read" in str(exc):
+            try:
+                os.remove(source_path)
+            except OSError as cleanup_exc:
+                logger.warning(
+                    "Failed to remove unreadable file %s: %s",
+                    source_path,
+                    cleanup_exc,
+                )
         raise
     finally:
         if fd is not None:
@@ -183,13 +195,21 @@ def batch_store_block(
         if isinstance(block_size, (list, tuple))
         else [block_size] * len(offsets)
     )
-    _validate_offsets(view, offsets, max(sizes_list) if sizes_list else 0)
+    for _voff, _vsz in zip(offsets, sizes_list):
+        _validate_offsets(view, [_voff], _vsz)
 
     if _HAS_FSIO_C:
         # ensure dirs before C fast path: batch_store_block_C opens dest
         # files directly and cannot create the per-key hash-prefix dirs.
         for _p in paths:
             _ensure_dirs(_p)
+        for _p in paths:
+            # The C fast path skips existing files without refreshing mtime;
+            # refresh here so the mtime-ordered pruner keeps hot chunks.
+            try:
+                os.utime(_p, None)
+            except OSError:
+                pass
         view_B = view.cast("B")
         view_slices = [
             view_B[x : x + s] for x, s in zip(offsets, sizes_list)
@@ -232,7 +252,8 @@ def batch_load_block(
         if isinstance(block_size, (list, tuple))
         else [block_size] * len(offsets)
     )
-    _validate_offsets(view, offsets, max(sizes_list) if sizes_list else 0)
+    for _voff, _vsz in zip(offsets, sizes_list):
+        _validate_offsets(view, [_voff], _vsz)
 
     if _HAS_FSIO_C:
         view_B = view.cast("B")
