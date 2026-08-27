@@ -39,6 +39,21 @@ class TieringOffloadingMetrics:
 
     LOOKUP_SYNC_DELAY = "vllm:kv_offload_tiering_lookup_sync_delay_seconds"
     LOOKUP_ASYNC_DELAY = "vllm:kv_offload_tiering_lookup_async_delay_seconds"
+    READ_BYTES = "vllm:kv_offload_tiering_read_bytes"
+    READ_TIME = "vllm:kv_offload_tiering_read_time"
+    WRITE_BYTES = "vllm:kv_offload_tiering_write_bytes"
+    WRITE_TIME = "vllm:kv_offload_tiering_write_time"
+    PROMOTION_JOB_FAILURES = "vllm:kv_offload_tiering_promotion_job_failures"
+    CASCADE_JOB_FAILURES = "vllm:kv_offload_tiering_cascade_job_failures"
+    BLOCK_QUERIES = "vllm:kv_offload_tiering_block_queries"
+    BLOCK_HITS = "vllm:kv_offload_tiering_block_hits"
+    PRIMARY_WRITE_USAGE_PERC = "vllm:kv_offload_tiering_primary_write_usage_perc"
+    PRIMARY_READ_USAGE_PERC = "vllm:kv_offload_tiering_primary_read_usage_perc"
+    PROMOTION_ALLOCATION_FAILURES = (
+        "vllm:kv_offload_tiering_promotion_allocation_failures"
+    )
+    ACTIVE_PROMOTION_JOBS = "vllm:kv_offload_tiering_active_promotion_jobs"
+    ACTIVE_CASCADE_JOBS = "vllm:kv_offload_tiering_active_cascade_jobs"
 
 
 @dataclass
