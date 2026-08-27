@@ -1,4 +1,5 @@
 import os
+import time as _time
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """
@@ -243,12 +244,16 @@ class TieringOffloadingManager(OffloadingManager):
         # chunk on disk but could not allocate staging (primary full, e.g.
         # another request's in-flight load still pins its blocks).
         self._primfull_retries: dict = {}
+        self._primfull_last_tick: dict = {}
         try:
+            # Interpreted as SECONDS of sustained primary-full per request
+            # (ticked at most once per second regardless of how many keys a
+            # lookup pass touches).
             self._primfull_retry_cap = int(
-                os.environ.get("DSPARK_PRIMFULL_RETRIES", "200") or 200
+                os.environ.get("DSPARK_PRIMFULL_RETRIES", "300") or 300
             )
         except ValueError:
-            self._primfull_retry_cap = 200
+            self._primfull_retry_cap = 300
 
         self._fs_promoted_keys: "dict" = _OD()
         try:
@@ -448,9 +453,14 @@ class TieringOffloadingManager(OffloadingManager):
                     # recompute). Bounded per request: after
                     # DSPARK_PRIMFULL_RETRIES consecutive full passes fall
                     # back to the old MISS behavior.
-                    _pf = self._primfull_retries.get(req_context.req_id, 0) + 1
-                    self._primfull_retries[req_context.req_id] = _pf
-                    if _pf <= self._primfull_retry_cap:
+                    _now = _time.monotonic()
+                    _rid = req_context.req_id
+                    if _now - self._primfull_last_tick.get(_rid, 0.0) >= 1.0:
+                        self._primfull_last_tick[_rid] = _now
+                        self._primfull_retries[_rid] = (
+                            self._primfull_retries.get(_rid, 0) + 1
+                        )
+                    if self._primfull_retries.get(_rid, 0) <= self._primfull_retry_cap:
                         return LookupResult.RETRY
                     return LookupResult.MISS
                 self._primfull_retries.pop(req_context.req_id, None)
@@ -828,6 +838,7 @@ class TieringOffloadingManager(OffloadingManager):
     ) -> None:
         self.primary_tier.on_request_finished(req_context)
         self._primfull_retries.pop(req_context.req_id, None)
+        self._primfull_last_tick.pop(req_context.req_id, None)
         state = self._req_state[req_context.req_id]
         state.is_finished = True
         self._maybe_finalize_request(req_context.req_id, exclude_tier)
