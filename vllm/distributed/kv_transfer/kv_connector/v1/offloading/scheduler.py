@@ -510,6 +510,23 @@ class OffloadingConnectorScheduler:
         # req_ids currently allowed to initiate fs->staging promotions.
         self._promotion_owners: set[ReqId] = set()
 
+        # DSPARK finish-store retry: req_id -> failed prepare_store attempt
+        # count for finished requests whose finish-time store allocation
+        # failed. Instead of permanently dropping the tail chunks (holes in
+        # the parked session), the finished-request cleanup is deferred and
+        # prepare_store is re-attempted on subsequent build_connector_meta
+        # steps while the freed source GPU blocks remain unreallocated.
+        try:
+            self._finish_store_retries_cap: int = max(
+                0,
+                int(
+                    os.environ.get("DSPARK_FINISH_STORE_RETRIES", "30") or 30
+                ),
+            )
+        except ValueError:
+            self._finish_store_retries_cap = 30
+        self._pending_finish_stores: dict[ReqId, int] = {}
+
         # Job ID counter shared by loads and stores.
         self._job_counter: int = 0
         # Threshold value for stale jobs. All job ids >= _stale_job_threshold are
@@ -1107,9 +1124,15 @@ class OffloadingConnectorScheduler:
         for req_id in chain(
             scheduler_output.num_scheduled_tokens,
             scheduler_output.finished_req_ids or (),
+            # DSPARK finish-store retry: finished requests whose finish-time
+            # prepare_store failed. Snapshot: entries resolve inside the loop.
+            tuple(self._pending_finish_stores),
         ):
             req_status = self._req_status.get(req_id)
             if req_status is None:
+                # A pending finish-store whose request state vanished
+                # (reset_cache) cannot be retried.
+                self._pending_finish_stores.pop(req_id, None)
                 continue
             req = req_status.req
 
@@ -1124,6 +1147,44 @@ class OffloadingConnectorScheduler:
             num_offloadable_tokens = self._calc_num_offloadable_tokens(
                 req_status, num_tokens_after_batch
             )
+
+            if req_id in self._pending_finish_stores:
+                # DSPARK finish-store retry: the request's GPU blocks were
+                # freed at finish time; their content stays valid only until
+                # the KV cache manager reallocates them. _update_req_states
+                # already zeroed reallocated sliding-window entries (they
+                # become skipped holes, same as at finish time); a
+                # reallocated full-attention block invalidates the retry, so
+                # give up rather than store overwritten bytes.
+                _stale = False
+                _cur_alloc = self._current_batch_allocated_block_ids
+                if _cur_alloc:
+                    for _gcfg, _gstate in zip(
+                        self.config.kv_group_configs, req_status.group_states
+                    ):
+                        _nch = req_status.storable_chunks(
+                            _gcfg, _gstate, num_offloadable_tokens
+                        )
+                        _start = (
+                            _gstate.next_stored_chunk_idx * blocks_per_chunk
+                        )
+                        for _bid in _gstate.block_ids[
+                            _start : _nch * blocks_per_chunk
+                        ]:
+                            if _bid and _bid in _cur_alloc:
+                                _stale = True
+                                break
+                        if _stale:
+                            break
+                if _stale:
+                    del self._pending_finish_stores[req_id]
+                    logger.warning(
+                        "Request %s: abandoning finish-time store retry; "
+                        "source GPU blocks were reallocated",
+                        req_id,
+                    )
+                    self._finalize_finished_req(req_id, req_status)
+                    continue
 
             # Filter out chunks skipped due to sliding window attention / SSM
             # or unreachable by the load path's alignment constraints.
@@ -1184,6 +1245,10 @@ class OffloadingConnectorScheduler:
 
             if not new_offload_keys:
                 req_status.advance_stored_idx(num_offloadable_tokens)
+                if req_id in self._pending_finish_stores:
+                    # Nothing storable remains; run the deferred cleanup.
+                    del self._pending_finish_stores[req_id]
+                    self._finalize_finished_req(req_id, req_status)
                 continue
 
             store_output = self.manager.prepare_store(
@@ -1193,11 +1258,43 @@ class OffloadingConnectorScheduler:
                 self._connector_stats.increase_counter(
                     _ConnectorMetricName.ALLOCATION_FAILURE
                 )
+                if req.is_finished():
+                    # DSPARK finish-store retry: dropping the store here
+                    # would permanently lose the request's tail chunks.
+                    # Keep req_status alive, defer the on_request_finished
+                    # signal (build_connector_meta skips this req_id), and
+                    # re-attempt on subsequent steps: has_pending_push_work
+                    # keeps the engine stepping, and the reallocation guard
+                    # above aborts if the freed GPU blocks get reused.
+                    _attempts = self._pending_finish_stores.get(req_id, 0) + 1
+                    if _attempts <= self._finish_store_retries_cap:
+                        self._pending_finish_stores[req_id] = _attempts
+                        logger.warning(
+                            "Request %s: cannot store finish-time chunks "
+                            "(attempt %d/%d); will retry",
+                            req_id,
+                            _attempts,
+                            self._finish_store_retries_cap,
+                        )
+                        continue
+                    self._pending_finish_stores.pop(req_id, None)
+                    logger.warning(
+                        "Request %s: giving up finish-time store after %d "
+                        "attempts; tail chunks are dropped",
+                        req_id,
+                        _attempts,
+                    )
+                    self._finalize_finished_req(req_id, req_status)
+                    continue
                 logger.warning("Request %s: cannot store chunks", req_id)
                 continue
 
             if not store_output.keys_to_store:
                 req_status.advance_stored_idx(num_offloadable_tokens)
+                if req_id in self._pending_finish_stores:
+                    # Everything already stored; run the deferred cleanup.
+                    del self._pending_finish_stores[req_id]
+                    self._finalize_finished_req(req_id, req_status)
                 continue
 
             self._touch(req_status)
@@ -1300,8 +1397,31 @@ class OffloadingConnectorScheduler:
                     self._block_id_to_pending_jobs.setdefault(bid, set()).add(job_id)
                     if bid in self._current_batch_allocated_block_ids:
                         self._current_batch_jobs_to_flush.add(job_id)
+                if req_id in self._pending_finish_stores:
+                    # DSPARK finish-store retry succeeded: run the deferred
+                    # finished-request cleanup. transfer_jobs now holds the
+                    # store job, so req_status survives until
+                    # update_connector_output completes it, exactly like an
+                    # on-time finish store.
+                    del self._pending_finish_stores[req_id]
+                    self._finalize_finished_req(req_id, req_status)
 
         return store_jobs
+
+    def _finalize_finished_req(
+        self, req_id: ReqId, req_status: RequestOffloadState
+    ) -> None:
+        """Deferred finished-request cleanup (DSPARK finish-store retry).
+
+        Mirrors the finished_req_ids cleanup in build_connector_meta():
+        signal the manager exactly once, then drop req_status unless
+        transfer jobs are still in flight (update_connector_output deletes
+        it when the last one completes).
+        """
+        req_status.finished_signaled = True
+        self.manager.on_request_finished(req_status.req_context)
+        if not req_status.transfer_jobs:
+            del self._req_status[req_id]
 
     def build_connector_meta(
         self, scheduler_output: SchedulerOutput
@@ -1348,6 +1468,13 @@ class OffloadingConnectorScheduler:
             req_status = self._req_status.get(req_id)
             if req_status is None:
                 continue
+            if req_id in self._pending_finish_stores:
+                # DSPARK finish-store retry: keep req_status alive and defer
+                # the on_request_finished signal until the retry resolves
+                # (_build_store_jobs runs the cleanup then). Signaling now
+                # would let the tiering manager finalize and drop its
+                # request state, making the retried prepare_store fail.
+                continue
             req_status.finished_signaled = True
             self.manager.on_request_finished(req_status.req_context)
             if not req_status.transfer_jobs:
@@ -1363,7 +1490,11 @@ class OffloadingConnectorScheduler:
         While True, build_connector_meta() and update_connector_output()
         continue to be called even when no requests are scheduled.
         """
-        return bool(self._jobs) or self.manager.has_pending_work()
+        return (
+            bool(self._jobs)
+            or bool(self._pending_finish_stores)
+            or self.manager.has_pending_work()
+        )
 
     def update_connector_output(self, connector_output: KVConnectorOutput):
         """
@@ -1549,6 +1680,7 @@ class OffloadingConnectorScheduler:
         self._jobs.clear()
         self._block_id_to_pending_jobs.clear()
         self._promotion_owners.clear()
+        self._pending_finish_stores.clear()
 
         # The manager pool is empty; pending event payloads and announced
         # reference counts are stale.
