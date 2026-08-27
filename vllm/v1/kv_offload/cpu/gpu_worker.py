@@ -773,7 +773,17 @@ class CPUOffloadingWorker(OffloadingWorker):
         pin_memory = PIN_MEMORY
         logger.info("Allocating %d CPU tensors...", len(kv_caches.tensors))
         if mmap_region is not None and pin_memory:
-            pin_mmap_region(mmap_region)
+            # DSPARK: gup-pinning a disk-backed staging mmap locks the whole
+            # region in RAM while MemAvailable still counts those file pages
+            # as reclaimable, blinding the earlyoom guard. On unified memory
+            # the pin gains nothing (host copies are same-DRAM either way),
+            # so pin only tmpfs-backed regions. Override: DSPARK_OFFLOAD_PIN=1/0.
+            import os as _os
+            _pin_env = _os.environ.get("DSPARK_OFFLOAD_PIN", "auto")
+            if _pin_env == "1" or (
+                _pin_env != "0" and getattr(mmap_region, "_on_shm", True)
+            ):
+                pin_mmap_region(mmap_region)
 
         canonical_bytes_per_block = (
             _canonical_block_sizes(kv_caches.group_data_refs, len(kv_caches.tensors))
