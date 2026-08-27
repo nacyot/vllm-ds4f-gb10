@@ -375,6 +375,14 @@ class FileSystemTierManager(SecondaryTierManager):
     def submit_load(self, job_metadata: JobMetadata) -> None:
         keys = list(job_metadata.keys)
         paths = [self.file_mapper.get_file_name(key) for key in keys]
+        for _p in paths:
+            # A load counts as "use" for the external mtime-ordered pruner;
+            # otherwise parked sessions age by first-write time and the
+            # pruner evicts the hottest chunks first.
+            try:
+                os.utime(_p, None)
+            except OSError:
+                pass
         offs, sizes = self._key_offsets_sizes(keys, job_metadata.block_ids)
         tasks = _fanout_tasks(
             batch_load_block, paths, self._primary_kv_view, offs, sizes,
