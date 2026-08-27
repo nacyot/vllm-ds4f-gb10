@@ -397,7 +397,26 @@ class TieringOffloadingManager(OffloadingManager):
                 continue
             result = tier.lookup(key, req_context)
             if result is LookupResult.HIT:
+                if not getattr(req_context, "dspark_allow_promotion", True):
+                    # DSPARK restore admission gate: the connector denied
+                    # this request a promotion slot for this pass. Do not
+                    # initiate the fs->staging promotion; defer the request
+                    # exactly like a pending lookup so it retries next
+                    # step. Keys already resident in the primary tier were
+                    # answered above, so ungated staging-only lookups are
+                    # unaffected.
+                    self._accumulate_lookup_sync_delay(req_state, lookup_start)
+                    if (
+                        req_state is not None
+                        and req_state.secondary_lookup_start_time is None
+                    ):
+                        req_state.secondary_lookup_start_time = lookup_start
+                    return LookupResult.RETRY
                 promoted = self._initiate_promotion(tier, key, req_context)
+                if promoted:
+                    # Tell the connector-side admission gate this request
+                    # now owns promotion work in flight.
+                    req_context.dspark_promotion_initiated = True
                 self._accumulate_lookup_sync_delay(req_state, lookup_start)
                 if (
                     req_state is not None
