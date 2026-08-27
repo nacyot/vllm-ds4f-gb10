@@ -1,22 +1,24 @@
 # vllm-ds4f-gb10
 
-> Experimental patch set on top of [vLLM](https://github.com/vllm-project/vllm) **v0.27.1**, for serving DeepSeek V4 Flash across two DGX Spark **GB10** nodes with unified memory. Single user, specific hardware, reference implementation, not a production guarantee.
+> Experimental patch set on top of [vLLM](https://github.com/vllm-project/vllm) **v0.27.1**, for serving DeepSeek V4 Flash across two DGX Spark **GB10** nodes with unified memory. Specific hardware, reference implementation, not a production guarantee.
 
 **Base:** vLLM v0.27.1. Build and install with vLLM's own instructions; this fork applies the patches below on top of that tree. License: Apache-2.0 (inherited from vLLM, see `LICENSE`).
 
 **Author:** nacyot
 
-Every change here is opt-in behind an env var and defaults to stock vLLM behavior. The blog below is the main content; a short knob index and a changelog follow it.
+Every change here is opt-in behind an env var and defaults to stock vLLM behavior. The blog below is the main content; a short knob index follows it.
 
-**Status (2026-08-27).** The goal is now met and exceeded on the reference hardware: **six ~500k-token sessions resident** in an 18 GiB GPU pool with instant (2-4 s) switching and zero disk reads, cold-restart restore of any parked session in **12-18 s** (about 47x over full reprefill, needle-exact), and **concurrent cold swap-ins self-serializing in ~67 s** for five 450k sessions (previously 45 minutes of mutual staging eviction). Concurrency benchmarks (c8/c16/c32) hold their acceptance and scaling with offloading on. See the changelog at the bottom for what landed.
+(한국어: [README.ko.md](README.ko.md))
 
 ---
 
+**Status (2026-08-27).** The goal is now met and exceeded on the reference hardware: **six ~500k-token sessions resident** in an 18 GiB GPU pool with instant (2-4 s) switching and zero disk reads, cold-restart restore of any parked session in **12-18 s** (about 47x over full reprefill, needle-exact), and **concurrent cold swap-ins self-serializing in ~67 s** for five 450k sessions (previously 45 minutes of mutual staging eviction). Concurrency benchmarks (c8/c16/c32) hold their acceptance and scaling with offloading on. See the changelog at the bottom for what landed.
+
 # Keeping many long agent sessions resident: disk KV offloading for multi-node vLLM
 
-**The goal.** On two GB10 DGX Spark boxes with unified memory, keep five or more sessions of 400k+ tokens resident and instant to switch between, and let any older session that has been evicted come back without paying the full reprefill cost. That is the target this work was built for. Everything else, including the restore-time work, is in service of it.
+**The goal.** Run many long agent sessions at once, and never worry about a session's KV cache expiring or about re-paying its multi-minute prefill. On two GB10 DGX Spark boxes with unified memory that means keeping five or more sessions of 400k+ tokens resident and instant to switch between, and letting any older session that has been evicted come back without the full reprefill cost. That is the target this work was built for. Everything else, including the restore-time work, is in service of it.
 
-This is an experimental patch set on top of [vLLM](https://github.com/vllm-project/vllm) 0.27.1. It targets a specific setup (two DGX Spark GB10 nodes, unified memory, DeepSeek V4 Flash FP8, tensor parallel across the two nodes) and a single-user workload. It is a reference implementation, not a production guarantee. If you run something similar, the parts below should transfer; if you do not, read it as a case study.
+This is an experimental patch set on top of [vLLM](https://github.com/vllm-project/vllm) 0.27.1. It targets a specific setup (two DGX Spark GB10 nodes, unified memory, DeepSeek V4 Flash FP8, tensor parallel across the two nodes). It is a reference implementation, not a production guarantee. If you run something similar, the parts below should transfer; if you do not, read it as a case study.
 
 Author: nacyot.
 
@@ -24,7 +26,7 @@ Author: nacyot.
 
 When you self-host an LLM for long sessions, the real cost is not decode throughput. It is reprefill. A 500k-token agent session that gets evicted from the GPU cache has to be recomputed from scratch the moment you send the next turn, because a prefix-cache miss means the server walks the whole conversation again to rebuild its attention keys and values. On this hardware that reprefill runs into the multi-minute range. Waiting minutes for one reply effectively forces you to use a single session.
 
-The bottleneck for a local agent, then, is not tokens per second. It is how many sessions you can keep alive. GPU memory is finite, so with several sessions the oldest gets pushed out, and reopening it is a full reprefill. You cannot solve this inside the GPU alone.
+The bottleneck for a local agent, then, is not tokens per second. It is how many sessions you can keep alive. GPU memory is finite, so with several sessions the oldest gets pushed out, and reopening it is a full reprefill. This is the root of the whole thing: the KV that gets pushed out of memory is simply lost, nothing higher in the memory hierarchy holds it, and so the reprefill on the next touch cannot be avoided from inside memory at all. The only lever is to have written the KV somewhere durable before it was evicted. You cannot solve this inside the GPU alone.
 
 The KV cache is a deterministic function of the tokens, so there is a clean answer: write it to disk when it is evicted, read it back when the session is touched again, and skip the recompute. A 469k-token session that costs 435 seconds to rebuild on the GPU is a few-GB file on disk, a few seconds away at 1 GB/s. vLLM 0.27 already ships a tiering path (GPU pool to a CPU buffer to backend storage). The problem was that it did not work in a two-node configuration.
 
@@ -66,13 +68,25 @@ The most important property first: the client has to know nothing. Send the same
 
 Cold build (reprefill) versus disk restore, measured by force-evicting a session and reaccessing it:
 
-| Session size | Cold build (reprefill) | Disk restore | Speedup |
-|---|---|---|---|
-| 94k tokens | 61 s | 8.1 s | 7.5x |
-| 188k tokens | 133 s | 12.6 s | 10.5x |
-| 469k tokens | 435 s | 27.8 s | 15.6x |
+All numbers here are on shared network storage at about 1 GB/s (see the limits section for why that matters and what local NVMe would change).
 
-The speedup grows with session size, because reprefill accelerates with context while a disk read is linear.
+| Session size | Cold build (reprefill) | Disk restore, initial | Disk restore, reworked |
+|---|---|---|---|
+| 94k tokens | 61 s | 8.1 s | not re-measured |
+| 188k tokens | 133 s | 12.6 s | not re-measured |
+| 469k tokens | 435 s | 27.8 s | ~9 s |
+
+The "initial" column is the first working version; the "reworked" column is after the restore-path rework described in "From 28 seconds to 9" below, measured at 25.5 to 9.1 seconds on a 381k session. Small sessions were not re-measured because their stat cost was already small, so their gain is modest; the win concentrates on large sessions where serial existence-checks dominated. The speedup over reprefill grows with session size, because reprefill accelerates with context while a disk read is linear: a reworked 469k restore is roughly a 48x speedup over its 435 second reprefill.
+
+Relay path (item 5) on a single node's local NVMe, same force-evict-and-reaccess method:
+
+| Session size | Local-NVMe restore |
+|---|---|
+| 76k tokens | 2.6 s |
+| 352k tokens | 7.5 s |
+
+- Non-reading rank disk I/O, store and restore: 0 bytes.
+- Four 457k-token sessions resident together: switching among them 1.7 to 2.1 s each.
 
 But a disk restore is meant to be the rare case, not the common one. With the GPU pool set to 13 GiB (about 2.51M tokens), six sessions of about 370k tokens each stay fully resident on the GPU, and switching among them lands in 1.6 to 1.8 seconds every time. Only the seventh, evicted, session comes back from disk. In the six-resident-session qualification, store failures were zero and the memory headroom stayed comfortable.
 
@@ -89,26 +103,50 @@ Once it was clear the cost was the serial nature of the lookup, not read bandwid
 This is an experimental fork: vLLM 0.27.1 in a venv with inline patches. `TRIAL_*` are this fork's own knobs, `VLLM_*` are upstream knobs. Several knobs exist because they are the fix for a specific bottleneck met along the way.
 
 ```
-GPU pool:  13 GiB (TRIAL_KVMEM=13958643712, ~2.51M tokens, six 370k sessions resident)
-Staging:   8 GiB  (TRIAL_KVOFF=8, buffer between GPU and disk)
-Disk:      cache volume mounted CIFS hard,retrans=6 on both nodes
+Runnable scripts are in `deploy/gb10-cluster/`. Set the machine-specific values at
+the top of `serve-common.sh` (head and worker IPs, the fast-NIC name and RoCE HCA,
+the KV cache directory), then run the worker first and the head second:
 
-env:  TRIAL_KVFS=1 TRIAL_KVFS_DIR=<cache-volume>/kv/<node>-compact
-      TRIAL_KVCANON=true TRIAL_KVCOMPACT=true    (canonical packed offloading)
-      TRIAL_KVBPC=16 TRIAL_KVRT=32               (blocks per chunk, read threads)
-      VLLM_PREFIX_CACHE_RETENTION_INTERVAL=32768 (sparse retention of window groups)
-      VLLM_SPARSE_INDEXER_MAX_LOGITS_MB=128       (indexer logits buffer cap)
-      TRIAL_SPEC=dspark TRIAL_SPEC_N=5            (speculative decoding)
-      TRIAL_GPUUTIL=0.75 TRIAL_MNBT=1024
+  ./deploy/gb10-cluster/serve-worker.sh   # worker node (rank 1)
+  ./deploy/gb10-cluster/serve-head.sh     # head node (rank 0)
 
-start: worker node unit first, then head node unit (systemd user units + linger)
-guards: earlyoom + vm.min_free_kbytes 2GB + a dirty-page ceiling, persistent on both nodes
-watch: promotion-failure counter, dmesg Xid, available memory, cache-volume usage
+The recipe knobs, one per line (deploy/gb10-cluster/ds4f.env):
+
+  TRIAL_THINK=max
+  TRIAL_SPEC=dspark
+  TRIAL_SPEC_N=7
+  TRIAL_MOE=flashinfer_b12x
+  TRIAL_LINEAR=deep_gemm
+  TRIAL_MML=524288
+  TRIAL_MNBT=1024
+  TRIAL_GPUUTIL=0.75
+  TRIAL_KVMEM=13958643712        # GPU pool, 13 GiB
+  TRIAL_KVOFF=7                  # CPU staging tier, 7 GiB
+  TRIAL_KVFS=1
+  TRIAL_KVCANON=true
+  TRIAL_KVCOMPACT=true
+  TRIAL_KVBPC=16
+  TRIAL_KVRT=32
+  TRIAL_TAILONLY=0
+  DSPARK_RELAY_RESTORE=1               # one node reads + TP broadcast (off = shared-storage pread)
+  DSPARK_RELAY_WINDOW_BYTES=268435456  # 256 MiB broadcast window
+  DSPARK_FS_LOOKUP_THREADS=16
+  DSPARK_FS_LOAD_TASKS=16
+  DSPARK_FS_PREAD_THREADS=16
+  DSPARK_FS_PREAD_WINDOW=16
+  DSPARK_FS_PREAD_SKIP=1
+  VLLM_PREFIX_CACHE_RETENTION_INTERVAL=32768
+  VLLM_SPARSE_INDEXER_MAX_LOGITS_MB=128
+  VLLM_EXECUTE_MODEL_TIMEOUT_SECONDS=1800
+
+The full serve arg list, one per line, is in serve-common.sh. TRIAL_KVFS_DIR is set
+per node from CACHE_DIR; with DSPARK_RELAY_RESTORE=1 only the head stores and reads
+there, so the cache can be a single node local NVMe, an attached disk, or a mount.
 ```
 
 A few knobs are not part of the offloading core but the fix for what sat on top of it. `RETENTION_INTERVAL` addresses small sliding-window and state-group blocks being billed at 1 MB each, which inflated the real cache cost of a session about fourfold; it is the key to six-session instant switching. `LOGITS_MB` caps the sparse-indexer prefill logits buffer, which had been eating unified memory (and the drafter was amplifying it); it is the key to running large sessions with the drafter on.
 
-Speculative tokens stay at 5. Lowering it to squeeze memory distorted the output distribution, and the mistake was trusting speed and acceptance rate while skipping output-quality checks. The cause (garbled output and skipped tool calls) was later pinned with a three-way configuration comparison, and the value was returned to its normal setting. `GPUUTIL` is set low at 0.75 because a warm page cache trims the boot-time GPU memory check.
+Speculative tokens stay at 7. Lowering it to squeeze memory distorted the output distribution, and the mistake was trusting speed and acceptance rate while skipping output-quality checks. The cause (garbled output and skipped tool calls) was later pinned with a three-way configuration comparison, and the value was returned to its normal setting. `GPUUTIL` is set low at 0.75 because a warm page cache trims the boot-time GPU memory check.
 
 ## Verification: proving the restores are real
 
@@ -149,14 +187,12 @@ The probe scripts are small (an OpenAI-client needle harness plus `/metrics` del
 
 An honest list.
 
-1. Restores now run 13.8-16.1 s for ~500k sessions (relay-direct removed a redundant per-chunk disk read), but much of that is still control-plane bound. The GPU copy is 0.18 seconds; the rest is spread across lookup, remote reads, tail reprefill, and tokenization. The theoretical floor is roughly 6 to 7 seconds. Going lower needs a narrower lookup and promotion prefetch, and fundamentally the real answer is a bigger pool so sessions are not evicted in the first place, which is a hardware-scale question.
-2. The disk tier has no built-in capacity cap or GC; an external mtime-ordered pruner handles capacity. Dedup-skip stores and loads now refresh file mtimes so that pruner behaves as LRU rather than FIFO-by-first-write, but an in-tree GC that indexes per-session size and last access remains future work.
+1. Much of the 9-second restore is still control-plane and storage-bandwidth bound. The GPU copy is 0.18 seconds; the rest is spread across lookup, remote reads, tail reprefill, and tokenization. The theoretical floor is roughly 6 to 7 seconds. Going lower needs a narrower lookup and promotion prefetch, and fundamentally the real answer is a bigger pool so sessions are not evicted in the first place, which is a hardware-scale question.
+2. The disk tier has no capacity cap or GC. Real write rate is on the order of tens of GB per day, so it is not a near-term issue, but a GC that indexes per-session size and last access and evicts oldest-first is the next task.
 3. A more aggressive tail-only store, which cuts storage further, was implemented and shown to save space, but a regression where restore lookup misses the window groups' store timing left it off by default.
-4. This design assumes a single user with unbounded context. It optimizes for reaccess latency over throughput and for session persistence over fast session turnover, which is a different target from multi-tenant serving.
-5. There is no always-on output-audit gate yet. Both output-quality regressions surfaced in real use rather than from a synthetic probe. Turning garbled-output sweeps, tool-call batteries, and truncated-tool-call scenarios into a standing gate is the remaining work.
-
-6. Worker-side load errors are not yet wired into `get_block_ids_with_load_errors`, so the configured `kv_load_failure_policy=recompute` cannot fire from a failed read; the current mitigation is a loud error plus zero-fill instead of silently passing stale bytes. Wiring the report through is the next correctness task.
-7. The native DeepGEMM indexer-logits route allocates an exact-size output per call; under varied-width prefill churn this ratchets the allocator's reserved memory (A/B measured: about 70% of the worker-side creep). A bucketed reusable output buffer for the native route is the planned fix; the Triton route already has one.
+4. This design optimizes for keeping many long-lived sessions persistent and instantly reaccessible, trading raw throughput and fast session turnover for reaccess latency and session persistence. That is a different target from high-churn multi-tenant serving.
+5. The storage tier assumes shared storage that both nodes can see. On restore each worker reads its slice from the file the scheduler node wrote, over the shared mount, so a local per-node disk is not supported out of the box. The numbers here are on a network cache volume at about 1 GB/s, so the read-bound part of a restore (roughly half of the nine seconds: existence-check stats, promotion read, remote read) is limited by that link, not by SSD speed. Because the MLA KV is replicated across ranks, one copy suffices: the relay path (item 5 above) has a single rank read that copy and broadcast it to the others over the interconnect, so the store can sit on one node's local NVMe, an attached disk, or a network mount, and no per-node shared mount is required. It is opt-in and off by default; with it off, the default path still reads over the shared mount described here.
+6. There is no always-on output-audit gate yet. Both output-quality regressions surfaced in real use rather than from a synthetic probe. Turning garbled-output sweeps, tool-call batteries, and truncated-tool-call scenarios into a standing gate is the remaining work.
 
 Treat this fork as experimental. It is a reference for pushing disk KV offloading to measured results on a two-node unified-memory homelab, not a production drop-in.
 
