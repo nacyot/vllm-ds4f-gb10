@@ -239,6 +239,17 @@ class TieringOffloadingManager(OffloadingManager):
         # the key here with fresh recency.
         from collections import OrderedDict as _OD
 
+        # DSPARK primfull-retry: per-request count of lookups that found the
+        # chunk on disk but could not allocate staging (primary full, e.g.
+        # another request's in-flight load still pins its blocks).
+        self._primfull_retries: dict = {}
+        try:
+            self._primfull_retry_cap = int(
+                os.environ.get("DSPARK_PRIMFULL_RETRIES", "200") or 200
+            )
+        except ValueError:
+            self._primfull_retry_cap = 200
+
         self._fs_promoted_keys: "dict" = _OD()
         try:
             _cap = int(
@@ -429,11 +440,21 @@ class TieringOffloadingManager(OffloadingManager):
                 # promotion, load and release drain as a pipeline.
                 if not promoted:
                     _dspark_trace("primfull_miss", req_context.req_id, key)
-                return (
-                    LookupResult.MISS
-                    if not promoted
-                    else LookupResult.HIT_PENDING
-                )
+                    # DSPARK: the chunk file EXISTS on disk; only the primary
+                    # (staging) tier is full - typically another request's
+                    # in-flight load still pins its blocks. That is transient,
+                    # so retry next step instead of collapsing the whole
+                    # hybrid restore into a definitive MISS (= full
+                    # recompute). Bounded per request: after
+                    # DSPARK_PRIMFULL_RETRIES consecutive full passes fall
+                    # back to the old MISS behavior.
+                    _pf = self._primfull_retries.get(req_context.req_id, 0) + 1
+                    self._primfull_retries[req_context.req_id] = _pf
+                    if _pf <= self._primfull_retry_cap:
+                        return LookupResult.RETRY
+                    return LookupResult.MISS
+                self._primfull_retries.pop(req_context.req_id, None)
+                return LookupResult.HIT_PENDING
             if result is LookupResult.RETRY:
                 any_retry = True
 
@@ -806,6 +827,7 @@ class TieringOffloadingManager(OffloadingManager):
         exclude_tier: SecondaryTierManager | None = None,
     ) -> None:
         self.primary_tier.on_request_finished(req_context)
+        self._primfull_retries.pop(req_context.req_id, None)
         state = self._req_state[req_context.req_id]
         state.is_finished = True
         self._maybe_finalize_request(req_context.req_id, exclude_tier)
