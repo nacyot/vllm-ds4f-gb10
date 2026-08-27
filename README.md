@@ -6,7 +6,9 @@
 
 **Author:** nacyot
 
-Every change here is opt-in behind an env var and defaults to stock vLLM behavior. The blog below is the main content; a short knob index follows it.
+Every change here is opt-in behind an env var and defaults to stock vLLM behavior. The blog below is the main content; a short knob index and a changelog follow it.
+
+**Status (2026-08-27).** The goal is now met and exceeded on the reference hardware: **six ~500k-token sessions resident** in an 18 GiB GPU pool with instant (2-4 s) switching and zero disk reads, cold-restart restore of any parked session in **12-18 s** (about 47x over full reprefill, needle-exact), and **concurrent cold swap-ins self-serializing in ~67 s** for five 450k sessions (previously 45 minutes of mutual staging eviction). Concurrency benchmarks (c8/c16/c32) hold their acceptance and scaling with offloading on. See the changelog at the bottom for what landed.
 
 ---
 
@@ -112,11 +114,14 @@ Speculative tokens stay at 5. Lowering it to squeeze memory distorted the output
 
 An honest list.
 
-1. Much of the 9-second restore is still control-plane and storage-bandwidth bound. The GPU copy is 0.18 seconds; the rest is spread across lookup, remote reads, tail reprefill, and tokenization. The theoretical floor is roughly 6 to 7 seconds. Going lower needs a narrower lookup and promotion prefetch, and fundamentally the real answer is a bigger pool so sessions are not evicted in the first place, which is a hardware-scale question.
-2. The disk tier has no capacity cap or GC. Real write rate is on the order of tens of GB per day, so it is not a near-term issue, but a GC that indexes per-session size and last access and evicts oldest-first is the next task.
+1. Restores now run 13.8-16.1 s for ~500k sessions (relay-direct removed a redundant per-chunk disk read), but much of that is still control-plane bound. The GPU copy is 0.18 seconds; the rest is spread across lookup, remote reads, tail reprefill, and tokenization. The theoretical floor is roughly 6 to 7 seconds. Going lower needs a narrower lookup and promotion prefetch, and fundamentally the real answer is a bigger pool so sessions are not evicted in the first place, which is a hardware-scale question.
+2. The disk tier has no built-in capacity cap or GC; an external mtime-ordered pruner handles capacity. Dedup-skip stores and loads now refresh file mtimes so that pruner behaves as LRU rather than FIFO-by-first-write, but an in-tree GC that indexes per-session size and last access remains future work.
 3. A more aggressive tail-only store, which cuts storage further, was implemented and shown to save space, but a regression where restore lookup misses the window groups' store timing left it off by default.
 4. This design assumes a single user with unbounded context. It optimizes for reaccess latency over throughput and for session persistence over fast session turnover, which is a different target from multi-tenant serving.
 5. There is no always-on output-audit gate yet. Both output-quality regressions surfaced in real use rather than from a synthetic probe. Turning garbled-output sweeps, tool-call batteries, and truncated-tool-call scenarios into a standing gate is the remaining work.
+
+6. Worker-side load errors are not yet wired into `get_block_ids_with_load_errors`, so the configured `kv_load_failure_policy=recompute` cannot fire from a failed read; the current mitigation is a loud error plus zero-fill instead of silently passing stale bytes. Wiring the report through is the next correctness task.
+7. The native DeepGEMM indexer-logits route allocates an exact-size output per call; under varied-width prefill churn this ratchets the allocator's reserved memory (A/B measured: about 70% of the worker-side creep). A bucketed reusable output buffer for the native route is the planned fix; the Triton route already has one.
 
 Treat this fork as experimental. It is a reference for pushing disk KV offloading to measured results on a two-node unified-memory homelab, not a production drop-in.
 
@@ -134,4 +139,37 @@ Beyond the disk offloading recipe above, this tree carries a few more experiment
 - **DeepSeek V4 tool-call generation stabilization** (experimental, still under validation): `DSPARK_SPEC_OFF_GUIDED` (opt a tools request out of speculative-decode grammar validation), `DSPARK_DSML_LEAK_GUARD` (stop a request if tool-call markup tokens leak into free text), `DSPARK_TOOL_TEMP0` (force temperature 0 on tool turns so structure tokens stay deterministic).
 - **GB10 kernel and backend knobs**: opt-in B12X MXFP4 MoE backend, DeepGemm opt-in for the mHC pre-norm path, e8m0 block-scale upcast for the Triton path, DSpark draft attention backend pinning, MLA index-width rounding.
 
+- **Restore robustness under concurrency** (2026-08-27): `DSPARK_RESTORE_CONCURRENCY` (promotion admission gate, default 1), `DSPARK_PRIMFULL_RETRIES` (seconds of sustained staging-full to retry instead of collapsing to a MISS, default 300), `DSPARK_SWA_RESERVE` (reserve staging blocks for sliding-window tail promotion so oversized sessions restore their fitting prefix), `DSPARK_FINISH_STORE_RETRIES` (retry finish-time stores instead of dropping a parked session's tail, default 30).
+- **Staging mmap placement**: `DSPARK_OFFLOAD_MMAP_DIR` (back the CPU staging mmap with a disk file instead of tmpfs; preallocated with `posix_fallocate`), `DSPARK_OFFLOAD_PIN` (host-register policy; disk-backed regions default to unpinned).
+- **Relay direct broadcast**: `DSPARK_RELAY_DIRECT` (source the TP broadcast from the staging mmap instead of re-reading files, default on; fallback preads verify lengths).
+- **Scheduler admission**: `DSPARK_ADMIT_RESERVED` (count in-flight prefills' reserved blocks for fresh admissions too, default on), `DSPARK_PPCAP` (cap concurrent compute-prefills).
+- **fs tier hygiene**: `DSPARK_SIDECAR_STRICT` (fail loudly on layout-sidecar parse errors instead of silently switching on-disk formats), `DSPARK_FS_PROMOTED_KEYS_CAP` (LRU bound), `DSPARK_LOOKUP_TRACE` (distinguish primary-full misses from genuine misses).
+
 These are documented in their commit messages. This repository will keep accumulating experiments.
+
+---
+
+## Changelog
+
+### 2026-08-27 — hardening round (19 commits)
+
+- **Concurrent cold swap-ins: 45 min -> 67 s.** Three pieces, all required: a restore admission gate so only N requests initiate fs-to-staging promotions at once; retry-instead-of-MISS when a chunk exists on disk but staging is merely full (the residual collapse path: a request taking its turn while the previous restore's load still pinned staging used to discard the whole hybrid restore); and a time-based retry budget after measuring that a per-key budget burns out within a single lookup pass.
+- **Relay restore sources the broadcast from staging** (the bytes are guaranteed resident there by the promotion contract), halving restore-path disk reads; 500k restores 16-32 s -> 13.8-16.1 s. Remaining pread paths verify read lengths and poison loudly.
+- **Admission counts in-flight prefill reservations** for fresh long prompts (previously only async-load admissions), so N large prompts admit in capacity-sized waves instead of over-admitting into preemption thrash.
+- **Finish-time store retry** keeps a parked session's tail chunks instead of silently dropping them when staging is momentarily full at request finish.
+- **Staging mmap lifecycle**: env-selectable disk backing (frees ~12 GB of tmpfs per node on unified memory), `posix_fallocate` so ENOSPC is a clean startup error rather than a SIGBUS mid-offload, unpinned by default when disk-backed.
+- **Cold-restore reserve cap**: oversized sessions restore the prefix that fits staging instead of collapsing to a full recompute.
+- **fs tier hardening**: mtime refresh on dedup-skip stores and on loads (external LRU pruners saw first-write age and evicted the hottest chunks first), per-block batch validation, unlink only on short-read evidence (fd exhaustion or O_DIRECT EINVAL no longer deletes good cache files; C extension rebuilt to match), strict layout-sidecar failures.
+- **Eagle extra-chunk pop** no longer walks an interior restore boundary down to a full recompute (pop only when the extra chunk actually hit).
+- Misc: `_fs_promoted_keys` LRU bound, env-gated lookup trace, preserved live venv-only features in-tree (`DSPARK_PPCAP` admission cap, tiering metrics extension), fs_io build recipe.
+
+### 2026-08-25/26 — SM120 attention overlay and output quality
+
+- Build-free Triton sparse-MLA overlay for GB10/SM12x (adopted from jasl's ds4-sm120-min-enable line) with warmup/sampling subsystems; fixes the FlashInfer sparse-MLA prefill stall under concurrency.
+- Drafter ring KV keyed by persistent request index (mixed-batch acceptance collapse fix), live-path wiring included.
+- Prefill top-k rebase disabled on both call sites (it dropped every non-first prefill request's compressed context: refusal storms and acceptance collapse under batching).
+- B12X MXFP4 MoE route block cap; env-gated native DeepGEMM SM120 MQA logits and tf32 pre-norm routes; out-of-context fill skip in the rowwise logits kernel.
+
+### 2026-08-21 — initial public patch set
+
+- Two-node disk KV offloading: canonical packed layout for hybrid caches, group-slice fs IO with a layout sidecar, single-writer store dedup, TP-broadcast relay restore, restore-path parallelism, retention-interval fix for small-block cache inflation, sparse-indexer logits cap, DeepSeek V4 tool-call stabilization gates.
