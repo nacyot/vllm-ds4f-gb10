@@ -127,8 +127,14 @@ class SharedOffloadRegion:
             # land on a 0-byte stub and spin in _wait_for_file_size
             # for the full 30 s timeout.
             try:
-                check_shm_free_space(self.total_size_bytes) if self._on_shm else None
-                os.ftruncate(self.fd, self.total_size_bytes)
+                if self._on_shm:
+                    check_shm_free_space(self.total_size_bytes)
+                    os.ftruncate(self.fd, self.total_size_bytes)
+                else:
+                    # Disk-backed: allocate extents up front so ENOSPC
+                    # surfaces here as a clean OSError instead of a SIGBUS
+                    # on the first write into a hole once the fs fills up.
+                    os.posix_fallocate(self.fd, 0, self.total_size_bytes)
             except (RuntimeError, OSError):
                 os.unlink(self.mmap_path)
                 os.close(self.fd)
