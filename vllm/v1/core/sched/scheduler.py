@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 import itertools
-import os
+import os  # [gate-small-bypass-0271]
 import time
 from collections import defaultdict, deque
 from collections.abc import Iterable
@@ -65,6 +65,10 @@ from vllm.v1.structured_output import StructuredOutputGrammar, StructuredOutputM
 from vllm.v1.utils import record_function_or_nullcontext
 
 logger = init_logger(__name__)
+# [issue43-step-diag-0271] per-step scheduler diagnostics gate (issue
+# #43 diag port, log-only). Set DSPARK_ISSUE43_SCHED_DIAG=1 to emit one
+# compact scheduled-tokens summary INFO line per scheduler step.
+_ISSUE43_SCHED_DIAG = os.environ.get("DSPARK_ISSUE43_SCHED_DIAG", "0") not in ("0", "", "false", "False")
 
 
 class Scheduler(SchedulerInterface):
@@ -711,6 +715,85 @@ class Scheduler(SchedulerInterface):
                     step_skipped_waiting.prepend_request(request)
                     continue
 
+                # [ppcap] cap concurrent compute partial prefills (env
+                # DSPARK_PPCAP, default 0 = off). Placed AFTER remote-KV
+                # promotion so offload loads are never blocked; counts only
+                # RUNNING compute-prefills, so it does not touch the
+                # _inflight_prefills / offload block-reservation semantics.
+                try:
+                    _ppcap = int(os.environ.get("DSPARK_PPCAP", "0") or 0)
+                except Exception:
+                    _ppcap = 0
+                if _ppcap > 0:
+                    _cpp = 0
+                    for _ppr in self.running:
+                        if _ppr.num_computed_tokens < _ppr.num_prompt_tokens:
+                            _cpp += 1
+                    if _cpp >= _ppcap:
+                        break
+
+                # [gate-small-bypass-0271] 입장 게이트 + 소형 우회 v2 (env-gated).
+                # DSPARK_GATE_BYPASS_TOKENS=T(>0)일 때만: '남은 프리필>T'
+                # 인플라이트가 max_num_partial_prefills(없으면 1) 이상이면
+                # 게이트 성립. head의 novel(캐시 히트 반영)이 T 초과면
+                # 이번 스텝만 skip, 이하면 정상 입장(소형 우회).
+                try:
+                    _gb_T = int(
+                        os.environ.get("DSPARK_GATE_BYPASS_TOKENS", "0") or 0
+                    )
+                except Exception:
+                    _gb_T = 0
+                if _gb_T > 0:
+                    _gb_skip = False
+                    try:
+                        _gb_limit = getattr(
+                            self.scheduler_config, "max_num_partial_prefills", 1
+                        )
+                        if _gb_limit is None:
+                            _gb_limit = 1
+                        _gb_inflight = getattr(self, "_inflight_prefills", None)
+                        if _gb_inflight is None:
+                            _gb_inflight = [
+                                _gb_r
+                                for _gb_r in self.running
+                                if _gb_r.num_computed_tokens
+                                < _gb_r.num_prompt_tokens
+                            ]
+                        _gb_long = sum(
+                            1
+                            for _gb_r in _gb_inflight
+                            if _gb_r.num_tokens - _gb_r.num_computed_tokens
+                            > _gb_T
+                        )
+                        if _gb_limit > 0 and _gb_long >= _gb_limit:
+                            _gb_novel = (
+                                request.num_tokens - request.num_computed_tokens
+                            )
+                            if _gb_novel > _gb_T and (
+                                request.num_computed_tokens == 0
+                            ):
+                                # 프롬프트-대형이어도 캐시 히트를 조회해
+                                # 실제 계산량(novel)으로 재판정 — 기존
+                                # 세션의 짧은 턴은 통과 (read-only 룩업,
+                                # admission 시 어차피 수행되는 조회).
+                                try:
+                                    _gb_hit = (
+                                        self.kv_cache_manager
+                                        .get_computed_blocks(request)[1]
+                                    )
+                                    _gb_novel = request.num_tokens - _gb_hit
+                                except Exception:
+                                    pass
+                            _gb_skip = _gb_novel > _gb_T
+                    except Exception:
+                        logger.exception(
+                            "[gate-small-bypass-0271] gate check failed"
+                        )
+                    if _gb_skip:
+                        request_queue.pop_request()
+                        step_skipped_waiting.prepend_request(request)
+                        continue
+
                 if (
                     request.num_stale_output_tokens > 0
                     and not request.drop_stale_output
@@ -1248,6 +1331,41 @@ class Scheduler(SchedulerInterface):
         # write KV and have their output processed later in update_from_output).
         if self.defer_block_free and total_num_scheduled_tokens > 0:
             self.sched_step_seq += 1
+
+        # [issue43-step-diag-0271] per-step scheduled-tokens summary
+        # (issue #43 diag port, log-only — fairness logic NOT ported).
+        # Splits the final num_scheduled_tokens mapping by phase: a
+        # request still mid-prompt (num_computed_tokens <
+        # num_prompt_tokens, pre _update_after_schedule) counts as
+        # prefill, the rest as decode. decode_skips is a fixed [] (the
+        # node-exporter parser requires the key). One INFO line per step
+        # when DSPARK_ISSUE43_SCHED_DIAG=1; default off = no output.
+        if _ISSUE43_SCHED_DIAG:
+            try:
+                _diag_prefill: dict[str, int] = {}
+                _diag_decode: dict[str, int] = {}
+                for _rid, _ntok in num_scheduled_tokens.items():
+                    _req = self.requests.get(_rid)
+                    if _req is None:
+                        continue
+                    if _req.num_computed_tokens < _req.num_prompt_tokens:
+                        _diag_prefill[_rid] = _ntok
+                    else:
+                        _diag_decode[_rid] = _ntok
+                logger.info(
+                    "[issue43-step %d] run=%d prefill_toks=%s "
+                    "decode_toks=%s decode_skips=%s",
+                    self.current_step,
+                    len(scheduled_running_reqs),
+                    _diag_prefill,
+                    _diag_decode,
+                    [],
+                )
+            except Exception:
+                # Never let diagnostics kill the scheduler.
+                logger.warning(
+                    "[issue43-step-diag] step log failed", exc_info=True
+                )
 
         with record_function_or_nullcontext("schedule: update_after_schedule"):
             self._update_after_schedule(scheduler_output)
@@ -2145,12 +2263,10 @@ class Scheduler(SchedulerInterface):
                 self.encoder_cache_manager.free_encoder_input(request, input_id)
 
     def update_draft_token_ids(self, draft_token_ids: DraftTokenIds) -> None:
-        # Experimental, opt-in (DeepSeek V4 tool-call generation
-        # stabilization): speculative decoding against a guided/tools
-        # request forces every draft token through grammar validation,
-        # which is a bad match for tool-call structure tokens and can
-        # derail the request. Read the gate once per call, not per request.
-        spec_off_guided = os.environ.get("DSPARK_SPEC_OFF_GUIDED", "") == "1"
+        # [dspark-spec-off-guided-0271] env 게이트 1회 읽기 (기본 꺼짐).
+        _dspark_spec_off_guided = (
+            os.environ.get("DSPARK_SPEC_OFF_GUIDED", "").strip() == "1"
+        )
         for req_id, spec_token_ids in zip(
             draft_token_ids.req_ids,
             draft_token_ids.draft_token_ids,
@@ -2166,14 +2282,11 @@ class Scheduler(SchedulerInterface):
                     request.spec_token_ids = []
                 continue
 
-            if spec_off_guided and request.use_structured_output:
-                # Drop the draft for this request only: an empty draft
-                # makes the next scheduler step skip spec verification
-                # for it, i.e. per-request opt-out rather than a global
-                # speculation toggle.
+            # [dspark-spec-off-guided-0271] guided/tools 요청은 이 요청만 spec off:
+            # draft 를 비워 부착하면 다음 스텝 스케줄러가 그 요청 spec 검증을 스킵한다.
+            if _dspark_spec_off_guided and request.use_structured_output:
                 request.spec_token_ids = []
                 continue
-
             # Add newly generated spec token ids to the request.
             if self.structured_output_manager.should_advance(request):
                 metadata = request.structured_output_request
