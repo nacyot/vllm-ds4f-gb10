@@ -110,6 +110,41 @@ A few knobs are not part of the offloading core but the fix for what sat on top 
 
 Speculative tokens stay at 5. Lowering it to squeeze memory distorted the output distribution, and the mistake was trusting speed and acceptance rate while skipping output-quality checks. The cause (garbled output and skipped tool calls) was later pinned with a three-way configuration comparison, and the value was returned to its normal setting. `GPUUTIL` is set low at 0.75 because a warm page cache trims the boot-time GPU memory check.
 
+## Verification: proving the restores are real
+
+Claims about KV restore are easy to fake by accident: a prefix-cache hit looks like a restore, a warm page cache looks like fast disk, and a recompute produces the same correct answer as a restore, only slower. The verification harness closes those holes. Method:
+
+1. **Sessions are needle-probed.** Each session is a unique deterministic filler text (about 450k-506k tokens; unique per session so no cross-session prefix hits) with a unique secret code planted in the first sentence. Every reaccess asks for the code. A correct answer proves the restored KV is byte-faithful, not just present.
+2. **Disk reads are metered, not assumed.** Every probe records the delta of `vllm:external_prefix_cache_hits_total` and `vllm:kv_offload_load_bytes_total`. "Resident" means the answer came with **zero** bytes loaded from disk; "restored" means external hits cover ~99% of the prompt and gigabytes were read.
+3. **Cold means cold.** Restore tests restart both nodes' serving processes first, so the GPU pool and staging start empty and the only KV source is the disk tier.
+4. **Recompute is the control.** The same session rebuilt from scratch gives the reprefill baseline the restore is judged against.
+
+Results from the 2026-08-27 acceptance run (six ~506k sessions plus five 450k sessions, all needle-exact throughout; per-node ~120 GB unified memory, 18 GiB GPU KV pool):
+
+```
+Reaccess latency per ~500k-token session
+  resident (RAM, 0 bytes from disk)   #                        2-4 s     12/12 round-robin
+  parked   (restore from disk)        ####                     12-18 s   3.5-3.9 GB read, ext hits 99%+
+  recompute (control)                 ############################################  ~680 s
+```
+
+```
+Five 450k sessions swapped in simultaneously (cold)
+  before the admission-gate fixes     ############################################  45 min  (1 restored, 4 recomputed)
+  after                               ##                                            67 s    (5/5 restored, serial chain
+                                                                                             19 -> 33 -> 47 -> 60 -> 67 s)
+```
+
+```
+Store overhead on prefill (fresh 450k build, offloading writing every chunk)
+  offloading on                       ~660-694 tok/s
+  historical no-offload baseline      ~660-700 tok/s   (difference within run-to-run noise)
+```
+
+Residency capacity followed the measured per-token allocation (~5.2 KB/token with the retention-interval checkpointing), not the pessimistic "maximum concurrency" boot metric: six ~500k sessions occupy ~84% of an 18 GiB pool and all answer instantly; a seventh evicts the least-recently-used one to disk, which then costs one 12-18 s restore on its next touch. Concurrency benchmarks (2.5k-token prompts, out=512, temp 0.6) with offloading on: acceptance 1.58/1.45/1.43 at c8/c16/c32 with zero refusal lanes and monotonically rising aggregate throughput, i.e. the offloading path does not disturb speculative decoding.
+
+The probe scripts are small (an OpenAI-client needle harness plus `/metrics` deltas) and live outside this tree; the method above is enough to reproduce them against any deployment of this fork.
+
 ## Limits and open problems
 
 An honest list.
