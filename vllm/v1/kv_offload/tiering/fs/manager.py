@@ -317,8 +317,34 @@ class FileSystemTierManager(SecondaryTierManager):
             try:
                 with open(self._layout_path) as _f:
                     self._group_slices = _json.load(_f)["group_slices"]
-            except (OSError, ValueError, KeyError):
+            except (OSError, ValueError, KeyError) as _e:
                 self._group_slices = None
+                # The sidecar file exists, so this deployment writes
+                # canonical slice-layout chunk files. Whole-row fallback
+                # files would share the same content-addressed namespace:
+                # a slice-mode reader hitting a whole-row file loads
+                # group-0 bytes into other groups, silently corrupting
+                # restores across boots. Fail loudly by default;
+                # DSPARK_SIDECAR_STRICT=0 restores the legacy fallback.
+                if _env_int("DSPARK_SIDECAR_STRICT", 1):
+                    raise RuntimeError(
+                        f"KV offload layout sidecar {self._layout_path!r} "
+                        f"exists but could not be read/parsed: {_e!r}. "
+                        "Refusing whole-row fallback in a slice-layout "
+                        "content-addressed namespace (set "
+                        "DSPARK_SIDECAR_STRICT=0 to allow it)."
+                    ) from _e
+                if not getattr(self, "_layout_fallback_logged", False):
+                    self._layout_fallback_logged = True
+                    logger.error(
+                        "KV offload layout sidecar %s could not be "
+                        "read/parsed (%r); falling back to whole-row file "
+                        "layout. Whole-row and slice-layout files share "
+                        "one content-addressed namespace, so mixing them "
+                        "silently corrupts restored KV data.",
+                        self._layout_path,
+                        _e,
+                    )
 
     def _key_offsets_sizes(self, keys, block_ids):
         self._maybe_load_layout()
