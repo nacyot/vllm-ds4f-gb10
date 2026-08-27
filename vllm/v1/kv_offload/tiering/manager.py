@@ -227,7 +227,27 @@ class TieringOffloadingManager(OffloadingManager):
         # promotion only writes the scheduler node's mmap, so loads of
         # these keys carry the file path and each worker preads the shared
         # fs directly to fill its own mmap.
-        self._fs_promoted_keys: set = set()
+        # LRU-bounded (was an unbounded, never-pruned set that also
+        # permanently rerouted every load of a once-promoted key through
+        # the fs-path attach). Bounding is safe: evicting an entry only
+        # means a later prepare_load() will not attach an fs path for that
+        # key, so workers read the staging copy instead (the head/rank0
+        # mmap holds the promoted bytes). With the cap (default 500k) far
+        # above the staging tier block count (~147), a key can only age out
+        # of this LRU long after its staging block was itself LRU-evicted;
+        # any later use then needs a fresh fs promotion, which re-inserts
+        # the key here with fresh recency.
+        from collections import OrderedDict as _OD
+
+        self._fs_promoted_keys: "dict" = _OD()
+        try:
+            _cap = int(
+                os.environ.get("DSPARK_FS_PROMOTED_KEYS_CAP", "500000")
+                or 500000
+            )
+        except ValueError:
+            _cap = 500000
+        self._fs_promoted_keys_cap: int = max(1, _cap)
 
         # Gate for once-per-step execution of _maybe_process_finished_jobs().
         # Reset at the end of each step in on_schedule_end().
@@ -296,7 +316,7 @@ class TieringOffloadingManager(OffloadingManager):
                         completed_job.success,
                     )
                     if completed_job.success and hasattr(tier, "file_mapper"):
-                        self._fs_promoted_keys.update(job_metadata.keys)
+                        self._note_fs_promoted(job_metadata.keys)
                 else:
                     # primary→secondary transfer completed.
                     # Decrement ref_cnt on primary blocks.
@@ -308,6 +328,23 @@ class TieringOffloadingManager(OffloadingManager):
     def primary_capacity_blocks(self) -> int:
         """Total block slots in the primary (CPU staging) tier."""
         return self.primary_tier._num_blocks
+
+    def _note_fs_promoted(self, keys: Collection[OffloadKey]) -> None:
+        """Record fs->primary promoted keys, LRU-bounded.
+
+        prepare_load() attaches direct fs read paths for keys present here
+        so each worker can fill its own mmap from the shared fs. Overflow
+        evicts the oldest entry; see __init__ for why that is safe.
+        """
+        lru = self._fs_promoted_keys
+        for key in keys:
+            if key in lru:
+                lru.move_to_end(key)
+            else:
+                lru[key] = None
+        cap = self._fs_promoted_keys_cap
+        while len(lru) > cap:
+            lru.popitem(last=False)
 
     def lookup(
         self,
