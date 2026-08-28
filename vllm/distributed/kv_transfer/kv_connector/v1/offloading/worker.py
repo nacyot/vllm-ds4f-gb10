@@ -58,6 +58,16 @@ class OffloadingConnectorWorker:
 
         # job_id -> req_id for in-flight loads.
         self._load_jobs: dict[int, ReqId] = {}
+        # [load-error-recompute] job_id -> dst GPU block ids of in-flight
+        # loads, so a failed job can be reported block-by-block.
+        self._load_job_block_ids: dict[int, list[int]] = {}
+        # [load-error-recompute] GPU block ids whose KV load failed; drained
+        # once per step by get_block_ids_with_load_errors().
+        self._load_error_block_ids: set[int] = set()
+        # [load-error-recompute] req_ids whose load job failed at submit and
+        # never reached the backend worker; they must still be reported via
+        # get_finished() so the scheduler resumes them.
+        self._failed_load_req_ids: set[ReqId] = set()
         self._unsubmitted_store_jobs: list[
             tuple[int, GPULoadStoreSpec, LoadStoreSpec]
         ] = []
@@ -210,57 +220,57 @@ class OffloadingConnectorWorker:
                         )
                     )
         else:
-            for kv_cache_tensor in kv_cache_config.kv_cache_tensors:
-                # Filter to layers that were actually processed above.
-                # Packed KV allocation emits KVCacheTensor entries for
-                # every (tuple_idx, page_size) slot; slots where no group has a
-                # layer at that index produce an empty shared_by (reserved memory
-                # with no corresponding model layer).
-                tensor_layer_names = [
-                    n for n in kv_cache_tensor.shared_by if n in tensors_per_block
-                ]
-                if not tensor_layer_names:
-                    continue
+          for kv_cache_tensor in kv_cache_config.kv_cache_tensors:
+              # Filter to layers that were actually processed above.
+              # Packed KV allocation emits KVCacheTensor entries for
+              # every (tuple_idx, page_size) slot; slots where no group has a
+              # layer at that index produce an empty shared_by (reserved memory
+              # with no corresponding model layer).
+              tensor_layer_names = [
+                  n for n in kv_cache_tensor.shared_by if n in tensors_per_block
+              ]
+              if not tensor_layer_names:
+                  continue
 
-                # verify all layers in the group reference the exact same tensors
-                assert len({len(tensors_per_block[n]) for n in tensor_layer_names}) == 1
-                assert (
-                    len({tensors_per_block[n][0].data_ptr() for n in tensor_layer_names})
-                    == 1
-                )
-                assert (
-                    len({tensors_per_block[n][0].stride() for n in tensor_layer_names}) == 1
-                )
+              # verify all layers in the group reference the exact same tensors
+              assert len({len(tensors_per_block[n]) for n in tensor_layer_names}) == 1
+              assert (
+                  len({tensors_per_block[n][0].data_ptr() for n in tensor_layer_names})
+                  == 1
+              )
+              assert (
+                  len({tensors_per_block[n][0].stride() for n in tensor_layer_names}) == 1
+              )
 
-                # pick the first layer to represent the group
-                first_layer_name = tensor_layer_names[0]
-                for tensor in tensors_per_block[first_layer_name]:
-                    block_tensors.append(
-                        CanonicalKVCacheTensor(
-                            tensor=tensor,
-                            page_size_bytes=page_size_bytes[first_layer_name],
-                        )
-                    )
+              # pick the first layer to represent the group
+              first_layer_name = tensor_layer_names[0]
+              for tensor in tensors_per_block[first_layer_name]:
+                  block_tensors.append(
+                      CanonicalKVCacheTensor(
+                          tensor=tensor,
+                          page_size_bytes=page_size_bytes[first_layer_name],
+                      )
+                  )
 
-                    curr_tensor_idx = len(block_tensors) - 1
-                    for layer_name in tensor_layer_names:
-                        mapping = (
-                            mappings.get(layer_name)
-                            if len(tensors_per_block[first_layer_name]) == 1
-                            else None
-                        )
-                        assert (
-                            mapping is None
-                            or mapping.local_page_size_bytes
-                            == unpadded_page_size_bytes[layer_name]
-                        )
-                        block_data_refs[layer_name].append(
-                            CanonicalKVCacheRef(
-                                tensor_idx=curr_tensor_idx,
-                                page_size_bytes=(unpadded_page_size_bytes[layer_name]),
-                                mapping=mapping,
-                            )
-                        )
+                  curr_tensor_idx = len(block_tensors) - 1
+                  for layer_name in tensor_layer_names:
+                      mapping = (
+                          mappings.get(layer_name)
+                          if len(tensors_per_block[first_layer_name]) == 1
+                          else None
+                      )
+                      assert (
+                          mapping is None
+                          or mapping.local_page_size_bytes
+                          == unpadded_page_size_bytes[layer_name]
+                      )
+                      block_data_refs[layer_name].append(
+                          CanonicalKVCacheRef(
+                              tensor_idx=curr_tensor_idx,
+                              page_size_bytes=(unpadded_page_size_bytes[layer_name]),
+                              mapping=mapping,
+                          )
+                      )
 
         group_data_refs: list[list[CanonicalKVCacheRef]] = []
         for kv_cache_group in kv_cache_config.kv_cache_groups:
@@ -360,8 +370,30 @@ class OffloadingConnectorWorker:
         for job_id, entry in metadata.load_jobs.items():
             self._load_jobs[job_id] = entry.req_id
             assert isinstance(entry.dst_spec, GPULoadStoreSpec)
+            self._load_job_block_ids[job_id] = [
+                int(b) for b in entry.dst_spec.block_ids
+            ]
             success = self.worker.submit_load(job_id, entry.src_spec, entry.dst_spec)
-            assert success
+            if not success:
+                # [load-error-recompute] The load never reached the backend
+                # worker. Report every dst block as failed so the scheduler
+                # recomputes them (kv_load_failure_policy=recompute), and
+                # synthesize the job completion so the request does not
+                # hang in WAITING_FOR_REMOTE_KVS and the manager unpins
+                # the staged chunks.
+                block_ids = self._load_job_block_ids.pop(job_id)
+                logger.error(
+                    "[load-error-recompute] submit_load failed: job=%d "
+                    "req=%s blocks=%d; scheduling recompute",
+                    job_id,
+                    entry.req_id,
+                    len(block_ids),
+                )
+                self._load_error_block_ids.update(block_ids)
+                self._connector_worker_meta.mark_completed(job_id)
+                req_id = self._load_jobs.pop(job_id, None)
+                if req_id is not None:
+                    self._failed_load_req_ids.add(req_id)
 
     def prepare_store_kv(self, metadata: OffloadingConnectorMetadata):
         for job_id, entry in metadata.store_jobs.items():
@@ -389,10 +421,42 @@ class OffloadingConnectorWorker:
         """
         assert self.worker is not None
         finished_recving: set[str] = set()
+        # [load-error-recompute] loads that failed at submit still resolve
+        # the request; their blocks were already reported as failed.
+        if self._failed_load_req_ids:
+            finished_recving |= self._failed_load_req_ids
+            self._failed_load_req_ids = set()
         for transfer_result in self.worker.get_finished():
-            # we currently do not support job failures
             job_id = transfer_result.job_id
-            assert transfer_result.success
+            if not transfer_result.success:
+                if job_id not in self._load_jobs:
+                    # [load-error-recompute] Failed *store*: keep the
+                    # upstream fail-stop semantics. The current backend
+                    # never emits success=False (cpu/gpu_worker.py builds
+                    # TransferResult with success=True unconditionally);
+                    # if a future backend does, completing the job would
+                    # let the scheduler's complete_store mark garbage
+                    # staging bytes as stored, and later lookups would
+                    # serve them as HITs (silent corruption). Fail loudly
+                    # instead (explicit raise, -O safe).
+                    raise AssertionError(
+                        "[load-error-recompute] store job %d reported "
+                        "failure; refusing to complete it as stored"
+                        % job_id
+                    )
+                # [load-error-recompute] Failed *load*: report the dst GPU
+                # blocks for recompute instead of asserting. Per the
+                # KVConnectorBase_V1 contract the job is still marked
+                # completed and the request still resolves below.
+                failed_block_ids = self._load_job_block_ids.get(job_id)
+                if failed_block_ids:
+                    self._load_error_block_ids.update(failed_block_ids)
+                logger.error(
+                    "[load-error-recompute] load transfer failed: job=%d "
+                    "blocks=%d; scheduling recompute",
+                    job_id,
+                    len(failed_block_ids) if failed_block_ids else 0,
+                )
             is_load = job_id in self._load_jobs
             if (
                 transfer_result.transfer_time is not None
@@ -408,11 +472,41 @@ class OffloadingConnectorWorker:
                 )
 
             self._connector_worker_meta.mark_completed(job_id)
+            self._load_job_block_ids.pop(job_id, None)
             req_id = self._load_jobs.pop(job_id, None)
             if req_id is not None:
                 finished_recving.add(req_id)
 
         return set(), finished_recving
+
+    def get_block_ids_with_load_errors(self) -> set[int]:
+        """[load-error-recompute] Drain GPU block ids whose KV load failed.
+
+        Two sources are merged:
+        - connector-level failures (submit_load refusals and failed
+          TransferResults) collected in self._load_error_block_ids, and
+        - backend fs pread failures recorded by the offloading spec worker
+          (TieringOffloadingSpec zero-fill fallback stashes them on the
+          worker object as _dspark_load_error_block_ids).
+
+        Called once per engine step by the model runner after
+        get_finished(); the executor unions the sets across TP ranks
+        (KVOutputAggregator) and the core scheduler recomputes the
+        affected blocks when kv_load_failure_policy=recompute.
+        """
+        errors = self._load_error_block_ids
+        self._load_error_block_ids = set()
+        spec_errors = getattr(
+            self.worker, "_dspark_load_error_block_ids", None
+        )
+        if spec_errors:
+            errors |= spec_errors
+            spec_errors.clear()
+        # Never report the shared null placeholder block: sliding-window
+        # groups pad with it, and marking it invalid would truncate every
+        # request at its first null position.
+        errors.discard(0)
+        return errors
 
     def build_connector_worker_meta(self) -> OffloadingWorkerMetadata | None:
         """Return completed transfer job IDs since the last call."""
@@ -425,6 +519,9 @@ class OffloadingConnectorWorker:
     def shutdown(self) -> None:
         self._unsubmitted_store_jobs.clear()
         self._load_jobs.clear()
+        self._load_job_block_ids.clear()
+        self._load_error_block_ids.clear()
+        self._failed_load_req_ids.clear()
         self._connector_worker_meta = OffloadingWorkerMetadata()
         if self.worker is not None:
             self.worker.shutdown()
