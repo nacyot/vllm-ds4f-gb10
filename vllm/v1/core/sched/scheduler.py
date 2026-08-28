@@ -2930,8 +2930,57 @@ class Scheduler(SchedulerInterface):
             is_affected = False
             marked_invalid_block = False
             req_id = request.request_id
-            # TODO (davidb): add support for hybrid memory allocator
-            (req_block_ids,) = self.kv_cache_manager.get_block_ids(req_id)
+            # [load-error-recompute] hybrid (multi-group) support: merge
+            # the per-group block lists positionally. A token-block index
+            # is invalid if any group's block at that index is invalid;
+            # represent the index by that invalid block id so the
+            # truncation logic below fires unchanged. Block ids are
+            # globally unique (single BlockPool); the null placeholder id
+            # is stripped from invalid_block_ids before reporting.
+            req_block_id_groups = self.kv_cache_manager.get_block_ids(req_id)
+            if len(req_block_id_groups) == 1:
+                (req_block_ids,) = req_block_id_groups
+            else:
+                req_block_ids = [
+                    next(
+                        (b for b in idx_blocks if b in invalid_block_ids),
+                        idx_blocks[0],
+                    )
+                    for idx_blocks in zip(*req_block_id_groups)
+                ]
+                if any(
+                    len(g) != len(req_block_ids)
+                    for g in req_block_id_groups
+                ):
+                    # zip() above silently truncated to the shortest
+                    # group: the per-group block lists are NOT
+                    # equal-length (measured on DS4F: per-group block
+                    # sizes 256/64/64/4/8), so positional alignment is
+                    # meaningless here. Be conservative: if ANY group
+                    # holds an invalid block, recompute this request's
+                    # entire loaded prefix by representing position 0
+                    # with that block (over-recompute only, never a
+                    # silently-kept invalid block).
+                    _bad = next(
+                        (
+                            b
+                            for g in req_block_id_groups
+                            for b in g
+                            if b in invalid_block_ids
+                        ),
+                        None,
+                    )
+                    if _bad is not None:
+                        logger.error(
+                            "[load-error-recompute] request %s has "
+                            "unequal KV group block list lengths %s and "
+                            "invalid block %d; conservatively recomputing "
+                            "the whole loaded prefix",
+                            req_id,
+                            [len(g) for g in req_block_id_groups],
+                            _bad,
+                        )
+                        req_block_ids = [_bad] + list(req_block_ids[1:])
             # We iterate only over blocks that may contain externally computed
             # tokens
             req_num_computed_tokens = (

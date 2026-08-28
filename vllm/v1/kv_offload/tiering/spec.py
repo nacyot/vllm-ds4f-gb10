@@ -18,7 +18,12 @@ Configuration via kv_connector_extra_config:
     registered via CachePolicyFactory
   - secondary_tiers: (optional) List of secondary tier configurations
     Each secondary tier config is a dict with:
-      - type: (required) Type of secondary tier (e.g., "example", "storage", "network")
+      - type: (required) Type of secondary tier (e.g., "example", "fs",
+        "p2p", "obj"), or the class name of an out-of-tree
+        SecondaryTierManager paired with module_path.
+      - module_path: (optional) Python import path to load 'type' from
+        when it names an out-of-tree SecondaryTierManager not registered
+        via SecondaryTierFactory.register_tier()
       - Additional tier-specific parameters are passed directly to the tier
         constructor. See each tier's documentation for supported parameters.
 
@@ -34,10 +39,20 @@ Example configuration:
         }
     ]
 }
+
+Example out-of-tree tier configuration:
+{
+    "cpu_bytes_to_use": 10737418240,
+    "secondary_tiers": [
+        {
+            "type": "MyCustomTier",
+            "module_path": "my_package.my_module",
+            "custom_param": "value"
+        }
+    ]
+}
 """
 
-import os
-from concurrent.futures import ThreadPoolExecutor
 from typing import Any
 
 import torch
@@ -46,6 +61,8 @@ from typing_extensions import override
 from vllm.logger import init_logger
 from vllm.v1.kv_offload.base import (
     CanonicalKVCaches,
+    OffloadingCounterMetadata,
+    OffloadingGaugeMetadata,
     OffloadingHistogramMetadata,
     OffloadingManager,
     OffloadingMetricMetadata,
@@ -64,11 +81,61 @@ from vllm.v1.kv_offload.tiering.manager import (
 logger = init_logger(__name__)
 
 
-def _env_int(name: str, default: int = 1) -> int:
+def _dspark_failed_chunks_to_gpu_blocks(
+    src_spec, dst_spec, blocks_per_chunk, failed_cpu_bids
+):
+    """[load-error-recompute] Map failed staging-chunk block ids to the GPU
+    block ids they would have filled.
+
+    Mirrors the per-group offset walk in
+    SingleDirectionOffloadingHandler.transfer_async for loads
+    (gpu_to_cpu=False: src_blocks_per_chunk=blocks_per_chunk,
+    dst_blocks_per_chunk=1). Per group, the first chunk may be partially
+    consumed (skip = block_index % blocks_per_chunk).
+
+    Falls back to reporting the whole job's dst blocks if the walk does not
+    line up; over-reporting is safe (the scheduler merely recomputes more).
+    """
+    dst_blocks = dst_spec.block_ids
     try:
-        return int(os.environ.get(name, "") or default)
-    except ValueError:
-        return default
+        failed_pos = {
+            i
+            for i, b in enumerate(src_spec.block_ids)
+            if int(b) in failed_cpu_bids
+        }
+        failed_gpu: set = set()
+        src_off = 0
+        dst_off = 0
+        for group_size, block_idx in zip(
+            dst_spec.group_sizes, dst_spec.block_indices
+        ):
+            gsz = int(group_size)
+            if gsz == 0:
+                continue
+            skip = int(block_idx) % blocks_per_chunk
+            src_count = -(-(gsz + skip) // blocks_per_chunk)
+            for j in range(src_count):
+                if (src_off + j) in failed_pos:
+                    lo = max(0, j * blocks_per_chunk - skip)
+                    hi = min(gsz, (j + 1) * blocks_per_chunk - skip)
+                    failed_gpu.update(
+                        int(b) for b in dst_blocks[dst_off + lo : dst_off + hi]
+                    )
+            src_off += src_count
+            dst_off += gsz
+        if src_off != len(src_spec.block_ids) or dst_off != len(dst_blocks):
+            raise ValueError(
+                "offset walk mismatch: src %d/%d dst %d/%d"
+                % (src_off, len(src_spec.block_ids), dst_off, len(dst_blocks))
+            )
+        return failed_gpu
+    except Exception as exc:  # noqa: BLE001
+        logger.error(
+            "[load-error-recompute] chunk->gpu mapping failed (%s); "
+            "reporting the whole job's dst blocks",
+            exc,
+        )
+        return {int(b) for b in dst_blocks}
 
 
 class TieringOffloadingSpec(CPUOffloadingSpec):
@@ -95,9 +162,8 @@ class TieringOffloadingSpec(CPUOffloadingSpec):
         metrics[TieringOffloadingMetrics.LOOKUP_SYNC_DELAY] = (
             OffloadingHistogramMetadata(
                 documentation=(
-                    "Histogram of total blocking time spent querying secondary "
-                    "tiers for a request, accumulated from first lookup until "
-                    "the request is allocated or finishes, in seconds."
+                    "Histogram of blocking time spent in a per-block tier lookup "
+                    "that resolved as a hit or miss, labeled by tier, in seconds."
                 ),
                 buckets=(
                     0.00001,
@@ -117,9 +183,9 @@ class TieringOffloadingSpec(CPUOffloadingSpec):
         metrics[TieringOffloadingMetrics.LOOKUP_ASYNC_DELAY] = (
             OffloadingHistogramMetadata(
                 documentation=(
-                    "Histogram of wall-clock time from a request's first deferred "
-                    "secondary-tier lookup until the request is allocated or "
-                    "finishes, in seconds."
+                    "Histogram of wall-clock time from a per-block tier lookup "
+                    "first returning retry until that same tier lookup resolves "
+                    "as a hit or miss, labeled by tier, in seconds."
                 ),
                 buckets=(
                     0.0001,
@@ -135,6 +201,95 @@ class TieringOffloadingSpec(CPUOffloadingSpec):
                     10,
                 ),
             )
+        )
+        metrics[TieringOffloadingMetrics.READ_BYTES] = OffloadingCounterMetadata(
+            documentation=(
+                "Total bytes read from secondary tiers into the primary tier, "
+                "labeled by tier."
+            ),
+            labelnames=("tier",),
+        )
+        metrics[TieringOffloadingMetrics.READ_TIME] = OffloadingCounterMetadata(
+            documentation=(
+                "Total time spent reading from secondary tiers into the primary "
+                "tier, in seconds, labeled by tier."
+            ),
+            labelnames=("tier",),
+        )
+        metrics[TieringOffloadingMetrics.WRITE_BYTES] = OffloadingCounterMetadata(
+            documentation=(
+                "Total bytes written from the primary tier to secondary tiers, "
+                "labeled by tier."
+            ),
+            labelnames=("tier",),
+        )
+        metrics[TieringOffloadingMetrics.WRITE_TIME] = OffloadingCounterMetadata(
+            documentation=(
+                "Total time spent writing from the primary tier to secondary "
+                "tiers, in seconds, labeled by tier."
+            ),
+            labelnames=("tier",),
+        )
+        metrics[TieringOffloadingMetrics.PROMOTION_JOB_FAILURES] = (
+            OffloadingCounterMetadata(
+                documentation=(
+                    "Number of failed secondary-tier promotion jobs, labeled by tier."
+                ),
+            )
+        )
+        metrics[TieringOffloadingMetrics.CASCADE_JOB_FAILURES] = (
+            OffloadingCounterMetadata(
+                documentation=(
+                    "Number of failed secondary-tier cascade jobs, labeled by tier."
+                ),
+            )
+        )
+        metrics[TieringOffloadingMetrics.BLOCK_QUERIES] = OffloadingCounterMetadata(
+            documentation=(
+                "Number of block lookup queries sent to a tier, labeled by tier."
+            ),
+            labelnames=("tier",),
+        )
+        metrics[TieringOffloadingMetrics.BLOCK_HITS] = OffloadingCounterMetadata(
+            documentation="Number of block lookup hits in a tier, labeled by tier.",
+            labelnames=("tier",),
+        )
+        metrics[TieringOffloadingMetrics.PROMOTION_ALLOCATION_FAILURES] = (
+            OffloadingCounterMetadata(
+                documentation=(
+                    "Number of promotion attempts that failed because the "
+                    "primary tier could not allocate space."
+                ),
+            )
+        )
+        metrics[TieringOffloadingMetrics.PRIMARY_WRITE_USAGE_PERC] = (
+            OffloadingGaugeMetadata(
+                documentation=(
+                    "Current fraction of primary-tier space used by writes from "
+                    "secondary tiers, labeled by tier."
+                ),
+            )
+        )
+        metrics[TieringOffloadingMetrics.PRIMARY_READ_USAGE_PERC] = (
+            OffloadingGaugeMetadata(
+                documentation=(
+                    "Current fraction of primary-tier space used by reads to "
+                    "secondary tiers, labeled by tier."
+                ),
+            )
+        )
+        metrics[TieringOffloadingMetrics.ACTIVE_PROMOTION_JOBS] = (
+            OffloadingGaugeMetadata(
+                documentation=(
+                    "Number of active secondary-tier promotion jobs, labeled by tier."
+                ),
+            )
+        )
+        metrics[TieringOffloadingMetrics.ACTIVE_CASCADE_JOBS] = OffloadingGaugeMetadata(
+            documentation=(
+                "Number of active secondary-tier cascade jobs, labeled by tier."
+            ),
+            labelnames=("tier",),
         )
         secondary_tier_configs = extra_config.get("secondary_tiers", [])
         if not isinstance(secondary_tier_configs, list):
@@ -219,24 +374,19 @@ class TieringOffloadingSpec(CPUOffloadingSpec):
                     )
                     secondary_tiers.append(tier)
                     logger.info(
-                        "Created secondary tier from config index %i, type %s",
+                        "Created secondary tier #%d (%s)",
                         i,
                         tier.tier_type,
                     )
 
-                # Create TieringOffloadingManager. GPU-CPU transfers use the
-                # inherited get_worker(). Secondary tier transfers are handled
-                # by the secondary tier managers and need no additional
-                # workers here.
-                # Point fs tiers at the worker-written layout sidecar so they
-                # can store/load group slices instead of whole staging rows.
-                if self.config.canonical_layout:
-                    for _tier in secondary_tiers:
-                        if hasattr(_tier, "file_mapper"):
-                            _tier._layout_path = (
-                                f"/dev/shm/vllm_offload_{self._engine_id}"
-                                ".layout.json"
-                            )
+                # Create TieringOffloadingManager. GPU↔CPU transfers use the inherited
+                # get_worker(). Secondary tier transfers are handled by the
+                # secondary tier managers and need no additional workers here.
+                for _tier in secondary_tiers:
+                    if hasattr(_tier, "file_mapper"):
+                        _tier._layout_path = (
+                            f"/dev/shm/vllm_offload_{self._engine_id}.layout.json"
+                        )
                 tiering_manager = TieringOffloadingManager(
                     primary_tier=primary_tier,
                     secondary_tiers=secondary_tiers,
@@ -313,20 +463,47 @@ class TieringOffloadingSpec(CPUOffloadingSpec):
                 mmap_region=worker_mmap,
                 canonical_layout=self.config.canonical_layout,
             )
-            # Compact packed multi-node: promoted chunks exist only in the
-            # scheduler node's mmap. When a load spec carries fs paths
-            # (absolute paths on a shared mount), fill this worker's mmap
-            # rows from the files first, then run the normal load.
+            # DSPARK compact 멀티노드: 승격 청크는 스케줄러 노드 mmap에만
+            # 존재한다. 로드 스펙에 fs 경로가 오면 (공유 마운트 절대경로)
+            # 이 워커의 mmap 행을 파일로 먼저 채운 뒤 정상 로드를 진행한다.
+            _mv = worker_mmap.create_kv_memoryview().cast("B")
             _row = self.kv_bytes_per_chunk
             _orig_submit_load = _worker.submit_load
-            # DSPARK_FS_PREAD_SKIP: on the node that ran the promotion (the
-            # scheduler node in the current single-writer scheme), this
-            # worker's mmap was already filled during promotion, so the
-            # direct pread below would just duplicate that write.
-            _pread_skip = os.environ.get("DSPARK_FS_PREAD_SKIP") == "1"
+
+            # canonical 그룹 슬라이스 사이드카: 텐서 뷰 오프셋에서 그룹별
+            # (행내 오프셋, 길이)를 산출해 기록. fs tier가 참바이트 파일을
+            # 쓰고, 워커 pread가 같은 슬라이스를 채우는 기준이 된다.
+            try:
+                _views = worker_mmap._views
+                _slices = []
+                for _grefs in kv_caches.group_data_refs:
+                    _idxs = sorted({r.tensor_idx for r in _grefs})
+                    _first = _views[_idxs[0]]
+                    _last = _views[_idxs[-1]]
+                    _start = int(_first.storage_offset())
+                    _end = int(_last.storage_offset()) + int(_last.shape[1])
+                    _slices.append([_start, _end - _start])
+                import json as _json
+                import os as _os
+
+                _sc = f"/dev/shm/vllm_offload_{self._engine_id}.layout.json"
+                _tmp = _sc + ".tmp"
+                with open(_tmp, "w") as _f:
+                    _json.dump({"group_slices": _slices}, _f)
+                _os.replace(_tmp, _sc)
+                logger.info("DSPARK layout sidecar written: %s %s", _sc, _slices)
+            except Exception as _e:  # noqa: BLE001
+                logger.warning("DSPARK layout sidecar failed: %s", _e)
+
+            import os as _skip_os
+            _pread_skip = _skip_os.environ.get("DSPARK_FS_PREAD_SKIP") == "1"
 
             def _fs_submit_load(job_id, src_spec, dst_spec):
                 entries = getattr(src_spec, "fs_paths", None)
+                # [load-error-recompute] staging chunk block ids whose fs
+                # pread failed in this job (zero-filled below); mapped to
+                # GPU blocks and reported before submitting the job.
+                _failed_cpu_bids = set()
                 # DSPARK_RELAY_RESTORE (experimental, opt-in, default off):
                 # one rank reads the canonical files, then broadcasts the loaded
                 # bytes to the other TP ranks over the process group interconnect.
@@ -436,63 +613,56 @@ class TieringOffloadingSpec(CPUOffloadingSpec):
                             _is_src, len(_items), _total,
                         )
                         return _orig_submit_load(job_id, src_spec, dst_spec)
-                logger.debug(
-                    "wk_load job=%s spec=%s fs=%s",
-                    job_id,
-                    type(src_spec).__name__,
+                logger.info(
+                    "DSPARK wk_load job=%s spec=%s fs=%s",
+                    job_id, type(src_spec).__name__,
                     len(entries) if entries else None,
                 )
                 if entries and _pread_skip:
-                    logger.debug(
-                        "fs-direct preads skipped (head node): %d",
-                        sum(1 for _e in entries if _e),
-                    )
+                    # head node: the scheduler already filled this mmap during
+                    # promotion; the worker-direct pread would be a duplicate.
+                    logger.info("DSPARK fs-direct preads skipped (head): %d",
+                                sum(1 for _e in entries if _e))
                     entries = None
-
-                n_pread_threads = _env_int("DSPARK_FS_PREAD_THREADS", 1)
-                if entries and n_pread_threads > 1:
-                    # Parallel windowed staging: read files on a small
-                    # threadpool (file I/O releases the GIL), stage a
-                    # bounded window of reads on the GPU, and synchronize
-                    # once per window instead of once per block. Peak extra
-                    # memory is window * per-block slice size, not the full
-                    # restore.
+                _pt = 1
+                try:
+                    _pt = int(_skip_os.environ.get("DSPARK_FS_PREAD_THREADS", "1") or 1)
+                except ValueError:
+                    _pt = 1
+                if entries and _pt > 1:
+                    # DSPARK S2a/b: parallel reads (GIL released) in bounded
+                    # windows, GPU-routed writes batched, one synchronize per
+                    # window. Memory bound = window * chunk slice (~16 * 16MB).
                     import torch as _t
+                    from concurrent.futures import ThreadPoolExecutor as _TPE
+                    try:
+                        _win = int(_skip_os.environ.get("DSPARK_FS_PREAD_WINDOW", "16") or 16)
+                    except ValueError:
+                        _win = 16
+                    _ex = getattr(_worker, "_dspark_pread_ex", None)
+                    if _ex is None:
+                        _ex = _worker._dspark_pread_ex = _TPE(
+                            max_workers=_pt, thread_name_prefix="fs_pread")
+                    _items = [(int(_bid) * _row + int(_ent[1]), _ent[0],
+                               int(_ent[2]))
+                              for _bid, _ent in zip(src_spec.block_ids, entries) if _ent]
 
-                    window = _env_int("DSPARK_FS_PREAD_WINDOW", 16)
-                    pool = getattr(_worker, "_dspark_pread_pool", None)
-                    if pool is None:
-                        pool = _worker._dspark_pread_pool = ThreadPoolExecutor(
-                            max_workers=n_pread_threads,
-                            thread_name_prefix="fs_pread",
-                        )
-                    items = [
-                        (int(_bid) * _row + int(_ent[1]), _ent[0],
-                         int(_ent[2]))
-                        for _bid, _ent in zip(src_spec.block_ids, entries)
-                        if _ent
-                    ]
-
-                    def _read_one(item):
-                        _off, _path, _ln = item
+                    def _read_one(_it):
                         try:
-                            with open(_path, "rb") as _f:
+                            with open(_it[1], "rb") as _f:
                                 return _f.read()
                         except OSError as _e:
-                            logger.warning(
-                                "fs direct read failed for %s: %s", _path, _e
-                            )
+                            logger.warning("fs direct read failed for %s: %s", _it[1], _e)
                             return None
 
                     _flat = _t.frombuffer(
-                        memoryview(worker_mmap.mmap_obj), dtype=_t.uint8
-                    )
-                    _n_read = 0
-                    for _i in range(0, len(items), window):
-                        _chunk = items[_i : _i + window]
-                        _datas = list(pool.map(_read_one, _chunk))
-                        _staged = []
-                        for (_off, _path, _ln), _data in zip(_chunk, _datas):
+                        memoryview(worker_mmap.mmap_obj), dtype=_t.uint8)
+                    _n = 0
+                    for _i in range(0, len(_items), _win):
+                        _chunk = _items[_i:_i + _win]
+                        _datas = list(_ex.map(_read_one, _chunk))
+                        _keep = []
+                        for (_off, _p, _ln), _data in zip(_chunk, _datas):
                             if _data is None or len(_data) != _ln:
                                 # This pread is the only source for this row
                                 # slice on this node, and the offloading
@@ -503,44 +673,32 @@ class TieringOffloadingSpec(CPUOffloadingSpec):
                                 # the range deterministically instead of
                                 # silently serving stale bytes as restored
                                 # KV.
-                                _why = (
-                                    "failed" if _data is None
-                                    else "short (%d bytes)" % len(_data)
-                                )
+                                _why = ("failed" if _data is None else
+                                        "short (%d bytes)" % len(_data))
                                 logger.error(
                                     "[relay-read-fail] fs pread %s for %s "
                                     "(want %d bytes); zero-filling range",
-                                    _why, _path, _ln,
-                                )
+                                    _why, _p, _ln)
                                 _z = _t.zeros(
-                                    _ln, dtype=_t.uint8, device="cuda"
-                                )
-                                _flat[_off : _off + _ln].copy_(_z)
-                                _staged.append(_z)
+                                    _ln, dtype=_t.uint8, device="cuda")
+                                _flat[_off:_off + _ln].copy_(_z)
+                                _keep.append(_z)
+                                # [load-error-recompute] slice offsets are
+                                # row-internal (< _row), so the row index
+                                # recovers the staging chunk block id.
+                                _failed_cpu_bids.add(_off // _row)
                                 continue
-                            # Route the write through the GPU: letting the
-                            # CPU dirty pinned pages that the device then
-                            # reads has produced Xid 13 channel errors on
-                            # GB10, so upload the file bytes and let device
-                            # DMA write them into the pinned mmap.
-                            _src_gpu = _t.frombuffer(
-                                bytearray(_data), dtype=_t.uint8
-                            ).cuda()
-                            _flat[_off : _off + len(_data)].copy_(_src_gpu)
-                            _staged.append(_src_gpu)
-                            _n_read += 1
+                            _src_gpu = _t.frombuffer(bytearray(_data), dtype=_t.uint8).cuda()
+                            _flat[_off:_off + len(_data)].copy_(_src_gpu)
+                            _keep.append(_src_gpu)
+                            _n += 1
                         _t.cuda.synchronize()
-                        del _staged, _datas
-                    logger.debug(
-                        "fs-direct preads (parallel x%d, window %d): %d",
-                        n_pread_threads,
-                        window,
-                        _n_read,
-                    )
+                        del _keep, _datas
+                    logger.info("DSPARK fs-direct preads (parallel x%d, win %d): %d",
+                                _pt, _win, _n)
                     entries = None
-
                 if entries:
-                    _n_read = 0
+                    _n = 0
                     import torch as _t
                     _flat = _t.frombuffer(
                         memoryview(worker_mmap.mmap_obj), dtype=_t.uint8
@@ -576,56 +734,48 @@ class TieringOffloadingSpec(CPUOffloadingSpec):
                             _z = _t.zeros(_ln, dtype=_t.uint8, device="cuda")
                             _flat[_off : _off + _ln].copy_(_z)
                             _t.cuda.synchronize()
+                            # [load-error-recompute]
+                            _failed_cpu_bids.add(int(_bid))
                             continue
-                        # Route the write through the GPU: letting the
-                        # CPU dirty pinned pages that the device then
-                        # reads has produced Xid 13 channel errors on
-                        # GB10, so upload the file bytes and let device
-                        # DMA write them into the pinned mmap.
+                        # GB10 Xid 13 우회: CPU가 더럽힌 pinned 페이지를
+                        # 디바이스가 읽으면 채널 오류 정황 — 파일 바이트를
+                        # GPU에 올렸다가 디바이스 DMA로 mmap에 쓰게 한다.
                         _src_gpu = _t.frombuffer(
                             bytearray(_data), dtype=_t.uint8
                         ).cuda()
                         _flat[_off : _off + len(_data)].copy_(_src_gpu)
                         _t.cuda.synchronize()
-                        _n_read += 1
-                    logger.debug("fs-direct preads: %d", _n_read)
+                        _n += 1
+                    logger.info("DSPARK fs-direct preads: %d", _n)
+                if _failed_cpu_bids:
+                    # [load-error-recompute] final defense line: report the
+                    # zero-filled ranges as failed GPU blocks so the core
+                    # scheduler (kv_load_failure_policy=recompute) truncates
+                    # the affected requests at the first bad block and
+                    # recomputes, instead of serving zero-filled KV as
+                    # restored context. Drained once per step by
+                    # OffloadingConnectorWorker.get_block_ids_with_load_errors.
+                    _gpu_failed = _dspark_failed_chunks_to_gpu_blocks(
+                        src_spec, dst_spec, self.blocks_per_chunk,
+                        _failed_cpu_bids)
+                    _errs = getattr(
+                        _worker, "_dspark_load_error_block_ids", None)
+                    if _errs is None:
+                        _errs = set()
+                        _worker._dspark_load_error_block_ids = _errs
+                    _errs.update(_gpu_failed)
+                    logger.error(
+                        "[load-error-recompute] job=%s failed_chunks=%d -> "
+                        "gpu_blocks=%d reported for recompute",
+                        job_id, len(_failed_cpu_bids), len(_gpu_failed))
                 return _orig_submit_load(job_id, src_spec, dst_spec)
 
             _worker.submit_load = _fs_submit_load
-
-            if self.config.canonical_layout:
-                # Canonical group-slice sidecar: derive each group's
-                # (row offset, length) from the canonical tensor views and
-                # persist it. The fs tier stores/loads exactly these
-                # true-byte slices, and the worker-direct pread path fills
-                # the same slices.
-                try:
-                    _views = worker_mmap._views
-                    _slices = []
-                    for _grefs in kv_caches.group_data_refs:
-                        _idxs = sorted({r.tensor_idx for r in _grefs})
-                        _first = _views[_idxs[0]]
-                        _last = _views[_idxs[-1]]
-                        _start = int(_first.storage_offset())
-                        _end = int(_last.storage_offset()) + int(_last.shape[1])
-                        _slices.append([_start, _end - _start])
-                    import json as _json
-                    import os as _os
-
-                    _sc = f"/dev/shm/vllm_offload_{self._engine_id}.layout.json"
-                    _tmp = _sc + ".tmp"
-                    with open(_tmp, "w") as _f:
-                        _json.dump({"group_slices": _slices}, _f)
-                    _os.replace(_tmp, _sc)
-                    logger.info(
-                        "KV offload layout sidecar written: %s %s", _sc, _slices
-                    )
-                except Exception as _e:  # noqa: BLE001
-                    logger.warning(
-                        "KV offload layout sidecar write failed: %s", _e
-                    )
             return _worker
         except Exception:
+            import traceback
+            print("DSPARK_COMPACT_DEBUG create_worker exception:", flush=True)
+            traceback.print_exc()
             worker_mmap.cleanup()
             raise
 

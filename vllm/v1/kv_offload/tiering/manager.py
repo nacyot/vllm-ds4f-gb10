@@ -224,10 +224,9 @@ class TieringOffloadingManager(OffloadingManager):
             SecondaryTierManager, dict[str, PendingPromotion]
         ] = {}
 
-        # Compact packed multi-node: keys promoted from the fs tier. A
-        # promotion only writes the scheduler node's mmap, so loads of
-        # these keys carry the file path and each worker preads the shared
-        # fs directly to fill its own mmap.
+        # DSPARK compact 멀티노드: fs에서 승격된 키 추적. 승격은 스케줄러
+        # 노드의 mmap에만 써지므로, 이 키들의 로드에는 파일 경로를 첨부해
+        # 각 워커가 공유 fs에서 직접 읽어 자기 mmap을 채우게 한다.
         # LRU-bounded (was an unbounded, never-pruned set that also
         # permanently rerouted every load of a once-promoted key through
         # the fs-path attach). Bounding is safe: evicting an entry only
@@ -255,6 +254,14 @@ class TieringOffloadingManager(OffloadingManager):
         except ValueError:
             self._primfull_retry_cap = 300
 
+        # [load-error-recompute] keys whose staging bytes were destroyed
+        # by a failed worker-side load (zero-fill fallback). lookup()
+        # treats them as MISS so the scheduler recomputes instead of
+        # re-offering the same failing chunks forever (retry livelock).
+        # An entry lifts itself once the garbage staging block is gone
+        # (see lookup), after which a fresh store may legitimately
+        # re-offer the key.
+        self._dspark_poisoned_keys: set = set()
         self._fs_promoted_keys: "dict" = _OD()
         try:
             _cap = int(
@@ -333,12 +340,64 @@ class TieringOffloadingManager(OffloadingManager):
                     )
                     if completed_job.success and hasattr(tier, "file_mapper"):
                         self._note_fs_promoted(job_metadata.keys)
+                    if not completed_job.success:
+                        # [load-error-recompute-p60] engine-side promotion
+                        # failed. complete_write(success=False) above already
+                        # released the staging blocks; now ride the recompute
+                        # report path (poison + lookup-cache invalidation).
+                        self._dspark_fail_promotion(tier, job_metadata)
                 else:
                     # primary→secondary transfer completed.
                     # Decrement ref_cnt on primary blocks.
                     self.primary_tier.complete_read(
                         job_metadata.keys, job_metadata.req_context
                     )
+
+    def _dspark_fail_promotion(self, tier, job_metadata) -> None:
+        """[load-error-recompute-p60] Handle a FAILED secondary->primary
+        promotion job (fs load error: FileNotFoundError, short-read EIO,
+        any OSError -- the thread pool completes them all as
+        success=False).
+
+        The staging blocks are already released by
+        complete_write(success=False), so nothing stays load-pinned; what
+        remains broken without this handler is the report path: the fs
+        tier's AsyncLookupManager cache was populated while the (possibly
+        truncated) file still existed, and the short-read unlink policy
+        never invalidates it, so lookup() keeps answering HIT and the
+        scheduler re-promotes the same failing chunk every step -- the
+        request parks in WAITING forever (silent retry livelock, E1
+        2026-08-28 03:15, 8487 resubmits in 8 min).
+
+        Fix: (1) poison the keys so TieringOffloadingManager.lookup()
+        answers MISS and the scheduler recomputes (same mechanism as the
+        worker-side patch_40/41 wiring; the poison self-lifts on the next
+        lookup because the staging block is already gone, see lookup());
+        (2) invalidate the tier's cached lookup state so the stale HIT
+        cannot re-offer the keys after the poison self-lifts.
+        """
+        keys = list(job_metadata.keys)
+        self._dspark_poisoned_keys.update(keys)
+        for _k in keys:
+            self._fs_promoted_keys.pop(_k, None)
+        _invalidate = getattr(tier, "dspark_invalidate_lookup", None)
+        if _invalidate is not None:
+            try:
+                _invalidate(keys)
+            except Exception:
+                logger.exception(
+                    "[load-error-recompute] lookup-cache invalidation "
+                    "failed on tier %s",
+                    tier.tier_type,
+                )
+        logger.error(
+            "[load-error-recompute] promotion job %d failed on tier %s: "
+            "poisoned %d chunk keys for recompute (req=%s)",
+            job_metadata.job_id,
+            tier.tier_type,
+            len(keys),
+            getattr(job_metadata.req_context, "req_id", None),
+        )
 
     @override
     def primary_capacity_blocks(self) -> int:
@@ -398,6 +457,19 @@ class TieringOffloadingManager(OffloadingManager):
 
         req_state = self._req_state.get(req_context.req_id)
 
+        # [load-error-recompute] Poisoned keys (staging bytes destroyed by
+        # a failed worker load) must not be offered again: report MISS so
+        # the scheduler recomputes. Self-lift: once the garbage block is
+        # gone from the primary tier (evicted), drop the poison so a
+        # later fresh store can re-offer the key.
+        if self._dspark_poisoned_keys and key in self._dspark_poisoned_keys:
+            if (
+                self.primary_tier.lookup(key, req_context)
+                is LookupResult.MISS
+            ):
+                self._dspark_poisoned_keys.discard(key)
+            return LookupResult.MISS
+
         primary_hit = self.primary_tier.lookup(key, req_context)
         if primary_hit is LookupResult.HIT:
             return LookupResult.HIT
@@ -440,9 +512,8 @@ class TieringOffloadingManager(OffloadingManager):
                     and req_state.secondary_lookup_start_time is None
                 ):
                     req_state.secondary_lookup_start_time = lookup_start
-                # Backport of #51840: return HIT_PENDING when a promotion
-                # was triggered -- the request keeps progressing while
-                # promotion, load and release drain as a pipeline.
+                # 업스트림 #51840 백포트: 승격 트리거 시 HIT_PENDING —
+                # 요청이 진행하며 승격→로드→해제가 파이프라인으로 드레인된다.
                 if not promoted:
                     _dspark_trace("primfull_miss", req_context.req_id, key)
                     # DSPARK: the chunk file EXISTS on disk; only the primary
@@ -573,7 +644,27 @@ class TieringOffloadingManager(OffloadingManager):
                     req_context=entry.req_context,
                 )
                 self._transfer_jobs[job_id] = job_metadata
-                tier.submit_load(job_metadata)
+                # [load-error-recompute-p60] a submit-time failure must
+                # complete the job as failed: otherwise the exception
+                # escapes on_schedule_end() (engine crash) or leaks a
+                # never-finishing job whose staging blocks stay
+                # write-pinned forever. This engine-side path has no TP
+                # collectives (unlike the worker connector submit path),
+                # so swallowing here cannot desync ranks.
+                try:
+                    tier.submit_load(job_metadata)
+                except Exception:
+                    logger.exception(
+                        "[load-error-recompute] submit_load failed on "
+                        "tier %s job %d; synthesizing failed completion",
+                        tier.tier_type,
+                        job_id,
+                    )
+                    self._transfer_jobs.pop(job_id, None)
+                    self.primary_tier.complete_write(
+                        job_metadata.keys, job_metadata.req_context, False
+                    )
+                    self._dspark_fail_promotion(tier, job_metadata)
 
         self._pending_load_submissions.clear()
 
@@ -610,6 +701,10 @@ class TieringOffloadingManager(OffloadingManager):
                     else None
                     for k in keys
                 ]
+                import logging as _lg
+                _lg.getLogger(__name__).info(
+                    "DSPARK prep_load keys=%d promoted_hits=%d",
+                    len(list(keys)), sum(1 for p in paths if p is not None))
                 if any(p is not None for p in paths):
                     spec.fs_paths = paths  # type: ignore[attr-defined]
         return spec

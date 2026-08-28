@@ -99,6 +99,9 @@ class GroupOffloadConfig(NamedTuple):
     # than the MLA full-attention group).
     # None for full-attention groups or when the optimization doesn't apply.
     alignment_chunk_count: int | None = None
+    # DSPARK tail-only: g0 정렬 세그먼트 크기(이 그룹 청크 단위) —
+    # 윈도우>=세그먼트라 alignment_chunk_count가 None인 그룹에도 앵커 제공.
+    anchor_chunk_count: int | None = None
     # True for EAGLE/MTP draft-model attention groups. The trailing chunk
     # of these groups is volatile and lacks a stable hash, so it must
     # be excluded from store and load scheduling.
@@ -126,8 +129,26 @@ def is_store_reachable_swa_chunk(
     alignment_chunk_count: int | None,
     sliding_window_chunks: int | None,
     is_eagle_group: bool,
+    tail_only: bool = False,
+    anchor_chunk_count: int | None = None,
 ) -> bool:
     """Return whether an SWA chunk can participate in an external-cache hit."""
+    if tail_only:
+        # 최종 꼬리만 저장하되, 앵커는 마지막 g0 정렬 경계다 —
+        # 재접근은 디코드 텍스트 재토크나이즈로 끝부분 해시가 어궸나므로
+        # 분기점 이전(정렬 경계)에서 윈도우 런이 맞아야 한다.
+        if sliding_window_chunks is None:
+            return True
+        tail = sliding_window_chunks + int(is_eagle_group)
+        if anchor_chunk_count:
+            anchor = (storable_chunk_count // anchor_chunk_count) * anchor_chunk_count
+        else:
+            anchor = storable_chunk_count
+        # 앵커 앞 윈도우 + 날자로 끝 꼬리(정확 연장 대비) 둘 다 허용.
+        return (
+            anchor - tail <= absolute_chunk_index < anchor
+            or absolute_chunk_index >= storable_chunk_count - tail
+        )
     if alignment_chunk_count is None:
         return True
     assert sliding_window_chunks is not None
@@ -138,6 +159,44 @@ def is_store_reachable_swa_chunk(
     )
     reachable_tail = sliding_window_chunks + int(is_eagle_group)
     return position_in_segment >= actual_segment_length - reachable_tail
+
+
+# NODE3_TAILONLY_FIX F1
+def is_store_anchor_now_swa_chunk(
+    absolute_chunk_index: int,
+    final_prompt_chunks: int,
+    anchor_chunk_count: int | None,
+    sliding_window_chunks: int | None,
+    is_eagle_group: bool,
+    checkpoint_chunks: int | None = None,
+) -> bool:
+    """DSPARK_TAIL_ONLY=2 (anchor-now).
+
+    유예 없이, 프롬프트의 마지막 완전 g0 정렬 경계(prompt_anchor) 직전 w(+e)
+    청크와, 선택적 체크포인트 경계(checkpoint_chunks 배수, g0 경계에 정렬)
+    직전 w(+e) 청크만 통과시킨다. 조회(_sliding_window_lookup)는 g0 경계에
+    정렬된 슬라이스 끝에서 역방향 w 런을 찾으므로 이 집합만으로 전장 히트가
+    성립한다. 청크는 계산된 스텝에 판정되므로 GPU 블록이 살아 있고 기존
+    flush 보호를 받는다(유예 방식의 구멍 문제 없음).
+    """
+    if sliding_window_chunks is None:
+        return True
+    a = anchor_chunk_count or 1
+    tail = sliding_window_chunks + int(is_eagle_group)
+    prompt_anchor = (final_prompt_chunks // a) * a
+    ckpt = checkpoint_chunks or 0
+    if ckpt:
+        ckpt = max(a, (ckpt // a) * a)
+    for boundary in range(
+        absolute_chunk_index + 1, absolute_chunk_index + tail + 1
+    ):
+        if boundary % a:
+            continue
+        if boundary > 0 and boundary == prompt_anchor:
+            return True
+        if ckpt and boundary % ckpt == 0:
+            return True
+    return False
 
 
 def resolve_mamba_align_size(
@@ -165,6 +224,10 @@ class SchedulerOffloadConfig(NamedTuple):
     blocks_per_chunk: int
     num_workers: int
     offload_prompt_only: bool
+    tail_only: bool = False
+    anchor_now: bool = False  # NODE3_TAILONLY_FIX F2
+    anchor_ckpt_tokens: int = 0
+    anchor_tokens_override: int = 0
 
     @classmethod
     def from_spec(
@@ -227,7 +290,33 @@ class SchedulerOffloadConfig(NamedTuple):
                 sorted(eagle_groups),
             )
 
-        return cls(
+        import os as _os
+        _tail_only = _os.environ.get("DSPARK_TAIL_ONLY") == "1"
+        _anchor_now = _os.environ.get("DSPARK_TAIL_ONLY") == "2"  # NODE3_TAILONLY_FIX F3
+        _anchor_ckpt_tokens = int(
+            _os.environ.get("DSPARK_TAIL_CKPT_TOKENS", "0") or 0
+        )
+        _anchor_tokens_override = int(
+            _os.environ.get("DSPARK_TAIL_ANCHOR_TOKENS", "0") or 0
+        )
+        if _anchor_now:
+            logger.info(
+                "KV offloading: DSPARK anchor-now store enabled (TAIL_ONLY=2) — "
+                "window groups store only the w(+e) chunks before the prompt's "
+                "last full-attention-aligned boundary (ckpt_tokens=%d), "
+                "decided at compute time (no deferral). anchor_tokens_override=%d",
+                _anchor_ckpt_tokens, _anchor_tokens_override,
+            )
+        if _tail_only:
+            logger.info(
+                "KV offloading: DSPARK tail-only store enabled — window/state "
+                "groups store only the final window at request finish."
+            )
+        _n3_cfg = cls(  # NODE3_TAILONLY_INSTR
+            tail_only=_tail_only,
+            anchor_now=_anchor_now,  # NODE3_TAILONLY_FIX F3b
+            anchor_ckpt_tokens=_anchor_ckpt_tokens,
+            anchor_tokens_override=_anchor_tokens_override,
             num_workers=vllm_config.parallel_config.world_size,
             kv_group_configs=tuple(
                 GroupOffloadConfig(
@@ -247,6 +336,16 @@ class SchedulerOffloadConfig(NamedTuple):
                     alignment_chunk_count=_alignment_chunk_count(
                         tokens_per_block * spec.blocks_per_chunk, sw
                     ),
+                    anchor_chunk_count=(
+                        alignment_tokens // (tokens_per_block * spec.blocks_per_chunk)
+                        if (
+                            sw is not None
+                            and alignment_tokens is not None
+                            and alignment_tokens
+                            >= tokens_per_block * spec.blocks_per_chunk
+                        )
+                        else None
+                    ),
                     kv_event_group_spec=get_offloading_event_group_spec(
                         kv_cache_config.kv_cache_groups[idx]
                     ),
@@ -257,6 +356,18 @@ class SchedulerOffloadConfig(NamedTuple):
             blocks_per_chunk=spec.blocks_per_chunk,
             offload_prompt_only=spec.offload_prompt_only,
         )
+        # NODE3_TAILONLY_INSTR I1
+        for _g in _n3_cfg.kv_group_configs:
+            logger.info(
+                "kvoff groupcfg g=%d tokens_per_block=%d tokens_per_chunk=%d "
+                "sw_chunks=%s align_chunks=%s anchor_chunks=%s eagle=%s "
+                "alignment_tokens=%s tail_only=%s blocks_per_chunk=%d",
+                _g.group_idx, _g.tokens_per_block, _g.tokens_per_chunk,
+                _g.sliding_window_size_in_chunks, _g.alignment_chunk_count,
+                _g.anchor_chunk_count, _g.is_eagle_group, alignment_tokens,
+                _tail_only, spec.blocks_per_chunk,
+            )
+        return _n3_cfg
 
 
 @dataclass
@@ -359,6 +470,15 @@ class RequestOffloadState:
         is_decoding = num_offloadable_tokens > self.req.num_prompt_tokens
         if group_config.is_eagle_group and is_decoding:
             num_chunks = max(0, num_chunks - 1)
+        # DSPARK tail-only: 윈도우/상태 그룹은 종료 전엔 새 storable 없음
+        # (next_stored_chunk_idx를 동결해 종료 시 [동결점, N) 전체가 후보로
+        # 남고, 도달성 필터가 최종 꼬리만 통과시킨다).
+        if (
+            self.config.tail_only
+            and group_config.sliding_window_size_in_chunks is not None
+            and not self.req.is_finished()
+        ):
+            return group_state.next_stored_chunk_idx
         num_allocated_chunks = (
             len(group_state.block_ids) // self.config.blocks_per_chunk
         )
@@ -456,6 +576,11 @@ class OffloadingConnectorScheduler:
             spec, vllm_config, kv_cache_config
         )
         self.manager: OffloadingManager = spec.get_manager()
+        # [load-error-recompute] load job_id -> dst GPU block ids, used to
+        # translate worker-reported invalid_block_ids back to the offload
+        # keys that must stop being offered (poison; see
+        # update_connector_output). Entries are dropped on job completion.
+        self._dspark_load_job_dst_blocks: dict[int, set[int]] = {}
         self._connector_stats = OffloadingConnectorStats()
 
         full_attention_groups: list[int] = []
@@ -775,6 +900,14 @@ class OffloadingConnectorScheduler:
                         required_window,
                         req_status.req_context,
                     )
+                if num_hit_chunks is not None:  # NODE3_TAILONLY_INSTR I3
+                    logger.info(
+                        "kvoff lookup req=%s g=%d start=%d end=%d hits=%s "
+                        "maxhit=%d computed=%d",
+                        req_status.req.request_id, group_idx, start_chunk_idx,
+                        num_chunks, num_hit_chunks, max_hit_size_tokens,
+                        num_computed_tokens,
+                    )
                 if num_hit_chunks == 0:
                     return 0
 
@@ -1051,6 +1184,10 @@ class OffloadingConnectorScheduler:
             src_spec=src_spec,
             dst_spec=dst_spec,
         )
+        # [load-error-recompute]
+        self._dspark_load_job_dst_blocks[load_job_id] = {
+            int(b) for b in dst_block_ids
+        }
         # a load can only be issued when no other jobs are pending.
         assert not req_status.transfer_jobs
         req_status.transfer_jobs.add(load_job_id)
@@ -1212,12 +1349,14 @@ class OffloadingConnectorScheduler:
                 ]
                 assert len(offload_keys) == len(offload_block_ids)
 
+                _n3_hole = _n3_unreach = _n3_kept = 0  # NODE3_TAILONLY_INSTR I2
                 for key_idx, (offload_key, block_id) in enumerate(
                     zip(offload_keys, offload_block_ids)
                 ):
                     if block_id == 0:
+                        _n3_hole += 1
                         continue
-                    # Compact packed: skip chunks with interior zeroed blocks
+                    # DSPARK compact: skip chunks with interior zeroed blocks
                     # (stale SWA entries). Partial chunks violate the
                     # GPULoadStoreSpec contiguity contract and desync the
                     # scheduler chunk allocation from the worker block math.
@@ -1226,6 +1365,7 @@ class OffloadingConnectorScheduler:
                         _ck * blocks_per_chunk : (_ck + 1) * blocks_per_chunk
                     ]
                     if len(_cb) < blocks_per_chunk or 0 in _cb:
+                        _n3_hole += 1
                         continue
                     # Skip SWA chunks that can never serve a load hit:
                     # within each full-attention alignment segment, only the
@@ -1233,15 +1373,48 @@ class OffloadingConnectorScheduler:
                     # reachable. EAGLE/MTP requires one additional chunk that
                     # lookup later drops as its volatile draft tail.
                     abs_chunk_idx = start_chunk_idx + key_idx
-                    if not is_store_reachable_swa_chunk(
-                        abs_chunk_idx,
-                        num_chunks,
-                        group_config.alignment_chunk_count,
-                        group_config.sliding_window_size_in_chunks,
-                        group_config.is_eagle_group,
-                    ):
+                    if self.config.anchor_now:  # NODE3_TAILONLY_FIX F4
+                        _reach = is_store_anchor_now_swa_chunk(
+                            abs_chunk_idx,
+                            req.num_prompt_tokens // group_config.tokens_per_chunk,
+                            (
+                                self.config.anchor_tokens_override
+                                // group_config.tokens_per_chunk
+                                if self.config.anchor_tokens_override
+                                else group_config.anchor_chunk_count
+                            ),
+                            group_config.sliding_window_size_in_chunks,
+                            group_config.is_eagle_group,
+                            checkpoint_chunks=(
+                                self.config.anchor_ckpt_tokens
+                                // group_config.tokens_per_chunk
+                            ),
+                        )
+                    else:
+                        _reach = is_store_reachable_swa_chunk(
+                            abs_chunk_idx,
+                            num_chunks,
+                            group_config.alignment_chunk_count,
+                            group_config.sliding_window_size_in_chunks,
+                            group_config.is_eagle_group,
+                            tail_only=self.config.tail_only,
+                            anchor_chunk_count=group_config.anchor_chunk_count,
+                        )
+                    if not _reach:
+                        _n3_unreach += 1
                         continue
+                    _n3_kept += 1
                     new_offload_keys.append(offload_key)
+                if req.is_finished():  # NODE3_TAILONLY_INSTR I2 log
+                    logger.info(
+                        "kvoff swa-finish req=%s g=%d sw=%s next=%d nchunks=%d "
+                        "cand=%d hole=%d unreach=%d kept=%d ntok=%d nblk=%d",
+                        req_id, group_config.group_idx,
+                        group_config.sliding_window_size_in_chunks,
+                        start_chunk_idx, num_chunks, len(offload_keys),
+                        _n3_hole, _n3_unreach, _n3_kept,
+                        num_offloadable_tokens, len(group_state.block_ids),
+                    )
 
             if not new_offload_keys:
                 req_status.advance_stored_idx(num_offloadable_tokens)
@@ -1504,6 +1677,47 @@ class OffloadingConnectorScheduler:
             connector_output (KVConnectorOutput): the worker-side
                 connectors output.
         """
+        # [load-error-recompute] Worker-reported KV load failures: the core
+        # scheduler recomputes the affected GPU blocks, but the offload
+        # metadata still claims the chunks are stored, so an unchanged
+        # lookup would re-offer the same failing chunks and the request
+        # would retry forever. Poison the keys of every in-flight load job
+        # that overlaps the invalid GPU blocks: lookup() then MISSes them
+        # (patch_41) and fs_paths are no longer attached. Job granularity
+        # over-poisons; the only cost is extra recompute.
+        invalid_block_ids = getattr(connector_output, "invalid_block_ids", None)
+        if invalid_block_ids and self._dspark_load_job_dst_blocks:
+            for job_id, dst_blocks in list(
+                self._dspark_load_job_dst_blocks.items()
+            ):
+                overlap = invalid_block_ids.intersection(dst_blocks)
+                if not overlap:
+                    continue
+                job_status = self._jobs.get(job_id)
+                if job_status is not None and not job_status.is_store:
+                    poisoned = getattr(
+                        self.manager, "_dspark_poisoned_keys", None
+                    )
+                    if poisoned is None:
+                        poisoned = set()
+                        self.manager._dspark_poisoned_keys = poisoned
+                    poisoned.update(job_status.keys)
+                    promoted = getattr(
+                        self.manager, "_fs_promoted_keys", None
+                    )
+                    if promoted is not None:
+                        for k in job_status.keys:
+                            promoted.pop(k, None)
+                    logger.error(
+                        "[load-error-recompute] load job %d overlaps %d "
+                        "invalid GPU blocks; poisoned %d offloaded chunks "
+                        "(lookup will MISS them; recompute re-fills)",
+                        job_id,
+                        len(overlap),
+                        len(job_status.keys),
+                    )
+                # poison at most once per job
+                del self._dspark_load_job_dst_blocks[job_id]
         meta = connector_output.kv_connector_worker_meta
         if not isinstance(meta, OffloadingWorkerMetadata):
             assert meta is None
@@ -1571,6 +1785,7 @@ class OffloadingConnectorScheduler:
                         job_id, job_status.non_sliding_window_block_ids
                     )
 
+            self._dspark_load_job_dst_blocks.pop(job_id, None)
             del self._jobs[job_id]
             req_status.transfer_jobs.remove(job_id)
             if req_status.finished_signaled and not req_status.transfer_jobs:
@@ -1678,6 +1893,7 @@ class OffloadingConnectorScheduler:
         # Discard jobs and save job_counter to be able to discard worker responses
         self._stale_job_threshold = self._job_counter
         self._jobs.clear()
+        self._dspark_load_job_dst_blocks.clear()
         self._block_id_to_pending_jobs.clear()
         self._promotion_owners.clear()
         self._pending_finish_stores.clear()

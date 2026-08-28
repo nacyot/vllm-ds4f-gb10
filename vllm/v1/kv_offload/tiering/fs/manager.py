@@ -17,10 +17,8 @@ File naming:  <base_path>_r<rank>/<hhh>/<hh>_g<group_idx>/<hash_hex>.bin
 
 import functools
 import json
-import math
 import os
-from collections.abc import Collection, Iterable
-from concurrent.futures import ThreadPoolExecutor
+from collections.abc import Iterable
 from typing import TYPE_CHECKING, ClassVar
 
 try:
@@ -63,14 +61,11 @@ if TYPE_CHECKING:
 
 logger = init_logger(__name__)
 
-# Per-event KV offload JSONL log (env-gated; no-op when DSPARK_KV_EVENT_LOG
-# is unset).
+# DSPARK: per-event KV offload JSONL log (env-gated, no-op when unset)
 import json as _ev_json
 import os as _ev_os
 import time as _ev_time
-
 _EV_PATH = _ev_os.environ.get("DSPARK_KV_EVENT_LOG")
-
 
 def _kv_event(rec):
     if not _EV_PATH:
@@ -83,39 +78,18 @@ def _kv_event(rec):
         pass
 
 
-def _env_int(name: str, default: int = 1) -> int:
+def _env_int(name, default=1):
     try:
-        return int(os.environ.get(name, "") or default)
+        v = int(_ev_os.environ.get(name, "") or default)
     except ValueError:
-        return default
+        v = default
+    return v
 
-
-# Fan the store/load batch across a small threadpool. Both paths are
-# I/O-bound (CIFS/NFS round trips or O_DIRECT reads release the GIL), so
-# splitting one large batch across DSPARK_FS_{LOAD,STORE}_TASKS threads
-# shortens wall time without changing what gets read or written. Default
-# 1 = a single task, i.e. today's behavior.
 _FS_LOAD_TASKS = _env_int("DSPARK_FS_LOAD_TASKS", 1)
 _FS_STORE_TASKS = _env_int("DSPARK_FS_STORE_TASKS", 1)
 
 
-def _fanout_tasks(fn, paths, view, offs, sizes, use_o_direct, fan):
-    """Split one batch into up to `fan` tasks, each a partial over a slice."""
-    if fan <= 1 or len(paths) <= 1:
-        return [functools.partial(fn, paths, view, offs, sizes, use_o_direct)]
-    n = len(paths)
-    per = max(1, math.ceil(n / fan))
-    tasks = []
-    for i in range(0, n, per):
-        sl = slice(i, i + per)
-        sz = sizes[sl] if isinstance(sizes, list) else sizes
-        tasks.append(
-            functools.partial(fn, paths[sl], view, offs[sl], sz, use_o_direct)
-        )
-    return tasks
-
-
-def _keys_hex(keys) -> list[str]:
+def _keys_hex(keys):
     out = []
     for k in keys:
         try:
@@ -126,8 +100,24 @@ def _keys_hex(keys) -> list[str]:
 
 
 def _req_id(job_metadata):
-    req_context = getattr(job_metadata, "req_context", None)
-    return getattr(req_context, "req_id", None) if req_context is not None else None
+    rc = getattr(job_metadata, "req_context", None)
+    return getattr(rc, "req_id", None) if rc is not None else None
+
+
+def _fanout_tasks(fn, paths, view, offs, sizes, use_o_direct, fan):
+    """Split one batch into up to `fan` tasks (each a partial over a slice)."""
+    import functools as _ft
+    import math as _math
+    n = len(paths)
+    if fan <= 1 or n <= 1:
+        return [_ft.partial(fn, paths, view, offs, sizes, use_o_direct)]
+    per = max(1, _math.ceil(n / fan))
+    tasks = []
+    for i in range(0, n, per):
+        sl = slice(i, i + per)
+        sz = sizes[sl] if isinstance(sizes, list) else sizes
+        tasks.append(_ft.partial(fn, paths[sl], view, offs[sl], sz, use_o_direct))
+    return tasks
 
 
 class FsAsyncLookupManager(AsyncLookupManager):
@@ -145,39 +135,36 @@ class FsAsyncLookupManager(AsyncLookupManager):
         self, keys: list[OffloadKey], req_context: ReqContext
     ) -> Iterable[bool]:
         paths = [self._tier.file_mapper.get_file_name(k) for k in keys]
-        # Existence checks are latency-bound (network filesystem metadata
-        # round trips), not CPU-bound: split the stat batch across
-        # DSPARK_FS_LOOKUP_THREADS threads (env-gated, default 1 = today's
-        # single-thread behavior).
-        n_threads = _env_int("DSPARK_FS_LOOKUP_THREADS", 1)
-        t0 = _ev_time.time()
-        if n_threads > 1 and len(paths) >= 2 * n_threads:
-            pool = getattr(self, "_lookup_pool", None)
-            if pool is None:
-                pool = self._lookup_pool = ThreadPoolExecutor(
-                    max_workers=n_threads, thread_name_prefix="fs_lookup"
-                )
-            fn = (
-                (lambda ps: list(batch_lookup_C(ps)))
-                if _HAS_BATCH_LOOKUP_C
+        # DSPARK S3: split the stat batch across threads (C path releases the
+        # GIL; CIFS metadata round trips are latency-bound, not CPU-bound).
+        n_thr = _env_int("DSPARK_FS_LOOKUP_THREADS", 1)
+        _t0 = _ev_time.time()
+        if n_thr > 1 and len(paths) >= 2 * n_thr:
+            import math as _math
+            from concurrent.futures import ThreadPoolExecutor as _TPE
+            ex = getattr(self, "_dspark_lookup_ex", None)
+            if ex is None:
+                ex = self._dspark_lookup_ex = _TPE(max_workers=n_thr,
+                                                   thread_name_prefix="fs_lookup")
+            per = _math.ceil(len(paths) / n_thr)
+            fn = (lambda ps: list(batch_lookup_C(ps))) if _HAS_BATCH_LOOKUP_C \
                 else (lambda ps: [os.path.exists(p) for p in ps])
-            )
-            per = math.ceil(len(paths) / n_threads)
-            futures = [
-                pool.submit(fn, paths[i : i + per])
-                for i in range(0, len(paths), per)
-            ]
+            futs = [ex.submit(fn, paths[i:i + per]) for i in range(0, len(paths), per)]
             results = []
-            for fut in futures:
-                results.extend(fut.result())
-        elif _HAS_BATCH_LOOKUP_C:
+            for f in futs:
+                results.extend(f.result())
+            _kv_event({"op": "lookup_batch", "n": len(paths),
+                       "hit": sum(1 for r in results if r), "threads": n_thr,
+                       "dt": round(_ev_time.time() - _t0, 3)})
+            return results
+        if _HAS_BATCH_LOOKUP_C:
             # C extension: GIL released for the entire faccessat() batch.
             results = list(batch_lookup_C(paths))
         else:
             results = [os.path.exists(p) for p in paths]
         _kv_event({"op": "lookup_batch", "n": len(paths),
-                   "hit": sum(1 for r in results if r), "threads": n_threads,
-                   "dt": round(_ev_time.time() - t0, 3)})
+                   "hit": sum(1 for r in results if r), "threads": 1,
+                   "dt": round(_ev_time.time() - _t0, 3)})
         return results
 
 
@@ -252,10 +239,8 @@ class FileSystemTierManager(SecondaryTierManager):
             "primary_kv_view.strides cannot be None"
         )
         self._block_size: int = primary_kv_view.strides[0]
-
-        # Compact packed: when the worker left a canonical-layout sidecar,
-        # store/load only each group's true-byte slice; otherwise fall back
-        # to whole staging rows (legacy layout).
+        # DSPARK compact: 워커가 남긴 canonical 레이아웃 사이드카가 있으면
+        # 그룹 슬라이스(참바이트)만 저장/로드한다. 없으면 행 통짜(레거시).
         self._group_slices: list | None = None
         self._layout_path: str | None = None
 
@@ -307,6 +292,7 @@ class FileSystemTierManager(SecondaryTierManager):
             return LookupResult.RETRY
         return LookupResult.HIT if result else LookupResult.MISS
 
+    @override
     def _maybe_load_layout(self) -> None:
         if self._group_slices is not None or not self._layout_path:
             return
@@ -375,33 +361,26 @@ class FileSystemTierManager(SecondaryTierManager):
         s0, ln = self._group_slices[get_offload_group_idx(key)]
         return (path, s0, ln)
 
-    @override
     def submit_store(self, job_metadata: JobMetadata) -> None:
         if self.events is not None:
             self._store_job_keys[job_metadata.job_id] = list(job_metadata.keys)
-        keys = list(job_metadata.keys)
-        paths = [self.file_mapper.get_file_name(key) for key in keys]
-        offs, sizes = self._key_offsets_sizes(keys, job_metadata.block_ids)
-        tasks = _fanout_tasks(
-            batch_store_block, paths, self._primary_kv_view, offs, sizes,
-            self._use_o_direct, _FS_STORE_TASKS,
-        )
-        _kv_event({
-            "op": "store",
-            "job": job_metadata.job_id,
-            "chunks": len(keys),
-            "tasks": len(tasks),
-            "req": _req_id(job_metadata),
-            "bytes": sum(sizes) if isinstance(sizes, list) else sizes * len(keys),
-            "keys": _keys_hex(keys),
-        })
+        _keys = list(job_metadata.keys)
+        _paths = [self.file_mapper.get_file_name(key) for key in _keys]
+        _offs, _sizes = self._key_offsets_sizes(_keys, job_metadata.block_ids)
+        tasks = _fanout_tasks(batch_store_block, _paths, self._primary_kv_view,
+                              _offs, _sizes, self._use_o_direct, _FS_STORE_TASKS)
+        _kv_event({"op": "store", "job": job_metadata.job_id,
+                   "chunks": len(_keys), "tasks": len(tasks),
+                   "req": _req_id(job_metadata),
+                   "bytes": (sum(_sizes) if isinstance(_sizes, list) else _sizes * len(_keys)),
+                   "keys": _keys_hex(_keys)})
         self._pool.enqueue_store(job_metadata.job_id, len(tasks), tasks)
 
     @override
     def submit_load(self, job_metadata: JobMetadata) -> None:
-        keys = list(job_metadata.keys)
-        paths = [self.file_mapper.get_file_name(key) for key in keys]
-        for _p in paths:
+        _keys = list(job_metadata.keys)
+        _paths = [self.file_mapper.get_file_name(key) for key in _keys]
+        for _p in _paths:
             # A load counts as "use" for the external mtime-ordered pruner;
             # otherwise parked sessions age by first-write time and the
             # pruner evicts the hottest chunks first.
@@ -409,20 +388,14 @@ class FileSystemTierManager(SecondaryTierManager):
                 os.utime(_p, None)
             except OSError:
                 pass
-        offs, sizes = self._key_offsets_sizes(keys, job_metadata.block_ids)
-        tasks = _fanout_tasks(
-            batch_load_block, paths, self._primary_kv_view, offs, sizes,
-            self._use_o_direct, _FS_LOAD_TASKS,
-        )
-        _kv_event({
-            "op": "load",
-            "job": job_metadata.job_id,
-            "chunks": len(keys),
-            "tasks": len(tasks),
-            "req": _req_id(job_metadata),
-            "bytes": sum(sizes) if isinstance(sizes, list) else sizes * len(keys),
-            "keys": _keys_hex(keys),
-        })
+        _offs, _sizes = self._key_offsets_sizes(_keys, job_metadata.block_ids)
+        tasks = _fanout_tasks(batch_load_block, _paths, self._primary_kv_view,
+                              _offs, _sizes, self._use_o_direct, _FS_LOAD_TASKS)
+        _kv_event({"op": "load", "job": job_metadata.job_id,
+                   "chunks": len(_keys), "tasks": len(tasks),
+                   "req": _req_id(job_metadata),
+                   "bytes": (sum(_sizes) if isinstance(_sizes, list) else _sizes * len(_keys)),
+                   "keys": _keys_hex(_keys)})
         self._pool.enqueue_load(job_metadata.job_id, len(tasks), tasks)
 
     @override
@@ -458,43 +431,59 @@ class FileSystemTierManager(SecondaryTierManager):
         """Block until all in-flight transfers in the threadpool finish."""
         self._pool.wait_idle()
 
-    @override
-    def touch(self, keys: Collection[OffloadKey], req_context: ReqContext) -> None:
-        # Record the request's full-attention (group 0) chunk chain once per
-        # request: enough to reconstruct which session a later store/load
-        # event belongs to without logging every touch call.
+    def touch(self, keys, req_context) -> None:
+        # DSPARK EVLOG v2: record the request's chunk chain once per request
+        # (the connector calls touch with the request's keys; g0 = full-attention
+        # group 0 chain identifies the session, window groups are derivable).
         if not _EV_PATH:
             return
         try:
-            req_id = req_context.req_id
-            touched = getattr(self, "_ev_touched_reqs", None)
-            if touched is None:
-                touched = self._ev_touched_reqs = set()
-            if req_id in touched:
+            rid = getattr(req_context, "req_id", None)
+            seen = getattr(self, "_ev_touched", None)
+            if seen is None:
+                seen = self._ev_touched = set()
+            if rid in seen:
                 return
-            touched.add(req_id)
-            if len(touched) > 4096:
-                touched.clear()
-            group0_keys = [k for k in keys if bytes(k)[-4:] == b"\x00\x00\x00\x00"]
-            _kv_event({
-                "op": "touch",
-                "req": req_id,
-                "n_keys": len(keys),
-                "g0": _keys_hex(group0_keys),
-            })
+            seen.add(rid)
+            if len(seen) > 4096:
+                seen.clear()
+            g0 = [k for k in keys if bytes(k)[-4:] == b"\x00\x00\x00\x00"]
+            _kv_event({"op": "touch", "req": rid, "n_keys": len(keys),
+                       "g0": _keys_hex(g0)})
         except Exception:  # noqa: BLE001
             pass
 
+    def dspark_invalidate_lookup(self, keys) -> None:
+        """[load-error-recompute-p60] Overwrite cached async-lookup results
+        for keys whose promotion load just failed.
+
+        The short-read policy (fs_io_C _load_block) unlinks the backing
+        file inside the failing I/O job, but the AsyncLookupManager cache
+        entry was created while the file still passed the existence check
+        and lives until every requesting request finishes. Without this
+        override the stale HIT re-offers the dead chunk every scheduler
+        step (silent retry livelock; E1 2026-08-28 03:15, 8487 resubmits).
+        Runs on the scheduler thread, which owns _lookup_state (see the
+        async_lookup.py locking design note); the single async stat result
+        per cache entry has necessarily been drained before any promotion
+        of that key could start, so no in-flight worker result can
+        overwrite this back to True.
+        """
+        state_map = self._lookup_manager._lookup_state
+        for key in keys:
+            state = state_map.get(key)
+            if state is not None:
+                state.result = False
+
     def on_request_finished(self, req_context: ReqContext) -> None:
         self._lookup_manager.cleanup(req_context.req_id)
-        if _EV_PATH:
-            try:
-                _kv_event({"op": "req_end", "req": req_context.req_id})
-                touched = getattr(self, "_ev_touched_reqs", None)
-                if touched is not None:
-                    touched.discard(req_context.req_id)
-            except Exception:  # noqa: BLE001
-                pass
+        try:
+            _kv_event({"op": "req_end", "req": req_context.req_id})
+            seen = getattr(self, "_ev_touched", None)
+            if seen is not None:
+                seen.discard(req_context.req_id)
+        except Exception:  # noqa: BLE001
+            pass
 
     @override
     def on_schedule_end(self, context: ScheduleEndContext) -> None:

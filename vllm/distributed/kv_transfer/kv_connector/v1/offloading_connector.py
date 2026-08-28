@@ -133,6 +133,16 @@ class OffloadingConnector(KVConnectorBase_V1, SupportsHMA):
 
         return self.connector_worker.get_finished(finished_req_ids)
 
+    def get_block_ids_with_load_errors(self) -> set[int]:
+        # [load-error-recompute] Worker-side API (0.27.1 KVConnectorBase_V1
+        # signature): drained once per step by the model runner after
+        # get_finished(), then unioned across TP ranks by KVOutputAggregator
+        # and fed to Scheduler._handle_invalid_blocks
+        # (kv_load_failure_policy=recompute).
+        if self.connector_worker is None:
+            return set()
+        return self.connector_worker.get_block_ids_with_load_errors()
+
     def build_connector_worker_meta(self) -> OffloadingWorkerMetadata | None:
         if self.connector_worker is not None:
             return self.connector_worker.build_connector_worker_meta()
