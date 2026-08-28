@@ -12,7 +12,7 @@ Every change here is opt-in behind an env var and defaults to stock vLLM behavio
 
 ---
 
-**Status (2026-08-27).** The goal is now met and exceeded on the reference hardware: **six ~500k-token sessions resident** in an 18 GiB GPU pool with instant (2-4 s) switching and zero disk reads, cold-restart restore of any parked session in **12-18 s** (about 47x over full reprefill, needle-exact), and **concurrent cold swap-ins self-serializing in ~67 s** for five 450k sessions (previously 45 minutes of mutual staging eviction). Concurrency benchmarks (c8/c16/c32) hold their acceptance and scaling with offloading on. See the changelog at the bottom for what landed.
+**Status (2026-08-28).** The goal is now met and exceeded on the reference hardware: **six ~500k-token sessions resident** in an 18 GiB GPU pool with instant (2-4 s) switching and zero disk reads, cold-restart restore of any parked session in **12-18 s** (about 47x over full reprefill, needle-exact), and **concurrent cold swap-ins self-serializing in ~67 s** for five 450k sessions (previously 45 minutes of mutual staging eviction). Concurrency benchmarks (c8/c16/c32) hold their acceptance and scaling with offloading on.  A 2026-08-28 reliability round, validated on a second GB10 pair, hardened the failure paths: a boot-order race that could latch the pair down after a whole-rack reboot now waits for the peer, the native-DeepGemm logits allocator no longer ratchets reserved memory under mixed-length prefills (bounded bucket reuse; measured +1.89 GB per 15 min before, flat after), and a corrupted or externally pruned store chunk now degrades to one logged failure plus a recompute instead of an assert or a permanently parked request (fault-injection verified, needle-exact). See the changelog at the bottom for what landed.
 
 # Keeping many long agent sessions resident: disk KV offloading for multi-node vLLM
 
@@ -183,6 +183,19 @@ Residency capacity followed the measured per-token allocation (~5.2 KB/token wit
 
 The probe scripts are small (an OpenAI-client needle harness plus `/metrics` deltas) and live outside this tree; the method above is enough to reproduce them against any deployment of this fork.
 
+### Fault injection (2026-08-28)
+
+The load-failure wiring was verified by breaking the store on purpose, with a needle session as the oracle:
+
+```
+truncated chunk (read fails)   before: 8,487 failure lines in 483 s, request parked forever
+                               after : 1 failure line -> recompute 43.8 s, needle exact
+delete files mid-restore       restore completes from already-open fds: 2.5 s, needle exact
+store pruned beneath session   clean full miss -> recompute 76.3 s, needle exact
+```
+
+The "before" row is itself a find from this round: the first wiring pass exposed a scheduler-side livelock (the async lookup stat cache kept re-serving HIT for a key whose promotion kept failing, one retry per scheduler step). The fix poisons failed keys and invalidates that cache, so the next lookup is a definitive MISS and the scheduler recomputes.
+
 ## Limits and open problems
 
 An honest list.
@@ -210,6 +223,7 @@ Beyond the disk offloading recipe above, this tree carries a few more experiment
 - **DeepSeek V4 tool-call generation stabilization** (experimental, still under validation): `DSPARK_SPEC_OFF_GUIDED` (opt a tools request out of speculative-decode grammar validation), `DSPARK_DSML_LEAK_GUARD` (stop a request if tool-call markup tokens leak into free text), `DSPARK_TOOL_TEMP0` (force temperature 0 on tool turns so structure tokens stay deterministic).
 - **GB10 kernel and backend knobs**: opt-in B12X MXFP4 MoE backend, DeepGemm opt-in for the mHC pre-norm path, e8m0 block-scale upcast for the Triton path, DSpark draft attention backend pinning, MLA index-width rounding.
 
+- **Allocator ratchet fix (2026-08-28)**: `VLLM_SM12X_DG_ALLOC_BUCKETS` (bucketed logits-workspace reuse on the native SM120 mqa-logits path, default on; `0` restores exact-size allocations), `VLLM_SM12X_DG_ALLOC_LOG` (log reserved-bytes and allocator counters every N calls for slope measurement, default off).
 - **Restore robustness under concurrency** (2026-08-27): `DSPARK_RESTORE_CONCURRENCY` (promotion admission gate, default 1), `DSPARK_PRIMFULL_RETRIES` (seconds of sustained staging-full to retry instead of collapsing to a MISS, default 300), `DSPARK_SWA_RESERVE` (reserve staging blocks for sliding-window tail promotion so oversized sessions restore their fitting prefix), `DSPARK_FINISH_STORE_RETRIES` (retry finish-time stores instead of dropping a parked session's tail, default 30).
 - **Staging mmap placement**: `DSPARK_OFFLOAD_MMAP_DIR` (back the CPU staging mmap with a disk file instead of tmpfs; preallocated with `posix_fallocate`), `DSPARK_OFFLOAD_PIN` (host-register policy; disk-backed regions default to unpinned).
 - **Relay direct broadcast**: `DSPARK_RELAY_DIRECT` (source the TP broadcast from the staging mmap instead of re-reading files, default on; fallback preads verify lengths).
@@ -221,6 +235,12 @@ These are documented in their commit messages. This repository will keep accumul
 ---
 
 ## Changelog
+
+### 2026-08-28 — reliability round (2 commits)
+
+- **Load failures recompute end to end.** A chunk that exists at lookup but fails at read (truncated, pruned, unlinked mid-flight) used to die as an assert, a zero-fill, or — as fault injection revealed — a scheduler-side livelock. Now: per-block read failures are reported, failed keys are poisoned, the async-lookup stat cache is invalidated, and the affected span is recomputed. Store failures stay fail-stop (never marked as stored). A hybrid-group zip guard stops silent block-table truncation.
+- **Bounded logits workspace for native DeepGemm.** The SM120 mqa-logits path rounds KV length up a geometric ladder and serves logits from a zero-copy view of the resident workspace (small LRU of bucketed buffers as fallback, DBO ubatch threads bypass the cache). Kills the reserved-memory ratchet under mixed-length prefills.
+- Ops layer (outside this tree): the pair pre-start now waits for the peer node after a whole-rack reboot instead of burning its start limit, the watchdog detects a long-stuck activating state, and the start timeout was raised to cover the new wait budgets.
 
 ### 2026-08-27 — hardening round (19 commits)
 
