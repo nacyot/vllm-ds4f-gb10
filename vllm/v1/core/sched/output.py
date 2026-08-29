@@ -268,6 +268,12 @@ class SchedulerOutput:
     # Number of spec tokens to schedule for the next step.
     num_spec_tokens_to_schedule: int = 0
 
+    # DSPARK reasoning loop breaker (vLLM PR #52677 port for Model Runner V2):
+    # {request id: reasoning tokens so far} for requests whose current
+    # reasoning section was found looping; the worker forces the reasoning
+    # end sequence for them (thinking budget := that length).
+    dspark_force_reasoning_end: dict[str, int] | None = None
+
     @classmethod
     def make_empty(cls) -> "SchedulerOutput":
         return cls(

@@ -231,6 +231,11 @@ class Sampler:
     def _requires_logits_processing(self, idx_mapping_np: np.ndarray) -> bool:
         if np.any(self.logit_bias_state.use_logit_bias[idx_mapping_np]):
             return True
+        # DSPARK: a thinking budget (or a loop-breaker forced end) must reach
+        # the forcing kernel even at temperature 1.0 / top_p 1.0.
+        tb = self.thinking_budget_state
+        if tb.enabled and np.any(tb.use_thinking_budget[idx_mapping_np]):
+            return True
         if np.any(self.penalties_state.use_penalty[idx_mapping_np]):
             return True
         if np.any(self.bad_words_state.num_bad_words.np[idx_mapping_np] > 0):

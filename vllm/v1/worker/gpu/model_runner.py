@@ -357,6 +357,9 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                 logprobs_mode=self.model_config.logprobs_mode,
                 num_speculative_tokens=self.decode_query_len,
                 use_fp64_gumbel=self.model_config.use_fp64_gumbel,
+                # DSPARK: wire the reasoning config so the V2 ThinkingBudgetState
+                # is enabled (thinking_token_budget + loop breaker forcing).
+                reasoning_config=self.vllm_config.reasoning_config,
             )
             custom = self.model_state.custom_sampler(self.sampler)
 
@@ -896,6 +899,28 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         if self.sampler is not None:
             self.sampler.apply_staged_writes()
 
+    def _dspark_apply_force_reasoning_end(
+        self, scheduler_output: SchedulerOutput
+    ) -> None:
+        """DSPARK loop breaker: the scheduler found these requests looping in
+        their reasoning section; give them a zero thinking budget so the V2
+        forcing kernel emits the reasoning end sequence (PR #52677 port)."""
+        verdicts = getattr(scheduler_output, "dspark_force_reasoning_end", None)
+        if not verdicts or self.sampler is None:
+            return
+        state = self.sampler.thinking_budget_state
+        if not state.enabled:
+            return
+        hit = 0
+        for req_id, think_len in verdicts.items():
+            req_idx = self.req_states.req_id_to_index.get(req_id)
+            if req_idx is None:
+                continue
+            state.force_reasoning_end(req_idx, int(think_len))
+            hit += 1
+        if hit:
+            self.sampler.apply_staged_writes()
+
     def update_requests(self, scheduler_output: SchedulerOutput) -> None:
         # Add new blocks and update num_computed_tokens for the existing requests.
         reqs = scheduler_output.scheduled_cached_reqs
@@ -1224,6 +1249,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             self.free_states(scheduler_output)
             self.add_requests(scheduler_output)
             self.update_requests(scheduler_output)
+            self._dspark_apply_force_reasoning_end(scheduler_output)
             self.block_tables.apply_staged_writes()
             if scheduler_output.total_num_scheduled_tokens == 0:
                 # No need to run the model.

@@ -3,7 +3,6 @@
 
 # Adapted from
 # https://github.com/lm-sys/FastChat/blob/168ccc29d3f7edc50823016105c024fe2282732a/fastchat/protocol/openai_api_protocol.py
-import os
 import time
 from typing import Annotated, Any, ClassVar, Literal
 
@@ -53,6 +52,24 @@ from vllm.sampling_params import (
 from vllm.utils import random_uuid
 
 logger = init_logger(__name__)
+
+
+# DSPARK: server-side default for thinking_token_budget when the client omits
+# it (some agent clients cannot pass sampling fields). DSPARK_DEFAULT_THINKING_BUDGET
+# = positive int enables; a request may still opt out with -1 (unlimited) or
+# override with its own value. Pairs with ReasoningConfig loop breaking
+# (vLLM PR #52677 port) as the hard upper bound for runaway reasoning.
+import os as _dspark_os
+
+
+def _dspark_default_thinking_budget(value):
+    if value is not None:
+        return None if value == -1 else value
+    try:
+        default = int(_dspark_os.environ.get("DSPARK_DEFAULT_THINKING_BUDGET", "0") or 0)
+    except ValueError:
+        default = 0
+    return default if default > 0 else None
 
 
 _INT64_MIN = -(2**63)
@@ -256,6 +273,15 @@ class ChatCompletionRequest(OpenAIBaseModel):
         ),
     )
     thinking_token_budget: ThinkingTokenBudget = None
+    thinking_loop_break: bool | None = Field(
+        default=None,
+        description=(
+            "Per-request control for server-configured reasoning loop "
+            "breaking. null follows the server configuration; false opts "
+            "this request out. true cannot enable the feature on a server "
+            "that has not configured it."
+        ),
+    )
     include_reasoning: bool = True
     parallel_tool_calls: bool | None = True
 
@@ -695,11 +721,10 @@ class ChatCompletionRequest(OpenAIBaseModel):
         if self.ec_transfer_params:
             # Pass in ec_transfer_params via extra_args
             extra_args["ec_transfer_params"] = self.ec_transfer_params
-        # Experimental, opt-in (DeepSeek V4 tool-call generation
-        # stabilization): tool-call structure tokens are brittle at
-        # temperature > 0, so force greedy sampling on tool-bearing
-        # requests when the operator opts in.
-        if os.environ.get("DSPARK_TOOL_TEMP0", "") == "1" and self.tools:
+        # DSPARK: force temp 0 on tool turns so DSML structure tokens do not
+        # break at temp>0 (env DSPARK_TOOL_TEMP0=1; default off).
+        import os as _dspark_os
+        if _dspark_os.environ.get("DSPARK_TOOL_TEMP0") == "1" and getattr(self, "tools", None):
             temperature = 0.0
         return SamplingParams.from_optional(
             n=self.n,
@@ -733,7 +758,10 @@ class ChatCompletionRequest(OpenAIBaseModel):
             structured_outputs=self.extract_structured_outputs(),
             logit_bias=self.logit_bias,
             bad_words=self.bad_words,
-            thinking_token_budget=self.thinking_token_budget,
+            thinking_token_budget=_dspark_default_thinking_budget(
+                self.thinking_token_budget
+            ),
+            thinking_loop_break=self.thinking_loop_break,
             allowed_token_ids=self.allowed_token_ids,
             extra_args=extra_args or None,
             skip_clone=True,  # Created fresh per request, safe to skip clone

@@ -118,7 +118,15 @@ class InputProcessor:
                         "not configured. Please set --reasoning-parser "
                         "and/or --reasoning-config to use thinking_token_budget."
                     )
-                if self.use_v2_model_runner:
+                # DSPARK: the V2 ThinkingBudgetState is usable once the
+                # reasoning config carries the natural end marker ids
+                # (config/reasoning.py); keep the gate only for configs that
+                # could not derive them.
+                if self.use_v2_model_runner and not getattr(
+                    self.vllm_config.reasoning_config,
+                    "natural_reasoning_end_token_ids",
+                    None,
+                ):
                     raise VLLMValidationError(
                         "thinking_token_budget is not yet supported by the V2 "
                         "model runner. Run vLLM with VLLM_USE_V2_MODEL_RUNNER=0 "

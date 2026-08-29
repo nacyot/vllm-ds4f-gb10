@@ -199,6 +199,59 @@ def is_store_anchor_now_swa_chunk(
     return False
 
 
+def superseded_anchor_chunk_ranges(
+    final_prompt_chunks: int,
+    anchor_chunk_count: int | None,
+    sliding_window_chunks: int | None,
+    is_eagle_group: bool,
+    keep: int,
+    max_boundaries: int = 256,
+) -> list[tuple[int, int]]:
+    """DSPARK_TAIL_KEEP: window-snapshot retention (per prefix chain).
+
+    Every full-attention-aligned boundary ``b`` (multiple of
+    ``anchor_chunk_count``, in this group's chunk units) may hold a window
+    snapshot: the ``w(+e)`` chunks ``[b - tail, b)`` that
+    ``is_store_anchor_now_swa_chunk`` / ``is_store_reachable_swa_chunk`` let
+    through. A chain only ever resumes from its latest anchors, so once the
+    prompt anchor moves on, snapshots at older boundaries are dead weight
+    (they were 92% of the disk tier on 2026-08-30). Return the chunk-index
+    ranges of the snapshots at boundaries older than the ``keep`` most
+    recent ones (the prompt anchor counts as the most recent), newest first.
+    ``keep`` boundaries are retained so an edited/re-tokenized suffix, which
+    changes the chained hash from the edit point on, still finds a nearby
+    aligned fallback (see plan 2026-08-30 sec. 3.1).
+
+    Boundary 0 never holds a snapshot (nothing precedes it) and is skipped.
+    ``max_boundaries`` bounds the sweep per call (1M tokens at 4096-token
+    alignment is 244 boundaries; older leftovers are the TTL pruner's job).
+    """
+    if (
+        keep <= 0
+        or sliding_window_chunks is None
+        or not anchor_chunk_count
+        or anchor_chunk_count <= 0
+    ):
+        return []
+    a = anchor_chunk_count
+    tail = sliding_window_chunks + int(is_eagle_group)
+    prompt_anchor = (final_prompt_chunks // a) * a
+    # The lowest kept boundary's snapshot occupies [lowest_kept - tail,
+    # lowest_kept); when the window is wider than a segment (tail > a) the
+    # older boundaries' ranges overlap it and must be clipped.
+    lowest_kept = prompt_anchor - a * (keep - 1)
+    limit = lowest_kept - tail
+    ranges: list[tuple[int, int]] = []
+    b = prompt_anchor - a * keep
+    while b > 0 and len(ranges) < max_boundaries:
+        start = max(0, b - tail)
+        end = min(b, limit)
+        if start < end:
+            ranges.append((start, end))
+        b -= a
+    return ranges
+
+
 def resolve_mamba_align_size(
     spec: "OffloadingSpec", kv_cache_config: KVCacheConfig
 ) -> int | None:
@@ -228,6 +281,10 @@ class SchedulerOffloadConfig(NamedTuple):
     anchor_now: bool = False  # NODE3_TAILONLY_FIX F2
     anchor_ckpt_tokens: int = 0
     anchor_tokens_override: int = 0
+    # DSPARK_TAIL_KEEP: keep window snapshots at the K most recent aligned
+    # boundaries of a chain; delete older ones from the secondary tiers when
+    # a store completes. 0 disables (legacy: snapshots are never deleted).
+    tail_keep: int = 0
 
     @classmethod
     def from_spec(
@@ -312,11 +369,24 @@ class SchedulerOffloadConfig(NamedTuple):
                 "KV offloading: DSPARK tail-only store enabled — window/state "
                 "groups store only the final window at request finish."
             )
+        try:
+            _tail_keep = int(_os.environ.get("DSPARK_TAIL_KEEP", "0") or 0)
+        except ValueError:
+            _tail_keep = 0
+        if _tail_keep > 0:
+            logger.info(
+                "KV offloading: DSPARK window-snapshot retention enabled "
+                "(TAIL_KEEP=%d) — after each completed store, window-group "
+                "snapshots at aligned boundaries older than the chain's %d "
+                "most recent are deleted from the secondary tiers.",
+                _tail_keep, _tail_keep,
+            )
         _n3_cfg = cls(  # NODE3_TAILONLY_INSTR
             tail_only=_tail_only,
             anchor_now=_anchor_now,  # NODE3_TAILONLY_FIX F3b
             anchor_ckpt_tokens=_anchor_ckpt_tokens,
             anchor_tokens_override=_anchor_tokens_override,
+            tail_keep=max(0, _tail_keep),
             num_workers=vllm_config.parallel_config.world_size,
             kv_group_configs=tuple(
                 GroupOffloadConfig(
@@ -1770,6 +1840,8 @@ class OffloadingConnectorScheduler:
             req_status = self._req_status[job_status.req_id]
             if job_status.is_store:
                 self.manager.complete_store(job_status.keys, req_status.req_context)
+                if self.config.tail_keep > 0:
+                    self._prune_superseded_anchors(req_status, job_status.keys)
             else:
                 self.manager.complete_load(job_status.keys, req_status.req_context)
                 if self._chunks_being_loaded:
@@ -1790,6 +1862,112 @@ class OffloadingConnectorScheduler:
             req_status.transfer_jobs.remove(job_id)
             if req_status.finished_signaled and not req_status.transfer_jobs:
                 del self._req_status[job_status.req_id]
+
+    def _superseded_anchor_keys(
+        self, req_status: RequestOffloadState
+    ) -> list[OffloadKey]:
+        """DSPARK_TAIL_KEEP: window-group keys of this chain's snapshots at
+        boundaries older than the ``tail_keep`` most recent (see
+        ``superseded_anchor_chunk_ranges``). The request's per-group
+        ``offload_keys`` cover the whole prefix (they are derived from the
+        request's chained block hashes), so the chain needs no extra
+        bookkeeping: an older boundary's snapshot keys are simply the keys
+        at those chunk indices."""
+        cfg = self.config
+        req = req_status.req
+        out: list[OffloadKey] = []
+        for gcfg, gstate in zip(cfg.kv_group_configs, req_status.group_states):
+            if gcfg.sliding_window_size_in_chunks is None:
+                continue  # full-attention KV is never a retention target
+            tpc = gcfg.tokens_per_chunk
+            anchor = (
+                cfg.anchor_tokens_override // tpc
+                if cfg.anchor_tokens_override
+                else gcfg.anchor_chunk_count
+            )
+            ranges = superseded_anchor_chunk_ranges(
+                req.num_prompt_tokens // tpc,
+                anchor,
+                gcfg.sliding_window_size_in_chunks,
+                gcfg.is_eagle_group,
+                cfg.tail_keep,
+            )
+            keys = gstate.offload_keys
+            for start, end in ranges:
+                if end > len(keys):
+                    continue
+                out.extend(keys[start:end])
+        return out
+
+    def _anchor_snapshot_keys(
+        self, req_status: RequestOffloadState
+    ) -> set[OffloadKey]:
+        """Window-group keys of this request's prompt-anchor snapshot (the
+        w(+e) chunks right before the prompt's last aligned boundary)."""
+        cfg = self.config
+        req = req_status.req
+        out: set[OffloadKey] = set()
+        for gcfg, gstate in zip(cfg.kv_group_configs, req_status.group_states):
+            if gcfg.sliding_window_size_in_chunks is None:
+                continue
+            tpc = gcfg.tokens_per_chunk
+            a = (
+                cfg.anchor_tokens_override // tpc
+                if cfg.anchor_tokens_override
+                else gcfg.anchor_chunk_count
+            )
+            if not a:
+                continue
+            tail = gcfg.sliding_window_size_in_chunks + int(gcfg.is_eagle_group)
+            anchor = ((req.num_prompt_tokens // tpc) // a) * a
+            keys = gstate.offload_keys
+            if anchor <= 0 or anchor > len(keys):
+                continue
+            out.update(keys[max(0, anchor - tail) : anchor])
+        return out
+
+    def _prune_superseded_anchors(
+        self,
+        req_status: RequestOffloadState,
+        completed_keys: set[OffloadKey] | None = None,
+    ) -> None:
+        """Delete this chain's superseded window snapshots (DSPARK_TAIL_KEEP).
+
+        Runs after a store job completes, but only once the job that just
+        completed carried the chain's new anchor snapshot: deleting older
+        anchors before the new one is durable would leave the chain with no
+        resumable window state if the process died in between (and would
+        also strip DSPARK_TAIL_CKPT_TOKENS checkpoints mid-prefill). Keys
+        with an in-flight load or store are left alone; the manager decides
+        what a delete means per tier (fs: unlink + lookup cache
+        invalidation). Best effort: deleting a snapshot that some other
+        branch still wanted only costs that branch a recompute.
+        """
+        delete = getattr(self.manager, "dspark_delete_keys", None)
+        if delete is None:
+            return
+        if completed_keys is not None:
+            anchor_keys = self._anchor_snapshot_keys(req_status)
+            if not anchor_keys or not (anchor_keys & completed_keys):
+                return
+        keys = self._superseded_anchor_keys(req_status)
+        if not keys:
+            return
+        busy: set[OffloadKey] = set()
+        if self._chunks_being_loaded:
+            busy.update(self._chunks_being_loaded)
+        for job in self._jobs.values():
+            busy.update(job.keys)
+        keys = [k for k in keys if k not in busy]
+        if not keys:
+            return
+        try:
+            delete(keys, req_status.req_context)
+        except Exception:  # noqa: BLE001 — retention must never break a step
+            logger.exception(
+                "Request %s: window-snapshot retention delete failed",
+                req_status.req.request_id,
+            )
 
     def get_stats(self) -> OffloadingConnectorStats | None:
         stats: OffloadingConnectorStats | None = None

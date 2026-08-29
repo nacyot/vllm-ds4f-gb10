@@ -475,6 +475,42 @@ class FileSystemTierManager(SecondaryTierManager):
             if state is not None:
                 state.result = False
 
+    def delete_keys(self, keys, req_context=None) -> tuple[int, int]:
+        """DSPARK_TAIL_KEEP: unlink the chunk files of ``keys`` (best effort).
+
+        Called on the scheduler thread after a store completes, with the
+        chain's superseded window snapshots (a few hundred keys at most per
+        call; most are already gone, and ENOENT is the cheap path).
+        Lookups resolve keys by file existence, so no index needs updating
+        except the per-request async lookup cache: a request that looked
+        this key up earlier in its lifetime still holds a cached HIT, and
+        re-offering a deleted file would end in a failed load + recompute
+        (see dspark_invalidate_lookup). Files younger than a few seconds are
+        never targeted by construction (they belong to the newest anchors).
+        Returns (files_deleted, bytes_freed).
+        """
+        n = b = 0
+        state_map = self._lookup_manager._lookup_state
+        for key in keys:
+            path = self.file_mapper.get_file_name(key)
+            try:
+                size = os.path.getsize(path)
+                os.remove(path)
+            except FileNotFoundError:
+                continue
+            except OSError as e:  # noqa: PERF203 — rare, keep going
+                logger.debug("delete_keys: %s: %s", path, e)
+                continue
+            n += 1
+            b += size
+            state = state_map.get(key)
+            if state is not None:
+                state.result = False
+        if n:
+            _kv_event({"op": "prune", "req": getattr(req_context, "req_id", None),
+                       "n": n, "bytes": b, "cand": len(keys)})
+        return (n, b)
+
     def on_request_finished(self, req_context: ReqContext) -> None:
         self._lookup_manager.cleanup(req_context.req_id)
         try:

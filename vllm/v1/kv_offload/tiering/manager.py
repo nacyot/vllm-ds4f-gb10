@@ -404,6 +404,43 @@ class TieringOffloadingManager(OffloadingManager):
         """Total block slots in the primary (CPU staging) tier."""
         return self.primary_tier._num_blocks
 
+    def dspark_delete_keys(
+        self, keys: Collection[OffloadKey], req_context: ReqContext | None = None
+    ) -> tuple[int, int]:
+        """DSPARK_TAIL_KEEP: drop superseded window snapshots from the
+        secondary tiers (best effort). Returns (files_deleted, bytes_freed)
+        summed over tiers that implement ``delete_keys``.
+
+        The primary (CPU staging) copy, if any, is left alone: it is LRU
+        managed and a later lookup that hits it is still correct. The
+        fs-promoted LRU and the load-failure poison set are deliberately
+        left alone too (review 2026-08-30): popping a promoted key while its
+        staging copy is still HIT would send rank>0 workers to their own
+        never-filled staging bytes instead of the fs path, and lifting a
+        poison while the zero-filled staging block is still resident would
+        turn the next lookup into a garbage load. A worker that follows a
+        stale fs path to a deleted file simply fails the load and the
+        request recomputes (load-error-recompute).
+        """
+        if not keys:
+            return (0, 0)
+        n = b = 0
+        for tier in self.secondary_tiers:
+            fn = getattr(tier, "delete_keys", None)
+            if fn is None:
+                continue
+            try:
+                dn, db = fn(keys, req_context)
+            except Exception:  # noqa: BLE001 — retention must never break a step
+                logger.exception(
+                    "secondary tier %s: delete_keys failed",
+                    getattr(tier, "tier_type", type(tier).__name__),
+                )
+                continue
+            n += dn
+            b += db
+        return (n, b)
+
     def _note_fs_promoted(self, keys: Collection[OffloadKey]) -> None:
         """Record fs->primary promoted keys, LRU-bounded.
 

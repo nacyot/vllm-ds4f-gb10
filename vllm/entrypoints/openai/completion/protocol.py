@@ -38,6 +38,24 @@ from vllm.utils.collection_utils import is_list_of
 logger = init_logger(__name__)
 
 
+# DSPARK: server-side default for thinking_token_budget when the client omits
+# it (some agent clients cannot pass sampling fields). DSPARK_DEFAULT_THINKING_BUDGET
+# = positive int enables; a request may still opt out with -1 (unlimited) or
+# override with its own value. Pairs with ReasoningConfig loop breaking
+# (vLLM PR #52677 port) as the hard upper bound for runaway reasoning.
+import os as _dspark_os
+
+
+def _dspark_default_thinking_budget(value):
+    if value is not None:
+        return None if value == -1 else value
+    try:
+        default = int(_dspark_os.environ.get("DSPARK_DEFAULT_THINKING_BUDGET", "0") or 0)
+    except ValueError:
+        default = 0
+    return default if default > 0 else None
+
+
 _INT64_MIN = -(2**63)
 _INT64_MAX = 2**63 - 1
 
@@ -232,6 +250,15 @@ class CompletionRequest(OpenAIBaseModel):
             "-1 means unlimited (treated as unset)."
         ),
     )
+    thinking_loop_break: bool | None = Field(
+        default=None,
+        description=(
+            "Per-request control for server-configured reasoning loop "
+            "breaking. null follows the server configuration; false opts "
+            "this request out. true cannot enable the feature on a server "
+            "that has not configured it."
+        ),
+    )
 
     stream_interval: Annotated[int, Field(ge=1)] | None = Field(
         default=None,
@@ -383,7 +410,10 @@ class CompletionRequest(OpenAIBaseModel):
             extra_args=extra_args or None,
             skip_clone=True,  # Created fresh per request, safe to skip clone
             repetition_detection=self.repetition_detection,
-            thinking_token_budget=self.thinking_token_budget,
+            thinking_token_budget=_dspark_default_thinking_budget(
+                self.thinking_token_budget
+            ),
+            thinking_loop_break=self.thinking_loop_break,
         )
 
     @model_validator(mode="before")

@@ -70,6 +70,14 @@ logger = init_logger(__name__)
 # ALL waiting-queue admissions (not only async KV loads). Escape hatch:
 # DSPARK_ADMIT_RESERVED=0. Read once at import.
 DSPARK_ADMIT_RESERVED = os.environ.get("DSPARK_ADMIT_RESERVED", "1") != "0"
+# [lptt-mixed] ds4-server style mixed-only prefill quantum. DSPARK_LPTT_MIXED=N (>0):
+# when another party needs the step (a decode is running, or >=2 prefills are
+# running+waiting) the per-request long-prefill cap is N; a solo prefill keeps the
+# base --long-prefill-token-threshold. Computed once per schedule() step.
+try:
+    DSPARK_LPTT_MIXED = int(os.environ.get("DSPARK_LPTT_MIXED", "0") or 0)
+except Exception:
+    DSPARK_LPTT_MIXED = 0
 # [issue43-step-diag-0271] per-step scheduler diagnostics gate (issue
 # #43 diag port, log-only). Set DSPARK_ISSUE43_SCHED_DIAG=1 to emit one
 # compact scheduled-tokens summary INFO line per scheduler step.
@@ -198,6 +206,12 @@ class Scheduler(SchedulerInterface):
         # requests skipped in waiting flow due async deps or constraints.
         self.skipped_waiting = create_request_queue(self.policy)
         self.running: list[Request] = []
+
+        # DSPARK reasoning loop breaker (PR #52677 port, scheduler side).
+        from vllm.v1.core.sched.dspark_loop_break import DsparkLoopBreak
+
+        self._dspark_loop_break = DsparkLoopBreak.from_config(vllm_config)
+        self._dspark_pending_force_end: dict[str, int] = {}
 
         # The request IDs that are finished in between the previous and the
         # current steps. This is used to notify the workers about the finished
@@ -411,7 +425,7 @@ class Scheduler(SchedulerInterface):
         # and re-aligns at the next boundary.
         if end < prefill_end:
             max_prefill_tokens = self.max_num_scheduled_tokens
-            long_prefill_threshold = self.scheduler_config.long_prefill_token_threshold
+            long_prefill_threshold = getattr(self, "_lptt_eff", self.scheduler_config.long_prefill_token_threshold)  # [lptt-mixed]
             if long_prefill_threshold > 0:
                 max_prefill_tokens = min(max_prefill_tokens, long_prefill_threshold)
             aligned_end = end // block_size * block_size
@@ -467,6 +481,18 @@ class Scheduler(SchedulerInterface):
         req_to_new_blocks: dict[str, KVCacheBlocks] = {}
         num_scheduled_tokens: dict[str, int] = {}
         token_budget = self.max_num_scheduled_tokens
+        # [lptt-mixed] effective per-request long-prefill cap for this step.
+        self._lptt_eff = self.scheduler_config.long_prefill_token_threshold
+        if DSPARK_LPTT_MIXED > 0:
+            _n_dec = 0
+            _n_pre = 0
+            for _r in self.running:
+                if _r.num_computed_tokens >= _r.num_prompt_tokens:
+                    _n_dec += 1
+                else:
+                    _n_pre += 1
+            if _n_dec > 0 or (_n_pre + len(self.waiting)) >= 2:
+                self._lptt_eff = DSPARK_LPTT_MIXED
         if self._pause_state == PauseState.PAUSED_ALL:
             # Do not schedule any requests when paused.
             token_budget = 0
@@ -528,8 +554,9 @@ class Scheduler(SchedulerInterface):
                 + request.num_output_placeholders
                 - request.num_computed_tokens
             )
-            if 0 < self.scheduler_config.long_prefill_token_threshold < num_new_tokens:
-                num_new_tokens = self.scheduler_config.long_prefill_token_threshold
+            _lptt = getattr(self, "_lptt_eff", self.scheduler_config.long_prefill_token_threshold)  # [lptt-mixed]
+            if 0 < _lptt < num_new_tokens:
+                num_new_tokens = _lptt
             num_new_tokens = min(num_new_tokens, token_budget)
 
             # Make sure the input position does not exceed the max model len.
@@ -730,12 +757,30 @@ class Scheduler(SchedulerInterface):
                 except Exception:
                     _ppcap = 0
                 if _ppcap > 0:
+                    # [ppcap-long] DSPARK_PPCAP_LONG_TOKENS=T>0: count only long
+                    # running prefills (remaining > T) and block only long
+                    # candidates (prompt > T); a blocked long candidate is
+                    # skipped for this step so shorter requests behind it get in.
+                    try:
+                        _pp_T = int(os.environ.get("DSPARK_PPCAP_LONG_TOKENS", "0") or 0)
+                    except Exception:
+                        _pp_T = 0
                     _cpp = 0
                     for _ppr in self.running:
-                        if _ppr.num_computed_tokens < _ppr.num_prompt_tokens:
+                        if _ppr.num_computed_tokens < _ppr.num_prompt_tokens and (
+                            _pp_T <= 0
+                            or (_ppr.num_prompt_tokens - _ppr.num_computed_tokens) > _pp_T
+                        ):
                             _cpp += 1
                     if _cpp >= _ppcap:
-                        break
+                        if _pp_T > 0 and request.num_prompt_tokens <= _pp_T:
+                            pass  # short candidate slips through
+                        elif _pp_T > 0:
+                            request_queue.pop_request()
+                            step_skipped_waiting.prepend_request(request)
+                            continue
+                        else:
+                            break
 
                 # [gate-small-bypass-0271] 입장 게이트 + 소형 우회 v2 (env-gated).
                 # DSPARK_GATE_BYPASS_TOKENS=T(>0)일 때만: '남은 프리필>T'
@@ -985,7 +1030,7 @@ class Scheduler(SchedulerInterface):
                             break
                         pad_spec_decode = True
 
-                    threshold = self.scheduler_config.long_prefill_token_threshold
+                    threshold = getattr(self, "_lptt_eff", self.scheduler_config.long_prefill_token_threshold)  # [lptt-mixed]
                     if 0 < threshold < num_new_tokens:
                         num_new_tokens = threshold
 
@@ -1330,7 +1375,12 @@ class Scheduler(SchedulerInterface):
             partial_tail_offloads=pending_partial_tail_offloads,
             num_spec_tokens_to_schedule=num_spec_tokens_to_schedule,
             ec_manager_metadata=self.encoder_cache_manager.get_manager_metadata(),
+            dspark_force_reasoning_end=(
+                self._dspark_pending_force_end or None
+            ),
         )
+        if self._dspark_pending_force_end:
+            self._dspark_pending_force_end = {}
 
         # NOTE(Kuntai): this function is designed for multiple purposes:
         # 1. Plan the KV cache store
@@ -2247,6 +2297,9 @@ class Scheduler(SchedulerInterface):
             if stopped:
                 del new_token_ids[num_new:]  # Trim new tokens if needed.
                 break
+        if new_token_ids and not stopped and self._dspark_loop_break is not None:
+            # DSPARK loop breaker: verdicts ride the next SchedulerOutput.
+            self._dspark_loop_break.observe(request, self._dspark_pending_force_end)
         return new_token_ids, stopped
 
     def _free_encoder_inputs(self, request: Request) -> None:
@@ -2451,6 +2504,8 @@ class Scheduler(SchedulerInterface):
         assert request.is_finished()
 
         self._inflight_prefills.discard(request)
+        if self._dspark_loop_break is not None:
+            self._dspark_loop_break.forget(request.request_id)
         connector_delay_free_blocks, kv_xfer_params = self._connector_finished(request)
 
         # EC Connector: mirror the KV hook. The contract requires firing

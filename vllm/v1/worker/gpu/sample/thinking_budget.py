@@ -92,6 +92,24 @@ class ThinkingBudgetState:
             self.thinking_token_budget.np[req_idx] = budget
             self._budget_dirty = True
 
+    def force_reasoning_end(self, req_idx: int, budget: int = 0) -> None:
+        """DSPARK loop breaker (PR #52677 port): make the forcing kernel emit
+        the reasoning end sequence for this request from the next step on by
+        giving it a thinking budget it has already used up (``budget`` = the
+        section's current length, so a later section keeps that same bound
+        instead of being closed immediately). Once the end marker is committed
+        the kernel sees last_end > last_start and stops forcing. The marker
+        caches are reset so a request that never had a budget gets a cold
+        scan instead of stale slot values."""
+        if not self.enabled:
+            return
+        budget = max(0, min(int(budget), _INT32_MAX))
+        self.use_thinking_budget[req_idx] = True
+        if self.thinking_token_budget.np[req_idx] != budget:
+            self.thinking_token_budget.np[req_idx] = budget
+            self._budget_dirty = True
+        self._reset_reqs.append(req_idx)
+
     def apply_staged_writes(self) -> None:
         if not self.enabled:
             return
