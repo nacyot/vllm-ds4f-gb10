@@ -2,7 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 import asyncio
-import os
+import os  # [dspark-dsml-leak-guard-0271]
 from collections import defaultdict, deque
 from collections.abc import Iterable
 from dataclasses import dataclass
@@ -29,6 +29,15 @@ from vllm.tracing import (
 )
 from vllm.utils import length_from_prompt_token_ids_or_embeds
 from vllm.v1.engine import EngineCoreOutput, EngineCoreRequest, FinishReason
+
+# [dspark-dsml-leak-guard-0271] DSML 누출 가드 (기본 꺼짐).
+_DSPARK_DSML_LEAK_GUARD = (
+    os.environ.get("DSPARK_DSML_LEAK_GUARD", "").strip() == "1"
+)
+# 파서 미복구 대체 방언 토큰: <dsml: (128840), </dsml: (128841). 출현 = 누출.
+_DSPARK_DSML_DIALECT_TOKEN_IDS = frozenset({128840, 128841})
+# 마커(｜DSML｜) 탈락 닫기 태그(유효 close 는 </｜DSML｜...> 라 부분열 불일치 → 오탐 0).
+_DSPARK_DSML_BARE_CLOSERS = ("</invoke>", "</parameter>", "</result>")
 from vllm.v1.engine.detokenizer import IncrementalDetokenizer
 from vllm.v1.engine.logprobs import LogprobsProcessor
 from vllm.v1.engine.parallel_sampling import ParentRequest
@@ -41,21 +50,6 @@ from vllm.v1.metrics.stats import (
 
 # shared empty CPU tensor used as a placeholder pooling output
 EMPTY_CPU_TENSOR = torch.empty(0, device="cpu")
-
-# Experimental, opt-in (DeepSeek V4 tool-call generation stabilization).
-# DSML is DeepSeek's tool-call markup dialect; the strict parser can fail to
-# match a slightly malformed opener and let raw DSML structure tokens leak
-# into visible content instead of being consumed as a tool call. When this
-# guard is on, surfacing either of those leak signatures stops the request
-# rather than letting the leak propagate into conversation history.
-_DSPARK_DSML_LEAK_GUARD = os.environ.get("DSPARK_DSML_LEAK_GUARD", "") == "1"
-# Token ids for the parser's unrecovered dialect opener/closer; seeing one
-# in the newly generated tokens means the recovery parser did not match.
-_DSPARK_DSML_DIALECT_TOKEN_IDS = frozenset({128840, 128841})
-# A valid DSML close tag is "</|DSML|...>"; a bare closer with the marker
-# dropped is itself a leak signature (the substring won't appear as a false
-# positive inside a well-formed tag).
-_DSPARK_DSML_BARE_CLOSERS = ("</invoke>", "</parameter>", "</result>")
 
 
 class RequestOutputCollector:
@@ -676,19 +670,17 @@ class OutputProcessor:
                     finish_reason = FinishReason.STOP
                     stop_reason = stop_string
 
-                # Experimental, opt-in (DeepSeek V4 tool-call generation
-                # stabilization): if a DSML structure token surfaces without
-                # the tool-call parser having consumed it, stop the request
-                # rather than let raw DSML markup pollute the visible output
-                # (and, in an agent loop, get fed back into history).
+                # [dspark-dsml-leak-guard-0271] DSML 구조 토큰이 tool-parse
+                # 성립 없이 표면화되면(미복구 방언 or 마커탈락 닫기 태그) 요청을
+                # stop 처리 → 생 DSML 히스토리 오염 차단.
                 if _DSPARK_DSML_LEAK_GUARD and finish_reason is None:
-                    leaked = any(
+                    _leak = any(
                         t in _DSPARK_DSML_DIALECT_TOKEN_IDS for t in new_token_ids
                     )
-                    if not leaked:
-                        tail = req_state.detokenizer.output_text[-64:]
-                        leaked = any(c in tail for c in _DSPARK_DSML_BARE_CLOSERS)
-                    if leaked:
+                    if not _leak:
+                        _tail = req_state.detokenizer.output_text[-64:]
+                        _leak = any(_c in _tail for _c in _DSPARK_DSML_BARE_CLOSERS)
+                    if _leak:
                         finish_reason = FinishReason.STOP
                         stop_reason = "dspark_dsml_leak_guard"
 

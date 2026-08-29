@@ -98,9 +98,8 @@ class SharedOffloadRegion:
         self.rank = rank
         if rank is not None:
             # byte offset to this worker's first slot within each block row
-            # Shared-region rule: when the page size covers the whole
-            # row (single canonical copy), every rank maps the same
-            # area at offset 0.
+            # 공유 영역 규칙: 페이지 크기가 행 전체면(복사본 1벌 canonical)
+            # 모든 랭크가 같은 영역을 쓴다 — 오프셋 0.
             if cpu_page_size >= self._row_stride:
                 self._worker_offset = 0
             else:

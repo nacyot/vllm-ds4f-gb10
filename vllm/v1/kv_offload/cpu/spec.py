@@ -89,10 +89,8 @@ class CPUOffloadingSpec(OffloadingSpec):
         self.cpu_page_size_per_worker = 0
         self.replicated_layout = config.replicated_layout and self._uses_shared_region()
         if config.worker_kv_bytes_per_block > 0 and world_size > 0:
-            # Canonical sharing: all workers write into the same
-            # canonical area, so one copy suffices — the staging slot
-            # shrinks from world_size worker copies to the canonical
-            # size.
+            # canonical 공유: 전 워커가 같은 canonical 영역에 기록하므로
+            # 복사본 1벌이면 충분 — 슬롯 크기 절반화 (하역장 실크기화).
             _canonical = bool(getattr(config, "canonical_layout", False))
             num_copies = (
                 1 if (self.replicated_layout or _canonical) else world_size

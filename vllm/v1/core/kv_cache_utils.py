@@ -136,8 +136,7 @@ class KVCacheBlock:
 
     # Whether the block is a null block that should never be cached.
     is_null: bool = False
-    # SWA retention tail: preferred to survive eviction within the
-    # pool's retention budget (see BlockPool.retention_tail_budget).
+    # [tail-evict-last] SWA retention tail: 예산 내 축출 최후순위 (hotfix 참조).
     retention_tail: bool = False
 
     @property

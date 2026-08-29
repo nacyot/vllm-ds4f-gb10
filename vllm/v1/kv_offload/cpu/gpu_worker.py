@@ -1,7 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 import functools
-import os
 import time
 from collections import deque
 from collections.abc import Sequence
@@ -40,15 +39,22 @@ def _select_swap_blocks_fn(
     layer_refs_per_group: list[list[CanonicalKVCacheRef]],
     gpu_to_cpu: bool,
 ):
-    """Resolve the swap_blocks function for a handler at init time.
-
-    The two directions use different engines: GPU->CPU stores keep the
-    csrc batched-DMA path (bandwidth-bound; the dedicated copy engine
-    wins), while CPU->GPU loads use the Triton copy kernel. Submitting
-    very large batches to cuMemcpyBatchAsync collapses the driver
-    frontend on Blackwell (Xid 32/69, vLLM #49276 family); restores of
-    long sessions are exactly such batches, and the Triton path
-    sidesteps the batch submission entirely."""
+    """Resolve the swap_blocks function for a handler at init time."""
+    # DSPARK v2: store(GPU->CPU)는 csrc 배치 DMA 유지(대역폭, 194GB 무사고).
+    # load는 Triton 커널 복사로 — Blackwell에서 cuMemcpyBatchAsync 대량 배치
+    # 제출이 드라이버 프런트엔드를 무너뜨림(Xid 32/69, vLLM #49276 계열).
+    # (구 Xid 13은 드라이버 580 결함으로 확정 — 595.84에서 소규모 해소,
+    #  대규모 로드에서 배치 제출 병리가 잔존해 방향별 분리.)
+    if gpu_to_cpu:
+        return ops.swap_blocks_batch
+    if not HAS_TRITON or current_platform.is_xpu() or current_platform.is_rocm():
+        return ops.swap_blocks_batch
+    _page_sizes = [r.page_size_bytes for g in layer_refs_per_group for r in g]
+    if not _page_sizes or any(s % 8 for s in _page_sizes):
+        return ops.swap_blocks_batch
+    _chunk = min(triton.next_power_of_2(max(_page_sizes)), 8192)
+    return functools.partial(swap_blocks_batch, bytes_per_chunk=_chunk)
+    # GPU->CPU is bandwidth-bound; the dedicated copy engine beats Triton.
     if gpu_to_cpu:
         return ops.swap_blocks_batch
     # Fall back to the C++ DMA path on platforms where Triton isn't usable
@@ -58,8 +64,12 @@ def _select_swap_blocks_fn(
     if not HAS_TRITON or current_platform.is_xpu() or current_platform.is_rocm():
         return ops.swap_blocks_batch
     page_sizes = [r.page_size_bytes for g in layer_refs_per_group for r in g]
-    # The Triton kernel requires 8-byte-aligned payloads.
-    if not page_sizes or any(s % 8 for s in page_sizes):
+    # Triton wins only on small, 8-byte-aligned payloads.
+    if (
+        not page_sizes
+        or max(page_sizes) >= THRESHOLD_BYTES
+        or any(s % 8 for s in page_sizes)
+    ):
         return ops.swap_blocks_batch
     chunk = min(triton.next_power_of_2(max(page_sizes)), 8192)
     return functools.partial(swap_blocks_batch, bytes_per_chunk=chunk)
@@ -620,7 +630,7 @@ class SingleDirectionOffloadingHandler:
 
         if src_offset != num_src_blocks or dst_offset != num_dst_blocks:
             raise AssertionError(
-                f"block accounting mismatch: src {src_offset}/{num_src_blocks} "
+                f"DSPARK_XFER_DBG mismatch: src {src_offset}/{num_src_blocks} "
                 f"dst {dst_offset}/{num_dst_blocks} "
                 f"g2c={self.gpu_to_cpu} "
                 f"src_bpc={self.src_blocks_per_chunk} dst_bpc={self.dst_blocks_per_chunk} "
@@ -647,38 +657,33 @@ class SingleDirectionOffloadingHandler:
             else torch.Event(enable_timing=True)
         )
 
-        # Both directions must wait on the compute stream (#47282/#47324):
-        # stores read the live GPU KV cache, and loads write into GPU
-        # blocks that were just recycled while in-flight compute may still
-        # be reading them (write-after-read hazard; observed as Xid 13
-        # channel corruption on GB10).
+        # DSPARK (#47282/#47324 백포트): 스토어뿐 아니라 H2D 로드도
+        # 컴퓨트 스트림을 기다려야 한다. 로드는 방금 재활용된 GPU 블록에
+        # 쓰는데 진행 중인 컴퓨트가 아직 그 블록을 읽고 있을 수 있다(WAR)
+        # — GB10에서는 Xid 13 채널 오염/워커 사망으로 발현.
         stream.wait_stream(current_platform.current_stream())
         if self._transfers:
-            # Load transfers may run in a small pipeline window
-            # (DSPARK_LOAD_WINDOW, default 1 = fully serial, the historical
-            # behavior). Load jobs touch disjoint GPU blocks and CPU slots,
-            # so they are independent of each other; stores stay serial.
-            window = 1
+            # DSPARK: 로드 핸들러는 윈도우 N까지 병렬 전송 허용
+            # (DSPARK_LOAD_WINDOW, 기본 1 = 기존 완전 직렬).
+            # 로드 잡들은 서로 다른 GPU 블록·CPU 슬롯을 다뤄 독립적이다.
+            import os as _os
+            _win = 1
             if not self.gpu_to_cpu:
                 try:
-                    window = max(
-                        1, int(os.environ.get("DSPARK_LOAD_WINDOW", "1"))
-                    )
+                    _win = max(1, int(_os.environ.get("DSPARK_LOAD_WINDOW", "1")))
                 except ValueError:
-                    window = 1
-            if len(self._transfers) >= window:
-                stream.wait_event(self._transfers[-window].end_event)
+                    _win = 1
+            if len(self._transfers) >= _win:
+                stream.wait_event(self._transfers[-_win].end_event)
         # CPU->GPU reads from host pinned memory, which is never written
         # by a concurrent GPU stream, so CU_MEMCPY_SRC_ACCESS_ORDER_ANY is
         # safe and lets the driver pipeline source reads. GPU->CPU reads
         # from the live GPU KV cache, which the compute stream keeps
         # writing; we must keep STREAM ordering so source reads are gated
         # by the transfer stream's wait_stream(compute) barrier.
-        # The fs promotion/pread path overwrites host mmap pages
-        # asynchronously; ANY lets the driver read the source after the
-        # API returns, which is undefined against a cross-process writer
-        # (observed as Xid 13 on GB10). Force STREAM ordering for loads
-        # as well.
+        # DSPARK: fs 승격/pread가 호스트 mmap 페이지를 비동기로 덮어쓴다.
+        # ANY는 API 반환 후에도 소스 읽기를 허용하므로(교차 프로세스 라이터와
+        # 만나면 미정의 동작 → GB10 Xid 13), 로드도 STREAM 순서로 강제한다.
         is_src_access_order_any = False
         with current_platform.stream(stream):
             start_event.record(stream)

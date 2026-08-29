@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-import os
+import os  # [tail-evict-last]
 from collections.abc import Iterable, Sequence
 from typing import Any
 
@@ -195,17 +195,14 @@ class BlockPool:
         self.kv_event_queue: list[KVCacheEvent] = []
 
         self.metrics_collector = metrics_collector
-        # Retention-tail bookkeeping: protection counter and budget
-        # (20% of the pool by default; tune via
-        # DSPARK_TAIL_RESERVE_FRAC, 0 disables).
+        # [tail-evict-last] tail 보호 카운터·예산 (풀의 20%, env로 조정).
         self.retention_tail_count = 0
         self.retention_tail_budget = int(
             num_gpu_blocks
             * float(os.environ.get("DSPARK_TAIL_RESERVE_FRAC", "0.2") or 0.2)
         )
 
-    # Tail marking/clearing must go through these two methods so the
-    # counter stays consistent with the flags.
+    # [tail-evict-last] tail 마킹/해제는 카운터 정합을 위해 반드시 이 API로.
     def mark_retention_tail(self, block: KVCacheBlock) -> None:
         if not block.retention_tail and not block.is_null:
             block.retention_tail = True
@@ -679,10 +676,8 @@ class BlockPool:
         if num_blocks > self.get_num_free_blocks():
             raise ValueError(f"Cannot get {num_blocks} free blocks from the pool")
 
-        # Within budget, retention-tail blocks are skipped and
-        # requeued at the back (evict-last). Over budget, the oldest
-        # tails are consumed normally (self-regulating). _te_budget
-        # caps the scan at a single pass over the free queue.
+        # [tail-evict-last] 예산 내 tail은 건너뛰어 큐 꼬리로(evict-last),
+        # 예산 초과 tail은 최고령부터 정상 소비(자기조절). budget으로 1회전 방지.
         ret: list[KVCacheBlock] = []
         _te_deferred: list[KVCacheBlock] = []
         _te_budget = self.free_block_queue.num_free_blocks
@@ -741,8 +736,7 @@ class BlockPool:
         if self.metrics_collector:
             self.metrics_collector.on_block_evicted(block)
 
-        # Removal from the prefix cache also ends retention-tail
-        # status.
+        # [tail-evict-last] 캐시에서 제거되면 tail 지위도 소멸.
         self.clear_retention_tail(block)
         evicted_hashes = self._remove_cached_block_hashes(block)
         if not evicted_hashes:

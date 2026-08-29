@@ -300,10 +300,9 @@ def _layer_mapping(
             canonical_page_size_bytes=upage,
             local_page_size_bytes=upage,
             runs=(CopyRun(0, 0, upage, 1, upage, upage),),
-            # Every rank writes: on multi-node deployments each node's
-            # mmap must hold a complete canonical copy. With writer
-            # rotation each node would hold only its share, and restores
-            # would read half-empty data, corrupting the GPU KV cache.
+            # 전 랭크 라이터: 멀티노드에서 각 노드의 mmap이 완전한 canonical
+            # 사본을 갖게 한다 (로테이션이면 노드별 절반만 존재 → 복원이
+            # 반쪽-빈 데이터를 읽어 GPU KV 오염/디바이스 사망).
             num_writers=1,
             writer_index=0,
             parallelism_agnostic=True,
