@@ -47,6 +47,9 @@ def _make_vllm_config(
     config.cache_config.cache_dtype = torch.float16
     config.model_config.model = "test-model"
     config.model_config.use_mla = False
+    # _full_attention_spec's heads at tp=1: the parallelism-agnostic gate
+    # requires the head shard to cover the model's KV heads exactly
+    config.model_config.get_total_num_kv_heads.return_value = 4
     world_size = (
         tensor_parallel_size * pipeline_parallel_size * prefill_context_parallel_size
     )
@@ -641,3 +644,42 @@ def test_blocks_per_chunk_must_be_positive():
 
     with pytest.raises(ValueError, match="greater than 0"):
         build_offloading_config(config, _make_kv_cache_config())
+
+
+def test_dspark_parallel_agnostic_widens_multi_group_mla(monkeypatch):
+    """DSPARK_PARALLEL_AGNOSTIC=1 collapses the storage namespace for
+    multi-group MLA models under canonical_layout (the worker still certifies
+    every layer and fails closed); anything else keeps the upstream gate."""
+    mla_groups = [
+        KVCacheGroupSpec(["full_mla"], _mla_spec()),
+        KVCacheGroupSpec(["swa_mla"], _mla_spec(head_size=256)),
+    ]
+    hybrid_groups = _make_hybrid_kv_cache_config().kv_cache_groups
+
+    def agnostic(groups, env, *, use_mla=True, canonical=True, tp=2):
+        if env is None:
+            monkeypatch.delenv("DSPARK_PARALLEL_AGNOSTIC", raising=False)
+        else:
+            monkeypatch.setenv("DSPARK_PARALLEL_AGNOSTIC", env)
+        config = _make_vllm_config(
+            extra_config={"canonical_layout": canonical} if canonical else None,
+            tensor_parallel_size=tp,
+        )
+        config.model_config.use_mla = use_mla
+        kv_cache_config = KVCacheConfig(
+            num_blocks=0, kv_cache_tensors=[], kv_cache_groups=groups
+        )
+        return build_offloading_config(
+            config, kv_cache_config
+        ).parallel.is_parallelism_agnostic
+
+    # Upstream gate: a multi-group model stays topology-bound.
+    assert agnostic(mla_groups, None) is False
+    assert agnostic(mla_groups, "0") is False
+    # Opt-in widens it for all-MLA groups under the canonical layout only.
+    assert agnostic(mla_groups, "1") is True
+    assert agnostic(mla_groups, "1", canonical=False) is False
+    # MLA-ness comes from the published specs, not model_config.use_mla.
+    assert agnostic(mla_groups, "1", use_mla=False) is True
+    # A non-MLA group is never collapsed.
+    assert agnostic(hybrid_groups, "1") is False

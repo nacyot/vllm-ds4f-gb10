@@ -2,13 +2,16 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """Translate vLLM KV cache metadata for native offloading backends."""
 
+import os
 from typing import TYPE_CHECKING
 
+from vllm.logger import init_logger
 from vllm.v1.core.kv_cache_utils import resolve_kv_cache_block_sizes
 from vllm.v1.kv_cache_interface import (
     AttentionSpec,
     FullAttentionSpec,
     MLAAttentionSpec,
+    SlidingWindowMLASpec,
 )
 from vllm.v1.kv_offload.config import (
     OffloadingCacheConfig,
@@ -21,6 +24,9 @@ from vllm.v1.kv_offload.config import (
 if TYPE_CHECKING:
     from vllm.config import VllmConfig
     from vllm.v1.kv_cache_interface import KVCacheConfig, KVCacheTensor
+
+
+logger = init_logger(__name__)
 
 
 def is_kv_cache_tensor_packed(kv_cache_tensor: "KVCacheTensor") -> bool:
@@ -198,6 +204,49 @@ def build_offloading_config(
                 and parallel_config.prefill_context_parallel_size == 1
                 and parallel_config.world_size == tp_size
             )
+
+    # DSPARK: multi-group MLA models (DeepSeek V4 Flash: full-attention MLA,
+    # sliding-window MLA and compressor-state groups) keep one TP-replicated
+    # latent page per layer, so the packed canonical layout is topology-free
+    # for every group, but the single-group gate above cannot say so. The
+    # worker still certifies every layer at registration and fails closed
+    # (tiering/spec.py) if any mapping is not portable, so this opt-in only
+    # collapses the storage namespace across TP sizes. Verified 2026-08-30 on
+    # GB10: TP=2 and TP=4 chunk files of the same key have identical layout
+    # and size and differ only by fp8 rounding noise (|delta| mostly 1 code).
+    if (
+        canonical_layout
+        and not is_parallelism_agnostic
+        and os.environ.get("DSPARK_PARALLEL_AGNOSTIC", "0") == "1"
+    ):
+        # The MLA-ness is read off the published specs, not model_config.use_mla:
+        # DeepSeek V4 publishes MLAAttentionSpec / SlidingWindowMLASpec while
+        # its architecture entry does not set is_deepseek_mla.
+        group_specs = [g.kv_cache_spec for g in kv_cache_config.kv_cache_groups]
+        all_mla = bool(group_specs) and all(
+            isinstance(spec, (MLAAttentionSpec, SlidingWindowMLASpec))
+            for spec in group_specs
+        )
+        widened = (
+            all_mla
+            and parallel_config.decode_context_parallel_size == 1
+            and parallel_config.prefill_context_parallel_size == 1
+            and parallel_config.world_size == parallel_config.tensor_parallel_size
+        )
+        logger.info(
+            "DSPARK_PARALLEL_AGNOSTIC=1: %s (groups=%s, world_size=%d, tp=%d, "
+            "dcp=%d, pcp=%d)",
+            "storage namespace shared across TP layouts"
+            if widened
+            else "conditions not met, namespace stays topology-bound",
+            [type(spec).__name__ for spec in group_specs],
+            parallel_config.world_size,
+            parallel_config.tensor_parallel_size,
+            parallel_config.decode_context_parallel_size,
+            parallel_config.prefill_context_parallel_size,
+        )
+        if widened:
+            is_parallelism_agnostic = True
 
     kv_events_config = vllm_config.kv_events_config
     cache_dtype = (
