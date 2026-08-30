@@ -1022,14 +1022,21 @@ class Scheduler(SchedulerInterface):
                         and num_new_tokens == 1
                         and (scheduled_running_reqs and not prefill_scheduled)
                     ):
-                        num_new_tokens = 1 + self.num_spec_tokens
+                        padded_num_tokens = 1 + self.num_spec_tokens
+                        # Pad only when there is room for the sampled token(s);
+                        # padding up to max_model_len made the next async
+                        # step's cap negative (vLLM #53962).
                         if (
-                            num_new_tokens > token_budget
-                            or num_computed_tokens + num_new_tokens > self.max_model_len
+                            num_computed_tokens
+                            + padded_num_tokens
+                            + self.num_sampled_tokens_per_step
+                            <= self.max_model_len
                         ):
-                            # Prefer to not schedule than schedule un-padded here.
-                            break
-                        pad_spec_decode = True
+                            if padded_num_tokens > token_budget:
+                                # Prefer to not schedule than schedule un-padded.
+                                break
+                            num_new_tokens = padded_num_tokens
+                            pad_spec_decode = True
 
                     threshold = getattr(
                         self,
@@ -2298,9 +2305,13 @@ class Scheduler(SchedulerInterface):
             if stopped:
                 del new_token_ids[num_new:]  # Trim new tokens if needed.
                 break
-        if new_token_ids and not stopped and self._dspark_loop_break is not None:
-            # DSPARK loop breaker: verdicts ride the next SchedulerOutput.
-            self._dspark_loop_break.observe(request, self._dspark_pending_force_end)
+        # DSPARK loop breaker: verdicts ride the next SchedulerOutput. getattr:
+        # tests build schedulers without __init__ (AsyncScheduler.__new__).
+        loop_break = getattr(self, "_dspark_loop_break", None)
+        pending_force_end = getattr(self, "_dspark_pending_force_end", None)
+        if new_token_ids and not stopped and loop_break is not None:
+            assert pending_force_end is not None
+            loop_break.observe(request, pending_force_end)
         return new_token_ids, stopped
 
     def _free_encoder_inputs(self, request: Request) -> None:
@@ -2505,8 +2516,9 @@ class Scheduler(SchedulerInterface):
         assert request.is_finished()
 
         self._inflight_prefills.discard(request)
-        if self._dspark_loop_break is not None:
-            self._dspark_loop_break.forget(request.request_id)
+        loop_break = getattr(self, "_dspark_loop_break", None)
+        if loop_break is not None:
+            loop_break.forget(request.request_id)
         connector_delay_free_blocks, kv_xfer_params = self._connector_finished(request)
 
         # EC Connector: mirror the KV hook. The contract requires firing
