@@ -27,11 +27,13 @@ def _make(min_reasoning=32, interval=4, natural=None, end=None):
 
 
 class _Req:
-    def __init__(self, rid="r", prompt=None, loop_break=None):
+    def __init__(self, rid="r", prompt=None, loop_break=None, budget=None):
         self.request_id = rid
         self.prompt_token_ids = prompt or [1, 2, 3]
         self.output_token_ids: list[int] = []
-        self.sampling_params = SimpleNamespace(thinking_loop_break=loop_break)
+        self.sampling_params = SimpleNamespace(
+            thinking_loop_break=loop_break, thinking_token_budget=budget
+        )
 
 
 def _feed(lb, req, pending, tokens, chunk=4):
@@ -143,3 +145,16 @@ def test_from_config_disabled_without_params():
     cfg.reasoning_config.loop_break_min_count = 3
     cfg.reasoning_config.loop_break_min_pattern_size = 2
     assert DsparkLoopBreak.from_config(cfg) is not None
+
+
+def test_budget_hit_is_counted_once_per_section():
+    lb = _make()
+    req = _Req(budget=40)
+    pending: dict[str, int] = {}
+    _feed(lb, req, pending, [THINK_START] + _non_periodic(60))
+    assert lb.num_budget_hits == 1
+    _feed(lb, req, pending, _non_periodic(20, base=500))
+    assert lb.num_budget_hits == 1  # not re-counted while the section is open
+    _feed(lb, req, pending, [THINK_END] + [THINK_START] + _non_periodic(60, base=900))
+    assert lb.num_budget_hits == 2  # a new section can hit again
+    assert pending == {}  # budget hits are not loop verdicts

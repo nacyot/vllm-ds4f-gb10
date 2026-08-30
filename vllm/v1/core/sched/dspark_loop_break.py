@@ -70,6 +70,10 @@ class DsparkLoopBreak:
         self._need = params.max_pattern_size * params.min_count
         self._state: dict[str, dict[str, Any]] = {}
         self.num_fired = 0
+        # thinking_token_budget hits (server default or per-request) are
+        # counted here too: the forcing kernel is silent, and a forced
+        # ``</think>`` is indistinguishable from a natural one in the output.
+        self.num_budget_hits = 0
 
     @classmethod
     def from_config(cls, vllm_config: "VllmConfig") -> "DsparkLoopBreak | None":
@@ -169,7 +173,13 @@ class DsparkLoopBreak:
             st["think_len"] = 0
             st["last_check"] = 0
             st["fired"] = False
+            st["budget_logged"] = False
         elif last_start > last_end:
+            if not st["in_think"] or window_begin + last_start >= st["section_begin"]:
+                # a new section (or the first one): re-arm per-section flags
+                st["fired"] = False
+                st["last_check"] = 0
+                st["budget_logged"] = False
             st["in_think"] = True
             st["section_begin"] = window_begin + last_start + len(self.start_ids)
             st["think_len"] = n - st["section_begin"]
@@ -177,6 +187,20 @@ class DsparkLoopBreak:
             st["think_len"] = st["think_len"] + (n - scan_pos)
         st["scan_pos"] = n
 
+        if st["in_think"] and not st.get("budget_logged"):
+            budget = getattr(sp, "thinking_token_budget", None) if sp else None
+            if budget is not None and budget > 0 and st["think_len"] >= budget:
+                st["budget_logged"] = True
+                self.num_budget_hits += 1
+                logger.info(
+                    "DSPARK thinking budget reached: request %s used %d reasoning "
+                    "tokens (budget %d); the end sequence is being forced "
+                    "(budget hits %d total).",
+                    rid,
+                    st["think_len"],
+                    budget,
+                    self.num_budget_hits,
+                )
         if st["fired"] or not st["in_think"]:
             return False
         think_len = st["think_len"]
