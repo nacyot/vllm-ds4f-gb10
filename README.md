@@ -242,6 +242,10 @@ These are documented in their commit messages. This repository will keep accumul
 
 ## Changelog
 
+### 2026-08-30 (night) — one disk-tier namespace for every TP layout (1 commit)
+
+- **`DSPARK_PARALLEL_AGNOSTIC=1`** (opt-in) lets a multi-group MLA model share one disk-tier folder across TP sizes. Upstream's parallelism-agnostic gate accepts only single-group models, so DeepSeek V4 Flash (full-attention MLA, sliding-window MLA and compressor-state groups) hashed `tp_size` into the namespace and sessions written under TP=2 were invisible under TP=4. The worker already certifies every layer's canonical mapping as portable and fails closed otherwise; this flag only widens the scheduler-side namespace collapse for all-MLA groups under `canonical_layout` (no DCP/PCP, `world_size == tp_size`). Evidence on GB10: chunk files of the same key written under TP=2 and TP=4 have identical layout and size and differ only by fp8 rounding noise (76% of differing bytes by one code). Live proof on the 4-node TP=4 deployment after merging both old folders into the shared one with hard links (58,719 files, 0 bytes copied): two sessions written under TP=2 on 2026-08-27 cold-restored with 60,416 / 61,927 and 446,464 / 450,050 external hits (993 MB in 1.8 s, 6.9 GB in 8.3 s) and both needles were recalled.
+
 ### 2026-08-30 (evening) — lint pass and four upstream fixes (5 commits)
 
 - **Every fork-modified Python file now passes the repo pre-commit hooks** (ruff-check, ruff-format, typos, pinned to the upstream revisions). 152 files were run through the hooks; 33 changed (formatting, import order, f-strings, `contextlib.suppress`, `logger.exception`, three identifiers the typos hook flagged). No behaviour change. Earlier rounds had not been linted; from now on the hooks run before every commit.
