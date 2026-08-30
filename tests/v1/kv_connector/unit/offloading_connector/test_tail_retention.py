@@ -43,7 +43,6 @@ from vllm.v1.kv_offload.base import (
     make_offload_key,
 )
 
-
 # ---------------------------------------------------------------------------
 # Pure predicates
 # ---------------------------------------------------------------------------
@@ -106,15 +105,11 @@ def test_superseded_anchor_ranges_edges():
 def test_anchor_now_predicate_prompt_anchor_only():
     # a=4, window 2, prompt 22 chunks -> anchor 20 -> chunks 18,19 pass
     passing = [
-        i
-        for i in range(24)
-        if is_store_anchor_now_swa_chunk(i, 22, 4, 2, False)
+        i for i in range(24) if is_store_anchor_now_swa_chunk(i, 22, 4, 2, False)
     ]
     assert passing == [18, 19]
     # eagle: one more trailing chunk (17,18,19)
-    passing = [
-        i for i in range(24) if is_store_anchor_now_swa_chunk(i, 22, 4, 2, True)
-    ]
+    passing = [i for i in range(24) if is_store_anchor_now_swa_chunk(i, 22, 4, 2, True)]
     assert passing == [17, 18, 19]
     # checkpoint every 8 chunks adds boundaries 8 and 16 (aligned to a)
     passing = [
@@ -271,7 +266,9 @@ def test_prune_gated_on_anchor_snapshot_landing(request_runner, monkeypatch):
     sched._prune_superseded_anchors(req_status, set(full_keys))
     assert calls == []
     sched._prune_superseded_anchors(req_status, {swa_keys[14], swa_keys[15]})
-    assert calls and set(calls[0]) == set(swa_keys[10:12] + swa_keys[6:8] + swa_keys[2:4])
+    assert calls and set(calls[0]) == set(
+        swa_keys[10:12] + swa_keys[6:8] + swa_keys[2:4]
+    )
     runner.manager.prepare_store.side_effect = lambda keys, req_context: (
         generate_store_output(keys)
     )

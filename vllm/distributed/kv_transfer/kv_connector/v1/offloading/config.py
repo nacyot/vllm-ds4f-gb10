@@ -9,7 +9,6 @@ from vllm.v1.kv_cache_interface import (
     AttentionSpec,
     FullAttentionSpec,
     MLAAttentionSpec,
-    UniformTypeKVCacheSpecs,
 )
 from vllm.v1.kv_offload.config import (
     OffloadingCacheConfig,
@@ -110,9 +109,7 @@ def build_offloading_config(
             else sum(tensor.size for tensor in kv_cache_config.kv_cache_tensors)
         )
         worker_kv_bytes_per_block = total_gpu_kv_bytes // kv_cache_config.num_blocks
-        _compact_packed = bool(
-            extra_config.get("dspark_compact_packed", False)
-        )
+        _compact_packed = bool(extra_config.get("dspark_compact_packed", False))
         if _compact_packed and is_packed:
             # Compact packed rows need room for every group's true pages.
             # Scheduler-side specs can disagree with worker-resolved specs

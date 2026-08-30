@@ -1,5 +1,3 @@
-import os
-import time as _time
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """
@@ -22,6 +20,7 @@ Key Design Principles:
    protecting blocks from eviction until complete_read() is called
 """
 
+import os
 import time
 from collections.abc import Collection, Iterable, Sequence
 from dataclasses import dataclass, field
@@ -160,14 +159,16 @@ class _SecondaryTierFacingParent(ParentManager):
         return self._m.on_request_finished(req_context, exclude_tier=self._origin)
 
 
-
 _DSPARK_TRACE_ON = os.environ.get("DSPARK_LOOKUP_TRACE") == "1"
 _dspark_trace_counts: dict = {}
+
+
 def _dspark_trace(kind, req_id, key):
     if not _DSPARK_TRACE_ON:
         return
     try:
         from vllm.v1.kv_offload.base import get_offload_group_idx as _ggi
+
         g = _ggi(key)
     except Exception:
         g = -1
@@ -176,6 +177,7 @@ def _dspark_trace(kind, req_id, key):
     if n < 60:
         _dspark_trace_counts[k] = n + 1
         logger.info("DSPARK_TRACE %s req=%s g=%d n=%d", kind, req_id, g, n)
+
 
 class TieringOffloadingManager(OffloadingManager):
     """
@@ -262,11 +264,10 @@ class TieringOffloadingManager(OffloadingManager):
         # (see lookup), after which a fresh store may legitimately
         # re-offer the key.
         self._dspark_poisoned_keys: set = set()
-        self._fs_promoted_keys: "dict" = _OD()
+        self._fs_promoted_keys: dict = _OD()
         try:
             _cap = int(
-                os.environ.get("DSPARK_FS_PROMOTED_KEYS_CAP", "500000")
-                or 500000
+                os.environ.get("DSPARK_FS_PROMOTED_KEYS_CAP", "500000") or 500000
             )
         except ValueError:
             _cap = 500000
@@ -500,10 +501,7 @@ class TieringOffloadingManager(OffloadingManager):
         # gone from the primary tier (evicted), drop the poison so a
         # later fresh store can re-offer the key.
         if self._dspark_poisoned_keys and key in self._dspark_poisoned_keys:
-            if (
-                self.primary_tier.lookup(key, req_context)
-                is LookupResult.MISS
-            ):
+            if self.primary_tier.lookup(key, req_context) is LookupResult.MISS:
                 self._dspark_poisoned_keys.discard(key)
             return LookupResult.MISS
 
@@ -561,7 +559,7 @@ class TieringOffloadingManager(OffloadingManager):
                     # recompute). Bounded per request: after
                     # DSPARK_PRIMFULL_RETRIES consecutive full passes fall
                     # back to the old MISS behavior.
-                    _now = _time.monotonic()
+                    _now = time.monotonic()
                     _rid = req_context.req_id
                     if _now - self._primfull_last_tick.get(_rid, 0.0) >= 1.0:
                         self._primfull_last_tick[_rid] = _now
@@ -739,9 +737,12 @@ class TieringOffloadingManager(OffloadingManager):
                     for k in keys
                 ]
                 import logging as _lg
+
                 _lg.getLogger(__name__).info(
                     "DSPARK prep_load keys=%d promoted_hits=%d",
-                    len(list(keys)), sum(1 for p in paths if p is not None))
+                    len(list(keys)),
+                    sum(1 for p in paths if p is not None),
+                )
                 if any(p is not None for p in paths):
                     spec.fs_paths = paths  # type: ignore[attr-defined]
         return spec

@@ -653,6 +653,7 @@ def test_deepseek_v4_official_api_sampling_override_is_v4_only():
     assert sampling_params.presence_penalty == 1.5
     assert sampling_params.frequency_penalty == 1.25
 
+
 def _split_turn_messages():
     """One logical assistant turn replayed as consecutive messages."""
     return [

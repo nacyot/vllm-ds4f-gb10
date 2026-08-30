@@ -463,8 +463,7 @@ def _prewarm_b12x_route_pack(
         _B12X_ROUTE_PACK_WARMED.add(cache_key)
 
     logger.info(
-        "Prewarmed B12X route-pack capacities %s on cuda:%d "
-        "(experts=%d, topk=%d)",
+        "Prewarmed B12X route-pack capacities %s on cuda:%d (experts=%d, topk=%d)",
         capacities,
         device_index,
         num_experts,

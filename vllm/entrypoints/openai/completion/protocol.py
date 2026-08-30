@@ -3,6 +3,7 @@
 
 # Adapted from
 # https://github.com/lm-sys/FastChat/blob/168ccc29d3f7edc50823016105c024fe2282732a/fastchat/protocol/openai_api_protocol.py
+import os
 import time
 from typing import Annotated, Any, Literal
 
@@ -43,14 +44,13 @@ logger = init_logger(__name__)
 # = positive int enables; a request may still opt out with -1 (unlimited) or
 # override with its own value. Pairs with ReasoningConfig loop breaking
 # (vLLM PR #52677 port) as the hard upper bound for runaway reasoning.
-import os as _dspark_os
 
 
 def _dspark_default_thinking_budget(value):
     if value is not None:
         return None if value == -1 else value
     try:
-        default = int(_dspark_os.environ.get("DSPARK_DEFAULT_THINKING_BUDGET", "0") or 0)
+        default = int(os.environ.get("DSPARK_DEFAULT_THINKING_BUDGET", "0") or 0)
     except ValueError:
         default = 0
     return default if default > 0 else None

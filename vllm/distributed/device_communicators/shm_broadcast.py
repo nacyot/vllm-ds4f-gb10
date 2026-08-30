@@ -132,7 +132,8 @@ class SpinCondition:
         is_reader: bool,
         context: zmq.Context,
         notify_address: str,
-        busy_loop_s: float = 0.002,  # spin hotfix: was 1s (GB10 P-core 96C, see vllm-spin-wait-gb10)
+        # spin hotfix: was 1s (GB10 P-core 96C, see vllm-spin-wait-gb10)
+        busy_loop_s: float = 0.002,
     ):
         self.is_reader = is_reader
 

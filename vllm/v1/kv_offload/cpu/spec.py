@@ -92,9 +92,7 @@ class CPUOffloadingSpec(OffloadingSpec):
             # canonical 공유: 전 워커가 같은 canonical 영역에 기록하므로
             # 복사본 1벌이면 충분 — 슬롯 크기 절반화 (하역장 실크기화).
             _canonical = bool(getattr(config, "canonical_layout", False))
-            num_copies = (
-                1 if (self.replicated_layout or _canonical) else world_size
-            )
+            num_copies = 1 if (self.replicated_layout or _canonical) else world_size
             kv_bytes_per_block = config.worker_kv_bytes_per_block * num_copies
             kv_bytes_per_chunk = kv_bytes_per_block * self.blocks_per_chunk
 

@@ -671,9 +671,7 @@ class DeepseekSparseSWAMetadataBuilder(AttentionMetadataBuilder):
                 else None
             ),
             prefill_swa_lens=(
-                self.prefill_swa_lens[:num_prefill_tokens]
-                if want_prefill_swa
-                else None
+                self.prefill_swa_lens[:num_prefill_tokens] if want_prefill_swa else None
             ),
             block_size=self.block_size,
             num_decodes=num_decodes,

@@ -29,15 +29,6 @@ from vllm.tracing import (
 )
 from vllm.utils import length_from_prompt_token_ids_or_embeds
 from vllm.v1.engine import EngineCoreOutput, EngineCoreRequest, FinishReason
-
-# [dspark-dsml-leak-guard-0271] DSML 누출 가드 (기본 꺼짐).
-_DSPARK_DSML_LEAK_GUARD = (
-    os.environ.get("DSPARK_DSML_LEAK_GUARD", "").strip() == "1"
-)
-# 파서 미복구 대체 방언 토큰: <dsml: (128840), </dsml: (128841). 출현 = 누출.
-_DSPARK_DSML_DIALECT_TOKEN_IDS = frozenset({128840, 128841})
-# 마커(｜DSML｜) 탈락 닫기 태그(유효 close 는 </｜DSML｜...> 라 부분열 불일치 → 오탐 0).
-_DSPARK_DSML_BARE_CLOSERS = ("</invoke>", "</parameter>", "</result>")
 from vllm.v1.engine.detokenizer import IncrementalDetokenizer
 from vllm.v1.engine.logprobs import LogprobsProcessor
 from vllm.v1.engine.parallel_sampling import ParentRequest
@@ -47,6 +38,13 @@ from vllm.v1.metrics.stats import (
     RequestStateStats,
     SchedulerStats,
 )
+
+# [dspark-dsml-leak-guard-0271] DSML 누출 가드 (기본 꺼짐).
+_DSPARK_DSML_LEAK_GUARD = os.environ.get("DSPARK_DSML_LEAK_GUARD", "").strip() == "1"
+# 파서 미복구 대체 방언 토큰: <dsml: (128840), </dsml: (128841). 출현 = 누출.
+_DSPARK_DSML_DIALECT_TOKEN_IDS = frozenset({128840, 128841})
+# 마커(｜DSML｜) 탈락 닫기 태그(유효 close 는 </｜DSML｜...> 라 부분열 불일치 → 오탐 0).
+_DSPARK_DSML_BARE_CLOSERS = ("</invoke>", "</parameter>", "</result>")
 
 # shared empty CPU tensor used as a placeholder pooling output
 EMPTY_CPU_TENSOR = torch.empty(0, device="cpu")

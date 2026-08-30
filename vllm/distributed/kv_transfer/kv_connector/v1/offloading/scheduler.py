@@ -1,4 +1,5 @@
 import os
+
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 import time
@@ -187,9 +188,7 @@ def is_store_anchor_now_swa_chunk(
     ckpt = checkpoint_chunks or 0
     if ckpt:
         ckpt = max(a, (ckpt // a) * a)
-    for boundary in range(
-        absolute_chunk_index + 1, absolute_chunk_index + tail + 1
-    ):
+    for boundary in range(absolute_chunk_index + 1, absolute_chunk_index + tail + 1):
         if boundary % a:
             continue
         if boundary > 0 and boundary == prompt_anchor:
@@ -348,11 +347,12 @@ class SchedulerOffloadConfig(NamedTuple):
             )
 
         import os as _os
+
         _tail_only = _os.environ.get("DSPARK_TAIL_ONLY") == "1"
-        _anchor_now = _os.environ.get("DSPARK_TAIL_ONLY") == "2"  # NODE3_TAILONLY_FIX F3
-        _anchor_ckpt_tokens = int(
-            _os.environ.get("DSPARK_TAIL_CKPT_TOKENS", "0") or 0
-        )
+        _anchor_now = (
+            _os.environ.get("DSPARK_TAIL_ONLY") == "2"
+        )  # NODE3_TAILONLY_FIX F3
+        _anchor_ckpt_tokens = int(_os.environ.get("DSPARK_TAIL_CKPT_TOKENS", "0") or 0)
         _anchor_tokens_override = int(
             _os.environ.get("DSPARK_TAIL_ANCHOR_TOKENS", "0") or 0
         )
@@ -362,7 +362,8 @@ class SchedulerOffloadConfig(NamedTuple):
                 "window groups store only the w(+e) chunks before the prompt's "
                 "last full-attention-aligned boundary (ckpt_tokens=%d), "
                 "decided at compute time (no deferral). anchor_tokens_override=%d",
-                _anchor_ckpt_tokens, _anchor_tokens_override,
+                _anchor_ckpt_tokens,
+                _anchor_tokens_override,
             )
         if _tail_only:
             logger.info(
@@ -379,7 +380,8 @@ class SchedulerOffloadConfig(NamedTuple):
                 "(TAIL_KEEP=%d) — after each completed store, window-group "
                 "snapshots at aligned boundaries older than the chain's %d "
                 "most recent are deleted from the secondary tiers.",
-                _tail_keep, _tail_keep,
+                _tail_keep,
+                _tail_keep,
             )
         _n3_cfg = cls(  # NODE3_TAILONLY_INSTR
             tail_only=_tail_only,
@@ -432,10 +434,16 @@ class SchedulerOffloadConfig(NamedTuple):
                 "kvoff groupcfg g=%d tokens_per_block=%d tokens_per_chunk=%d "
                 "sw_chunks=%s align_chunks=%s anchor_chunks=%s eagle=%s "
                 "alignment_tokens=%s tail_only=%s blocks_per_chunk=%d",
-                _g.group_idx, _g.tokens_per_block, _g.tokens_per_chunk,
-                _g.sliding_window_size_in_chunks, _g.alignment_chunk_count,
-                _g.anchor_chunk_count, _g.is_eagle_group, alignment_tokens,
-                _tail_only, spec.blocks_per_chunk,
+                _g.group_idx,
+                _g.tokens_per_block,
+                _g.tokens_per_chunk,
+                _g.sliding_window_size_in_chunks,
+                _g.alignment_chunk_count,
+                _g.anchor_chunk_count,
+                _g.is_eagle_group,
+                alignment_tokens,
+                _tail_only,
+                spec.blocks_per_chunk,
             )
         return _n3_cfg
 
@@ -714,9 +722,7 @@ class OffloadingConnectorScheduler:
         try:
             self._finish_store_retries_cap: int = max(
                 0,
-                int(
-                    os.environ.get("DSPARK_FINISH_STORE_RETRIES", "30") or 30
-                ),
+                int(os.environ.get("DSPARK_FINISH_STORE_RETRIES", "30") or 30),
             )
         except ValueError:
             self._finish_store_retries_cap = 30
@@ -974,8 +980,12 @@ class OffloadingConnectorScheduler:
                     logger.info(
                         "kvoff lookup req=%s g=%d start=%d end=%d hits=%s "
                         "maxhit=%d computed=%d",
-                        req_status.req.request_id, group_idx, start_chunk_idx,
-                        num_chunks, num_hit_chunks, max_hit_size_tokens,
+                        req_status.req.request_id,
+                        group_idx,
+                        start_chunk_idx,
+                        num_chunks,
+                        num_hit_chunks,
+                        max_hit_size_tokens,
                         num_computed_tokens,
                     )
                 if num_hit_chunks == 0:
@@ -1001,9 +1011,8 @@ class OffloadingConnectorScheduler:
                         # (query_max is clamped to the key range), so the
                         # unconditional pop semantics are preserved there.
                         _extra_chunk_queried = query_max > max_hit_size_tokens
-                        if (
-                            not _extra_chunk_queried
-                            or num_hit_chunks >= len(offload_keys)
+                        if not _extra_chunk_queried or num_hit_chunks >= len(
+                            offload_keys
                         ):
                             num_hit_chunks -= 1
                         eagle_verified.add(group_idx)
@@ -1255,9 +1264,7 @@ class OffloadingConnectorScheduler:
             dst_spec=dst_spec,
         )
         # [load-error-recompute]
-        self._dspark_load_job_dst_blocks[load_job_id] = {
-            int(b) for b in dst_block_ids
-        }
+        self._dspark_load_job_dst_blocks[load_job_id] = {int(b) for b in dst_block_ids}
         # a load can only be issued when no other jobs are pending.
         assert not req_status.transfer_jobs
         req_status.transfer_jobs.add(load_job_id)
@@ -1372,12 +1379,8 @@ class OffloadingConnectorScheduler:
                         _nch = req_status.storable_chunks(
                             _gcfg, _gstate, num_offloadable_tokens
                         )
-                        _start = (
-                            _gstate.next_stored_chunk_idx * blocks_per_chunk
-                        )
-                        for _bid in _gstate.block_ids[
-                            _start : _nch * blocks_per_chunk
-                        ]:
+                        _start = _gstate.next_stored_chunk_idx * blocks_per_chunk
+                        for _bid in _gstate.block_ids[_start : _nch * blocks_per_chunk]:
                             if _bid and _bid in _cur_alloc:
                                 _stale = True
                                 break
@@ -1479,11 +1482,17 @@ class OffloadingConnectorScheduler:
                     logger.info(
                         "kvoff swa-finish req=%s g=%d sw=%s next=%d nchunks=%d "
                         "cand=%d hole=%d unreach=%d kept=%d ntok=%d nblk=%d",
-                        req_id, group_config.group_idx,
+                        req_id,
+                        group_config.group_idx,
                         group_config.sliding_window_size_in_chunks,
-                        start_chunk_idx, num_chunks, len(offload_keys),
-                        _n3_hole, _n3_unreach, _n3_kept,
-                        num_offloadable_tokens, len(group_state.block_ids),
+                        start_chunk_idx,
+                        num_chunks,
+                        len(offload_keys),
+                        _n3_hole,
+                        _n3_unreach,
+                        _n3_kept,
+                        num_offloadable_tokens,
+                        len(group_state.block_ids),
                     )
 
             if not new_offload_keys:
@@ -1752,29 +1761,23 @@ class OffloadingConnectorScheduler:
         # metadata still claims the chunks are stored, so an unchanged
         # lookup would re-offer the same failing chunks and the request
         # would retry forever. Poison the keys of every in-flight load job
-        # that overlaps the invalid GPU blocks: lookup() then MISSes them
+        # that overlaps the invalid GPU blocks: lookup() then returns MISS for them
         # (patch_41) and fs_paths are no longer attached. Job granularity
         # over-poisons; the only cost is extra recompute.
         invalid_block_ids = getattr(connector_output, "invalid_block_ids", None)
         if invalid_block_ids and self._dspark_load_job_dst_blocks:
-            for job_id, dst_blocks in list(
-                self._dspark_load_job_dst_blocks.items()
-            ):
+            for job_id, dst_blocks in list(self._dspark_load_job_dst_blocks.items()):
                 overlap = invalid_block_ids.intersection(dst_blocks)
                 if not overlap:
                     continue
                 job_status = self._jobs.get(job_id)
                 if job_status is not None and not job_status.is_store:
-                    poisoned = getattr(
-                        self.manager, "_dspark_poisoned_keys", None
-                    )
+                    poisoned = getattr(self.manager, "_dspark_poisoned_keys", None)
                     if poisoned is None:
                         poisoned = set()
                         self.manager._dspark_poisoned_keys = poisoned
                     poisoned.update(job_status.keys)
-                    promoted = getattr(
-                        self.manager, "_fs_promoted_keys", None
-                    )
+                    promoted = getattr(self.manager, "_fs_promoted_keys", None)
                     if promoted is not None:
                         for k in job_status.keys:
                             promoted.pop(k, None)
@@ -1899,9 +1902,7 @@ class OffloadingConnectorScheduler:
                 out.extend(keys[start:end])
         return out
 
-    def _anchor_snapshot_keys(
-        self, req_status: RequestOffloadState
-    ) -> set[OffloadKey]:
+    def _anchor_snapshot_keys(self, req_status: RequestOffloadState) -> set[OffloadKey]:
         """Window-group keys of this request's prompt-anchor snapshot (the
         w(+e) chunks right before the prompt's last aligned boundary)."""
         cfg = self.config

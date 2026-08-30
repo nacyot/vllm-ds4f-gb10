@@ -76,7 +76,7 @@ class DsparkLoopBreak:
         self.num_budget_hits = 0
 
     @classmethod
-    def from_config(cls, vllm_config: "VllmConfig") -> "DsparkLoopBreak | None":
+    def from_config(cls, vllm_config: VllmConfig) -> DsparkLoopBreak | None:
         rc = getattr(vllm_config, "reasoning_config", None)
         if rc is None or not getattr(rc, "enabled", False):
             return None
@@ -116,7 +116,7 @@ class DsparkLoopBreak:
         return lb
 
     # ------------------------------------------------------------------
-    def _init_state(self, request: "Request") -> dict[str, Any]:
+    def _init_state(self, request: Request) -> dict[str, Any]:
         """The section may have begun in the prompt (DeepSeek V4 chat
         templates open ``<think>`` before generation): seed from the prompt
         tail like the V1 holder does."""
@@ -141,7 +141,7 @@ class DsparkLoopBreak:
                 st["section_begin"] = 0
         return st
 
-    def observe(self, request: "Request", pending: dict[str, int]) -> bool:
+    def observe(self, request: Request, pending: dict[str, int]) -> bool:
         """Update tracking for ``request`` after new output tokens were
         appended; on a confirmed loop, record ``pending[request_id] =
         reasoning tokens so far`` (shipped with the next SchedulerOutput).

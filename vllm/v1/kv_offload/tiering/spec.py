@@ -99,16 +99,12 @@ def _dspark_failed_chunks_to_gpu_blocks(
     dst_blocks = dst_spec.block_ids
     try:
         failed_pos = {
-            i
-            for i, b in enumerate(src_spec.block_ids)
-            if int(b) in failed_cpu_bids
+            i for i, b in enumerate(src_spec.block_ids) if int(b) in failed_cpu_bids
         }
         failed_gpu: set = set()
         src_off = 0
         dst_off = 0
-        for group_size, block_idx in zip(
-            dst_spec.group_sizes, dst_spec.block_indices
-        ):
+        for group_size, block_idx in zip(dst_spec.group_sizes, dst_spec.block_indices):
             gsz = int(group_size)
             if gsz == 0:
                 continue
@@ -125,8 +121,8 @@ def _dspark_failed_chunks_to_gpu_blocks(
             dst_off += gsz
         if src_off != len(src_spec.block_ids) or dst_off != len(dst_blocks):
             raise ValueError(
-                "offset walk mismatch: src %d/%d dst %d/%d"
-                % (src_off, len(src_spec.block_ids), dst_off, len(dst_blocks))
+                f"offset walk mismatch: src {src_off}/{len(src_spec.block_ids)} "
+                f"dst {dst_off}/{len(dst_blocks)}"
             )
         return failed_gpu
     except Exception as exc:  # noqa: BLE001
@@ -496,6 +492,7 @@ class TieringOffloadingSpec(CPUOffloadingSpec):
                 logger.warning("DSPARK layout sidecar failed: %s", _e)
 
             import os as _skip_os
+
             _pread_skip = _skip_os.environ.get("DSPARK_FS_PREAD_SKIP") == "1"
 
             def _fs_submit_load(job_id, src_spec, dst_spec):
@@ -510,9 +507,12 @@ class TieringOffloadingSpec(CPUOffloadingSpec):
                 # Removes the shared-storage requirement and moves the cross-node
                 # copy onto the fast link. Replicated KV -> one read suffices.
                 import os as _relay_os
+
                 if entries and _relay_os.environ.get("DSPARK_RELAY_RESTORE") == "1":
                     import torch as _t
+
                     from vllm.distributed.parallel_state import get_tp_group
+
                     _tp = get_tp_group()
                     if _tp.world_size > 1:
                         _is_src = _tp.rank_in_group == 0
@@ -526,8 +526,11 @@ class TieringOffloadingSpec(CPUOffloadingSpec):
                         )
                         _win_bytes = 268435456
                         try:
-                            _win_bytes = int(_relay_os.environ.get(
-                                "DSPARK_RELAY_WINDOW_BYTES", "268435456"))
+                            _win_bytes = int(
+                                _relay_os.environ.get(
+                                    "DSPARK_RELAY_WINDOW_BYTES", "268435456"
+                                )
+                            )
                         except (ValueError, TypeError):
                             _win_bytes = 268435456
                         # DSPARK_RELAY_DIRECT (default 1): source the
@@ -545,15 +548,16 @@ class TieringOffloadingSpec(CPUOffloadingSpec):
                         # so the bytes are already in _flat and the per-chunk
                         # pread was a second NVMe read of the same bytes.
                         # Set DSPARK_RELAY_DIRECT=0 for the legacy preads.
-                        _relay_direct = _relay_os.environ.get(
-                            "DSPARK_RELAY_DIRECT", "1") != "0"
+                        _relay_direct = (
+                            _relay_os.environ.get("DSPARK_RELAY_DIRECT", "1") != "0"
+                        )
                         _wi = 0
                         while _wi < len(_items):
                             _wb = 0
                             _wj = _wi
                             while _wj < len(_items) and (
-                                    _wj == _wi
-                                    or _wb + _items[_wj][2] <= _win_bytes):
+                                _wj == _wi or _wb + _items[_wj][2] <= _win_bytes
+                            ):
                                 _wb += _items[_wj][2]
                                 _wj += 1
                             _window = _items[_wi:_wj]
@@ -574,7 +578,8 @@ class TieringOffloadingSpec(CPUOffloadingSpec):
                                             "[relay-read-fail] relay src "
                                             "read failed for %s: %s "
                                             "(broadcasting staging bytes)",
-                                            _path, _e2,
+                                            _path,
+                                            _e2,
                                         )
                                         continue
                                     if len(_data) != _ln:
@@ -582,7 +587,9 @@ class TieringOffloadingSpec(CPUOffloadingSpec):
                                             "[relay-read-fail] relay src "
                                             "short read for %s: %d != %d "
                                             "(broadcasting staging bytes)",
-                                            _path, len(_data), _ln,
+                                            _path,
+                                            len(_data),
+                                            _ln,
                                         )
                                         continue
                                     _g = _t.frombuffer(
@@ -595,14 +602,16 @@ class TieringOffloadingSpec(CPUOffloadingSpec):
                                 _pos = 0
                                 for _off, _p, _ln in _window:
                                     _buf[_pos : _pos + _ln].copy_(
-                                        _flat[_off : _off + _ln])
+                                        _flat[_off : _off + _ln]
+                                    )
                                     _pos += _ln
                             _tp.broadcast(_buf, src=0)
                             if not _is_src:
                                 _pos = 0
                                 for _off, _p, _ln in _window:
                                     _flat[_off : _off + _ln].copy_(
-                                        _buf[_pos : _pos + _ln])
+                                        _buf[_pos : _pos + _ln]
+                                    )
                                     _pos += _ln
                             _t.cuda.synchronize()
                             del _buf
@@ -610,19 +619,24 @@ class TieringOffloadingSpec(CPUOffloadingSpec):
                         _total = sum(_ln for _o, _p, _ln in _items)
                         logger.debug(
                             "relay restore: src=%s chunks=%d bytes=%d",
-                            _is_src, len(_items), _total,
+                            _is_src,
+                            len(_items),
+                            _total,
                         )
                         return _orig_submit_load(job_id, src_spec, dst_spec)
                 logger.info(
                     "DSPARK wk_load job=%s spec=%s fs=%s",
-                    job_id, type(src_spec).__name__,
+                    job_id,
+                    type(src_spec).__name__,
                     len(entries) if entries else None,
                 )
                 if entries and _pread_skip:
                     # head node: the scheduler already filled this mmap during
                     # promotion; the worker-direct pread would be a duplicate.
-                    logger.info("DSPARK fs-direct preads skipped (head): %d",
-                                sum(1 for _e in entries if _e))
+                    logger.info(
+                        "DSPARK fs-direct preads skipped (head): %d",
+                        sum(1 for _e in entries if _e),
+                    )
                     entries = None
                 _pt = 1
                 try:
@@ -633,33 +647,45 @@ class TieringOffloadingSpec(CPUOffloadingSpec):
                     # DSPARK S2a/b: parallel reads (GIL released) in bounded
                     # windows, GPU-routed writes batched, one synchronize per
                     # window. Memory bound = window * chunk slice (~16 * 16MB).
+                    from concurrent.futures import (
+                        ThreadPoolExecutor as _ThreadPoolExecutor,
+                    )
+
                     import torch as _t
-                    from concurrent.futures import ThreadPoolExecutor as _TPE
+
                     try:
-                        _win = int(_skip_os.environ.get("DSPARK_FS_PREAD_WINDOW", "16") or 16)
+                        _win = int(
+                            _skip_os.environ.get("DSPARK_FS_PREAD_WINDOW", "16") or 16
+                        )
                     except ValueError:
                         _win = 16
                     _ex = getattr(_worker, "_dspark_pread_ex", None)
                     if _ex is None:
-                        _ex = _worker._dspark_pread_ex = _TPE(
-                            max_workers=_pt, thread_name_prefix="fs_pread")
-                    _items = [(int(_bid) * _row + int(_ent[1]), _ent[0],
-                               int(_ent[2]))
-                              for _bid, _ent in zip(src_spec.block_ids, entries) if _ent]
+                        _ex = _worker._dspark_pread_ex = _ThreadPoolExecutor(
+                            max_workers=_pt, thread_name_prefix="fs_pread"
+                        )
+                    _items = [
+                        (int(_bid) * _row + int(_ent[1]), _ent[0], int(_ent[2]))
+                        for _bid, _ent in zip(src_spec.block_ids, entries)
+                        if _ent
+                    ]
 
                     def _read_one(_it):
                         try:
                             with open(_it[1], "rb") as _f:
                                 return _f.read()
                         except OSError as _e:
-                            logger.warning("fs direct read failed for %s: %s", _it[1], _e)
+                            logger.warning(
+                                "fs direct read failed for %s: %s", _it[1], _e
+                            )
                             return None
 
                     _flat = _t.frombuffer(
-                        memoryview(worker_mmap.mmap_obj), dtype=_t.uint8)
+                        memoryview(worker_mmap.mmap_obj), dtype=_t.uint8
+                    )
                     _n = 0
                     for _i in range(0, len(_items), _win):
-                        _chunk = _items[_i:_i + _win]
+                        _chunk = _items[_i : _i + _win]
                         _datas = list(_ex.map(_read_one, _chunk))
                         _keep = []
                         for (_off, _p, _ln), _data in zip(_chunk, _datas):
@@ -673,33 +699,45 @@ class TieringOffloadingSpec(CPUOffloadingSpec):
                                 # the range deterministically instead of
                                 # silently serving stale bytes as restored
                                 # KV.
-                                _why = ("failed" if _data is None else
-                                        "short (%d bytes)" % len(_data))
+                                _why = (
+                                    "failed"
+                                    if _data is None
+                                    else f"short ({len(_data)} bytes)"
+                                )
                                 logger.error(
                                     "[relay-read-fail] fs pread %s for %s "
                                     "(want %d bytes); zero-filling range",
-                                    _why, _p, _ln)
-                                _z = _t.zeros(
-                                    _ln, dtype=_t.uint8, device="cuda")
-                                _flat[_off:_off + _ln].copy_(_z)
+                                    _why,
+                                    _p,
+                                    _ln,
+                                )
+                                _z = _t.zeros(_ln, dtype=_t.uint8, device="cuda")
+                                _flat[_off : _off + _ln].copy_(_z)
                                 _keep.append(_z)
                                 # [load-error-recompute] slice offsets are
                                 # row-internal (< _row), so the row index
                                 # recovers the staging chunk block id.
                                 _failed_cpu_bids.add(_off // _row)
                                 continue
-                            _src_gpu = _t.frombuffer(bytearray(_data), dtype=_t.uint8).cuda()
-                            _flat[_off:_off + len(_data)].copy_(_src_gpu)
+                            _src_gpu = _t.frombuffer(
+                                bytearray(_data), dtype=_t.uint8
+                            ).cuda()
+                            _flat[_off : _off + len(_data)].copy_(_src_gpu)
                             _keep.append(_src_gpu)
                             _n += 1
                         _t.cuda.synchronize()
                         del _keep, _datas
-                    logger.info("DSPARK fs-direct preads (parallel x%d, win %d): %d",
-                                _pt, _win, _n)
+                    logger.info(
+                        "DSPARK fs-direct preads (parallel x%d, win %d): %d",
+                        _pt,
+                        _win,
+                        _n,
+                    )
                     entries = None
                 if entries:
                     _n = 0
                     import torch as _t
+
                     _flat = _t.frombuffer(
                         memoryview(worker_mmap.mmap_obj), dtype=_t.uint8
                     )
@@ -715,13 +753,17 @@ class TieringOffloadingSpec(CPUOffloadingSpec):
                         except OSError as _e:
                             logger.error(
                                 "[relay-read-fail] fs pread failed for "
-                                "%s: %s; zero-filling range", _path, _e,
+                                "%s: %s; zero-filling range",
+                                _path,
+                                _e,
                             )
                         if _data is not None and len(_data) != _ln:
                             logger.error(
                                 "[relay-read-fail] fs pread short read for "
                                 "%s: %d != %d; zero-filling range",
-                                _path, len(_data), _ln,
+                                _path,
+                                len(_data),
+                                _ln,
                             )
                             _data = None
                         if _data is None:
@@ -756,10 +798,9 @@ class TieringOffloadingSpec(CPUOffloadingSpec):
                     # restored context. Drained once per step by
                     # OffloadingConnectorWorker.get_block_ids_with_load_errors.
                     _gpu_failed = _dspark_failed_chunks_to_gpu_blocks(
-                        src_spec, dst_spec, self.blocks_per_chunk,
-                        _failed_cpu_bids)
-                    _errs = getattr(
-                        _worker, "_dspark_load_error_block_ids", None)
+                        src_spec, dst_spec, self.blocks_per_chunk, _failed_cpu_bids
+                    )
+                    _errs = getattr(_worker, "_dspark_load_error_block_ids", None)
                     if _errs is None:
                         _errs = set()
                         _worker._dspark_load_error_block_ids = _errs
@@ -767,13 +808,17 @@ class TieringOffloadingSpec(CPUOffloadingSpec):
                     logger.error(
                         "[load-error-recompute] job=%s failed_chunks=%d -> "
                         "gpu_blocks=%d reported for recompute",
-                        job_id, len(_failed_cpu_bids), len(_gpu_failed))
+                        job_id,
+                        len(_failed_cpu_bids),
+                        len(_gpu_failed),
+                    )
                 return _orig_submit_load(job_id, src_spec, dst_spec)
 
             _worker.submit_load = _fs_submit_load
             return _worker
         except Exception:
             import traceback
+
             print("DSPARK_COMPACT_DEBUG create_worker exception:", flush=True)
             traceback.print_exc()
             worker_mmap.cleanup()

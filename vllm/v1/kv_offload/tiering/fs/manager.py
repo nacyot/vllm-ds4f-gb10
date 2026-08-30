@@ -15,9 +15,10 @@ File naming:  <base_path>_r<rank>/<hhh>/<hh>_g<group_idx>/<hash_hex>.bin
               (hash-based subdirectories to limit directory fan-out)
 """
 
-import functools
+import contextlib
 import json
 import os
+import time
 from collections.abc import Iterable
 from typing import TYPE_CHECKING, ClassVar
 
@@ -62,28 +63,28 @@ if TYPE_CHECKING:
 logger = init_logger(__name__)
 
 # DSPARK: per-event KV offload JSONL log (env-gated, no-op when unset)
-import json as _ev_json
-import os as _ev_os
-import time as _ev_time
-_EV_PATH = _ev_os.environ.get("DSPARK_KV_EVENT_LOG")
+
+_EV_PATH = os.environ.get("DSPARK_KV_EVENT_LOG")
+
 
 def _kv_event(rec):
     if not _EV_PATH:
         return
     try:
-        rec["ts"] = round(_ev_time.time(), 3)
+        rec["ts"] = round(time.time(), 3)
         with open(_EV_PATH, "a") as _f:
-            _f.write(_ev_json.dumps(rec, separators=(",", ":")) + "\n")
+            _f.write(json.dumps(rec, separators=(",", ":")) + "\n")
     except OSError:
         pass
 
 
 def _env_int(name, default=1):
     try:
-        v = int(_ev_os.environ.get(name, "") or default)
+        v = int(os.environ.get(name, "") or default)
     except ValueError:
         v = default
     return v
+
 
 _FS_LOAD_TASKS = _env_int("DSPARK_FS_LOAD_TASKS", 1)
 _FS_STORE_TASKS = _env_int("DSPARK_FS_STORE_TASKS", 1)
@@ -108,6 +109,7 @@ def _fanout_tasks(fn, paths, view, offs, sizes, use_o_direct, fan):
     """Split one batch into up to `fan` tasks (each a partial over a slice)."""
     import functools as _ft
     import math as _math
+
     n = len(paths)
     if fan <= 1 or n <= 1:
         return [_ft.partial(fn, paths, view, offs, sizes, use_o_direct)]
@@ -138,33 +140,52 @@ class FsAsyncLookupManager(AsyncLookupManager):
         # DSPARK S3: split the stat batch across threads (C path releases the
         # GIL; CIFS metadata round trips are latency-bound, not CPU-bound).
         n_thr = _env_int("DSPARK_FS_LOOKUP_THREADS", 1)
-        _t0 = _ev_time.time()
+        _t0 = time.time()
         if n_thr > 1 and len(paths) >= 2 * n_thr:
             import math as _math
-            from concurrent.futures import ThreadPoolExecutor as _TPE
+            from concurrent.futures import ThreadPoolExecutor as _ThreadPoolExecutor
+
             ex = getattr(self, "_dspark_lookup_ex", None)
             if ex is None:
-                ex = self._dspark_lookup_ex = _TPE(max_workers=n_thr,
-                                                   thread_name_prefix="fs_lookup")
+                ex = self._dspark_lookup_ex = _ThreadPoolExecutor(
+                    max_workers=n_thr, thread_name_prefix="fs_lookup"
+                )
             per = _math.ceil(len(paths) / n_thr)
-            fn = (lambda ps: list(batch_lookup_C(ps))) if _HAS_BATCH_LOOKUP_C \
+            fn = (
+                (lambda ps: list(batch_lookup_C(ps)))
+                if _HAS_BATCH_LOOKUP_C
                 else (lambda ps: [os.path.exists(p) for p in ps])
-            futs = [ex.submit(fn, paths[i:i + per]) for i in range(0, len(paths), per)]
+            )
+            futs = [
+                ex.submit(fn, paths[i : i + per]) for i in range(0, len(paths), per)
+            ]
             results = []
             for f in futs:
                 results.extend(f.result())
-            _kv_event({"op": "lookup_batch", "n": len(paths),
-                       "hit": sum(1 for r in results if r), "threads": n_thr,
-                       "dt": round(_ev_time.time() - _t0, 3)})
+            _kv_event(
+                {
+                    "op": "lookup_batch",
+                    "n": len(paths),
+                    "hit": sum(1 for r in results if r),
+                    "threads": n_thr,
+                    "dt": round(time.time() - _t0, 3),
+                }
+            )
             return results
         if _HAS_BATCH_LOOKUP_C:
             # C extension: GIL released for the entire faccessat() batch.
             results = list(batch_lookup_C(paths))
         else:
             results = [os.path.exists(p) for p in paths]
-        _kv_event({"op": "lookup_batch", "n": len(paths),
-                   "hit": sum(1 for r in results if r), "threads": 1,
-                   "dt": round(_ev_time.time() - _t0, 3)})
+        _kv_event(
+            {
+                "op": "lookup_batch",
+                "n": len(paths),
+                "hit": sum(1 for r in results if r),
+                "threads": 1,
+                "dt": round(time.time() - _t0, 3),
+            }
+        )
         return results
 
 
@@ -367,13 +388,28 @@ class FileSystemTierManager(SecondaryTierManager):
         _keys = list(job_metadata.keys)
         _paths = [self.file_mapper.get_file_name(key) for key in _keys]
         _offs, _sizes = self._key_offsets_sizes(_keys, job_metadata.block_ids)
-        tasks = _fanout_tasks(batch_store_block, _paths, self._primary_kv_view,
-                              _offs, _sizes, self._use_o_direct, _FS_STORE_TASKS)
-        _kv_event({"op": "store", "job": job_metadata.job_id,
-                   "chunks": len(_keys), "tasks": len(tasks),
-                   "req": _req_id(job_metadata),
-                   "bytes": (sum(_sizes) if isinstance(_sizes, list) else _sizes * len(_keys)),
-                   "keys": _keys_hex(_keys)})
+        tasks = _fanout_tasks(
+            batch_store_block,
+            _paths,
+            self._primary_kv_view,
+            _offs,
+            _sizes,
+            self._use_o_direct,
+            _FS_STORE_TASKS,
+        )
+        _kv_event(
+            {
+                "op": "store",
+                "job": job_metadata.job_id,
+                "chunks": len(_keys),
+                "tasks": len(tasks),
+                "req": _req_id(job_metadata),
+                "bytes": (
+                    sum(_sizes) if isinstance(_sizes, list) else _sizes * len(_keys)
+                ),
+                "keys": _keys_hex(_keys),
+            }
+        )
         self._pool.enqueue_store(job_metadata.job_id, len(tasks), tasks)
 
     @override
@@ -384,18 +420,31 @@ class FileSystemTierManager(SecondaryTierManager):
             # A load counts as "use" for the external mtime-ordered pruner;
             # otherwise parked sessions age by first-write time and the
             # pruner evicts the hottest chunks first.
-            try:
+            with contextlib.suppress(OSError):
                 os.utime(_p, None)
-            except OSError:
-                pass
         _offs, _sizes = self._key_offsets_sizes(_keys, job_metadata.block_ids)
-        tasks = _fanout_tasks(batch_load_block, _paths, self._primary_kv_view,
-                              _offs, _sizes, self._use_o_direct, _FS_LOAD_TASKS)
-        _kv_event({"op": "load", "job": job_metadata.job_id,
-                   "chunks": len(_keys), "tasks": len(tasks),
-                   "req": _req_id(job_metadata),
-                   "bytes": (sum(_sizes) if isinstance(_sizes, list) else _sizes * len(_keys)),
-                   "keys": _keys_hex(_keys)})
+        tasks = _fanout_tasks(
+            batch_load_block,
+            _paths,
+            self._primary_kv_view,
+            _offs,
+            _sizes,
+            self._use_o_direct,
+            _FS_LOAD_TASKS,
+        )
+        _kv_event(
+            {
+                "op": "load",
+                "job": job_metadata.job_id,
+                "chunks": len(_keys),
+                "tasks": len(tasks),
+                "req": _req_id(job_metadata),
+                "bytes": (
+                    sum(_sizes) if isinstance(_sizes, list) else _sizes * len(_keys)
+                ),
+                "keys": _keys_hex(_keys),
+            }
+        )
         self._pool.enqueue_load(job_metadata.job_id, len(tasks), tasks)
 
     @override
@@ -448,8 +497,9 @@ class FileSystemTierManager(SecondaryTierManager):
             if len(seen) > 4096:
                 seen.clear()
             g0 = [k for k in keys if bytes(k)[-4:] == b"\x00\x00\x00\x00"]
-            _kv_event({"op": "touch", "req": rid, "n_keys": len(keys),
-                       "g0": _keys_hex(g0)})
+            _kv_event(
+                {"op": "touch", "req": rid, "n_keys": len(keys), "g0": _keys_hex(g0)}
+            )
         except Exception:  # noqa: BLE001
             pass
 
@@ -507,8 +557,15 @@ class FileSystemTierManager(SecondaryTierManager):
             if state is not None:
                 state.result = False
         if n:
-            _kv_event({"op": "prune", "req": getattr(req_context, "req_id", None),
-                       "n": n, "bytes": b, "cand": len(keys)})
+            _kv_event(
+                {
+                    "op": "prune",
+                    "req": getattr(req_context, "req_id", None),
+                    "n": n,
+                    "bytes": b,
+                    "cand": len(keys),
+                }
+            )
         return (n, b)
 
     def on_request_finished(self, req_context: ReqContext) -> None:

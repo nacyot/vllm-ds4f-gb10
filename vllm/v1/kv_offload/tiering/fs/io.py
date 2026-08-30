@@ -101,10 +101,8 @@ def _store_block(
     # mtime so the external mtime-ordered pruner treats re-stored (hot)
     # chunks as fresh instead of evicting them by first-write age.
     if os.path.exists(dest_path):
-        try:
+        with contextlib.suppress(OSError):
             os.utime(dest_path, None)
-        except OSError:
-            pass
         return
 
     tmp_path = dest_path + _get_tmp_suffix()
@@ -206,28 +204,23 @@ def batch_store_block(
         for _p in paths:
             # The C fast path skips existing files without refreshing mtime;
             # refresh here so the mtime-ordered pruner keeps hot chunks.
-            try:
+            with contextlib.suppress(OSError):
                 os.utime(_p, None)
-            except OSError:
-                pass
         view_B = view.cast("B")
-        view_slices = [
-            view_B[x : x + s] for x, s in zip(offsets, sizes_list)
-        ]
+        view_slices = [view_B[x : x + s] for x, s in zip(offsets, sizes_list)]
         tmp_paths = [p + _get_tmp_suffix() for p in paths]
         # retry transient fs errors (CIFS reconnect windows and the like)
         import time as _time
+
         for _attempt in range(3):
             try:
-                return batch_store_block_C(
-                    tmp_paths, paths, view_slices, use_o_direct
-                )
+                return batch_store_block_C(tmp_paths, paths, view_slices, use_o_direct)
             except OSError:
                 if _attempt == 2:
                     raise
                 for _p in paths:
                     _ensure_dirs(_p)
-                _time.sleep(0.2 * (4 ** _attempt))
+                _time.sleep(0.2 * (4**_attempt))
     else:
         for path, offset, size in zip(paths, offsets, sizes_list):
             _store_block(path, view, offset, size, use_o_direct)
@@ -257,9 +250,7 @@ def batch_load_block(
 
     if _HAS_FSIO_C:
         view_B = view.cast("B")
-        view_slices = [
-            view_B[x : x + s] for x, s in zip(offsets, sizes_list)
-        ]
+        view_slices = [view_B[x : x + s] for x, s in zip(offsets, sizes_list)]
         return batch_load_block_C(paths, view_slices, use_o_direct)
     else:
         for path, offset, size in zip(paths, offsets, sizes_list):

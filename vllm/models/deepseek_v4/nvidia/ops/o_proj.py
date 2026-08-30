@@ -8,7 +8,6 @@ from vllm.models.deepseek_v4.common.ops.fused_inv_rope_fp8_quant import (
 )
 from vllm.models.deepseek_v4.nvidia.ops.fp8_einsum import (
     deepseek_v4_fp8_einsum,
-    deepseek_v4_fp8_einsum_config,
 )
 from vllm.platforms import current_platform
 

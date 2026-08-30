@@ -1109,9 +1109,7 @@ def mhc_post_hc_head_tilelang(
             T.copy(layer_shared, layer_local)
 
             for out_hc, h in T.Parallel(hc_mult, h_block):
-                val = T.alloc_var(
-                    T.float32, init=post_shared[out_hc] * layer_local[h]
-                )
+                val = T.alloc_var(T.float32, init=post_shared[out_hc] * layer_local[h])
                 for in_hc in T.unroll(hc_mult):
                     val += comb_shared[in_hc, out_hc] * residual_local[in_hc, h]
                 post_local[out_hc, h] = val
@@ -1239,9 +1237,7 @@ def mhc_post_mean_hc_head_tilelang(
             T.copy(layer_shared, layer_local)
 
             for out_hc, h in T.Parallel(hc_mult, h_block):
-                val = T.alloc_var(
-                    T.float32, init=post_shared[out_hc] * layer_local[h]
-                )
+                val = T.alloc_var(T.float32, init=post_shared[out_hc] * layer_local[h])
                 for in_hc in T.unroll(hc_mult):
                     val += comb_shared[in_hc, out_hc] * residual_local[in_hc, h]
                 post_local[out_hc, h] = val

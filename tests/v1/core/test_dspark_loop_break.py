@@ -84,9 +84,7 @@ def test_no_fire_outside_reasoning_section():
     req = _Req()
     pending: dict[str, int] = {}
     cycle = [7, 8, 9]
-    assert not _feed(
-        lb, req, pending, [THINK_START, 11, THINK_END] + cycle * 30
-    )
+    assert not _feed(lb, req, pending, [THINK_START, 11, THINK_END] + cycle * 30)
     assert pending == {}
 
 

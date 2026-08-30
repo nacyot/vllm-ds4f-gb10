@@ -220,57 +220,60 @@ class OffloadingConnectorWorker:
                         )
                     )
         else:
-          for kv_cache_tensor in kv_cache_config.kv_cache_tensors:
-              # Filter to layers that were actually processed above.
-              # Packed KV allocation emits KVCacheTensor entries for
-              # every (tuple_idx, page_size) slot; slots where no group has a
-              # layer at that index produce an empty shared_by (reserved memory
-              # with no corresponding model layer).
-              tensor_layer_names = [
-                  n for n in kv_cache_tensor.shared_by if n in tensors_per_block
-              ]
-              if not tensor_layer_names:
-                  continue
+            for kv_cache_tensor in kv_cache_config.kv_cache_tensors:
+                # Filter to layers that were actually processed above.
+                # Packed KV allocation emits KVCacheTensor entries for
+                # every (tuple_idx, page_size) slot; slots where no group has a
+                # layer at that index produce an empty shared_by (reserved memory
+                # with no corresponding model layer).
+                tensor_layer_names = [
+                    n for n in kv_cache_tensor.shared_by if n in tensors_per_block
+                ]
+                if not tensor_layer_names:
+                    continue
 
-              # verify all layers in the group reference the exact same tensors
-              assert len({len(tensors_per_block[n]) for n in tensor_layer_names}) == 1
-              assert (
-                  len({tensors_per_block[n][0].data_ptr() for n in tensor_layer_names})
-                  == 1
-              )
-              assert (
-                  len({tensors_per_block[n][0].stride() for n in tensor_layer_names}) == 1
-              )
+                # verify all layers in the group reference the exact same tensors
+                assert len({len(tensors_per_block[n]) for n in tensor_layer_names}) == 1
+                assert (
+                    len(
+                        {tensors_per_block[n][0].data_ptr() for n in tensor_layer_names}
+                    )
+                    == 1
+                )
+                assert (
+                    len({tensors_per_block[n][0].stride() for n in tensor_layer_names})
+                    == 1
+                )
 
-              # pick the first layer to represent the group
-              first_layer_name = tensor_layer_names[0]
-              for tensor in tensors_per_block[first_layer_name]:
-                  block_tensors.append(
-                      CanonicalKVCacheTensor(
-                          tensor=tensor,
-                          page_size_bytes=page_size_bytes[first_layer_name],
-                      )
-                  )
+                # pick the first layer to represent the group
+                first_layer_name = tensor_layer_names[0]
+                for tensor in tensors_per_block[first_layer_name]:
+                    block_tensors.append(
+                        CanonicalKVCacheTensor(
+                            tensor=tensor,
+                            page_size_bytes=page_size_bytes[first_layer_name],
+                        )
+                    )
 
-                  curr_tensor_idx = len(block_tensors) - 1
-                  for layer_name in tensor_layer_names:
-                      mapping = (
-                          mappings.get(layer_name)
-                          if len(tensors_per_block[first_layer_name]) == 1
-                          else None
-                      )
-                      assert (
-                          mapping is None
-                          or mapping.local_page_size_bytes
-                          == unpadded_page_size_bytes[layer_name]
-                      )
-                      block_data_refs[layer_name].append(
-                          CanonicalKVCacheRef(
-                              tensor_idx=curr_tensor_idx,
-                              page_size_bytes=(unpadded_page_size_bytes[layer_name]),
-                              mapping=mapping,
-                          )
-                      )
+                    curr_tensor_idx = len(block_tensors) - 1
+                    for layer_name in tensor_layer_names:
+                        mapping = (
+                            mappings.get(layer_name)
+                            if len(tensors_per_block[first_layer_name]) == 1
+                            else None
+                        )
+                        assert (
+                            mapping is None
+                            or mapping.local_page_size_bytes
+                            == unpadded_page_size_bytes[layer_name]
+                        )
+                        block_data_refs[layer_name].append(
+                            CanonicalKVCacheRef(
+                                tensor_idx=curr_tensor_idx,
+                                page_size_bytes=(unpadded_page_size_bytes[layer_name]),
+                                mapping=mapping,
+                            )
+                        )
 
         group_data_refs: list[list[CanonicalKVCacheRef]] = []
         for kv_cache_group in kv_cache_config.kv_cache_groups:
@@ -440,9 +443,8 @@ class OffloadingConnectorWorker:
                     # serve them as HITs (silent corruption). Fail loudly
                     # instead (explicit raise, -O safe).
                     raise AssertionError(
-                        "[load-error-recompute] store job %d reported "
+                        f"[load-error-recompute] store job {job_id} reported "
                         "failure; refusing to complete it as stored"
-                        % job_id
                     )
                 # [load-error-recompute] Failed *load*: report the dst GPU
                 # blocks for recompute instead of asserting. Per the
@@ -496,9 +498,7 @@ class OffloadingConnectorWorker:
         """
         errors = self._load_error_block_ids
         self._load_error_block_ids = set()
-        spec_errors = getattr(
-            self.worker, "_dspark_load_error_block_ids", None
-        )
+        spec_errors = getattr(self.worker, "_dspark_load_error_block_ids", None)
         if spec_errors:
             errors |= spec_errors
             spec_errors.clear()

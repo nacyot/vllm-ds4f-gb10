@@ -633,7 +633,8 @@ class SingleDirectionOffloadingHandler:
                 f"DSPARK_XFER_DBG mismatch: src {src_offset}/{num_src_blocks} "
                 f"dst {dst_offset}/{num_dst_blocks} "
                 f"g2c={self.gpu_to_cpu} "
-                f"src_bpc={self.src_blocks_per_chunk} dst_bpc={self.dst_blocks_per_chunk} "
+                f"src_bpc={self.src_blocks_per_chunk} "
+                f"dst_bpc={self.dst_blocks_per_chunk} "
                 f"group_sizes={list(group_sizes)} block_indices={list(block_indices)}"
             )
         # Writer rotation may skip non-writer blocks, leaving op_idx below
@@ -667,6 +668,7 @@ class SingleDirectionOffloadingHandler:
             # (DSPARK_LOAD_WINDOW, 기본 1 = 기존 완전 직렬).
             # 로드 잡들은 서로 다른 GPU 블록·CPU 슬롯을 다뤄 독립적이다.
             import os as _os
+
             _win = 1
             if not self.gpu_to_cpu:
                 try:
@@ -784,6 +786,7 @@ class CPUOffloadingWorker(OffloadingWorker):
             # the pin gains nothing (host copies are same-DRAM either way),
             # so pin only tmpfs-backed regions. Override: DSPARK_OFFLOAD_PIN=1/0.
             import os as _os
+
             _pin_env = _os.environ.get("DSPARK_OFFLOAD_PIN", "auto")
             if _pin_env == "1" or (
                 _pin_env != "0" and getattr(mmap_region, "_on_shm", True)

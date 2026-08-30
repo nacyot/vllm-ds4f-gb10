@@ -166,11 +166,10 @@ class DualQueueThreadPool:
                 task()
                 job_finished, success = state.task_done(True)
             except Exception as exc:
-                logger.error(
+                logger.exception(
                     "Job %s block I/O failed: %s",
                     state.job_id,
                     exc,
-                    exc_info=True,
                 )
                 job_finished, success = state.task_done(False)
 

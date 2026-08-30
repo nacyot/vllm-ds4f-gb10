@@ -26,9 +26,8 @@ when the official packed kernel is importable (see ``_select_dsv4_attn_cls``).
 Default on; gate-off behavior is identical to the FlashMLA decode path.
 """
 
-from typing import TYPE_CHECKING
-
 import os
+from typing import TYPE_CHECKING
 
 import torch
 

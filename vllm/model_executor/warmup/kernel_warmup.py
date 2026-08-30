@@ -14,12 +14,14 @@ import vllm.envs as envs
 from vllm.logger import init_logger
 from vllm.model_executor.warmup.cutedsl_warmup import cutedsl_warmup
 from vllm.model_executor.warmup.deep_gemm_warmup import deep_gemm_warmup
-from vllm.model_executor.warmup.deepseek_v4_sm12x_warmup import (
-    _deepseek_v4_request_prep_warmup,
-    _deepseek_v4_sparse_mla_attention_warmup as _sm12x_sparse_mla_warmup,
-)
 from vllm.model_executor.warmup.deepseek_v4_mhc_warmup import (
     deepseek_v4_mhc_warmup,
+)
+from vllm.model_executor.warmup.deepseek_v4_sm12x_warmup import (
+    _deepseek_v4_request_prep_warmup,
+)
+from vllm.model_executor.warmup.deepseek_v4_sm12x_warmup import (
+    _deepseek_v4_sparse_mla_attention_warmup as _sm12x_sparse_mla_warmup,
 )
 from vllm.model_executor.warmup.fa4_cutedsl_warmup import (
     fa4_cutedsl_warmup,

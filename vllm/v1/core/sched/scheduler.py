@@ -81,7 +81,12 @@ except Exception:
 # [issue43-step-diag-0271] per-step scheduler diagnostics gate (issue
 # #43 diag port, log-only). Set DSPARK_ISSUE43_SCHED_DIAG=1 to emit one
 # compact scheduled-tokens summary INFO line per scheduler step.
-_ISSUE43_SCHED_DIAG = os.environ.get("DSPARK_ISSUE43_SCHED_DIAG", "0") not in ("0", "", "false", "False")
+_ISSUE43_SCHED_DIAG = os.environ.get("DSPARK_ISSUE43_SCHED_DIAG", "0") not in (
+    "0",
+    "",
+    "false",
+    "False",
+)
 
 
 class Scheduler(SchedulerInterface):
@@ -425,7 +430,9 @@ class Scheduler(SchedulerInterface):
         # and re-aligns at the next boundary.
         if end < prefill_end:
             max_prefill_tokens = self.max_num_scheduled_tokens
-            long_prefill_threshold = getattr(self, "_lptt_eff", self.scheduler_config.long_prefill_token_threshold)  # [lptt-mixed]
+            long_prefill_threshold = getattr(
+                self, "_lptt_eff", self.scheduler_config.long_prefill_token_threshold
+            )  # [lptt-mixed]
             if long_prefill_threshold > 0:
                 max_prefill_tokens = min(max_prefill_tokens, long_prefill_threshold)
             aligned_end = end // block_size * block_size
@@ -554,7 +561,9 @@ class Scheduler(SchedulerInterface):
                 + request.num_output_placeholders
                 - request.num_computed_tokens
             )
-            _lptt = getattr(self, "_lptt_eff", self.scheduler_config.long_prefill_token_threshold)  # [lptt-mixed]
+            _lptt = getattr(
+                self, "_lptt_eff", self.scheduler_config.long_prefill_token_threshold
+            )  # [lptt-mixed]
             if 0 < _lptt < num_new_tokens:
                 num_new_tokens = _lptt
             num_new_tokens = min(num_new_tokens, token_budget)
@@ -762,14 +771,17 @@ class Scheduler(SchedulerInterface):
                     # candidates (prompt > T); a blocked long candidate is
                     # skipped for this step so shorter requests behind it get in.
                     try:
-                        _pp_T = int(os.environ.get("DSPARK_PPCAP_LONG_TOKENS", "0") or 0)
+                        _pp_T = int(
+                            os.environ.get("DSPARK_PPCAP_LONG_TOKENS", "0") or 0
+                        )
                     except Exception:
                         _pp_T = 0
                     _cpp = 0
                     for _ppr in self.running:
                         if _ppr.num_computed_tokens < _ppr.num_prompt_tokens and (
                             _pp_T <= 0
-                            or (_ppr.num_prompt_tokens - _ppr.num_computed_tokens) > _pp_T
+                            or (_ppr.num_prompt_tokens - _ppr.num_computed_tokens)
+                            > _pp_T
                         ):
                             _cpp += 1
                     if _cpp >= _ppcap:
@@ -788,9 +800,7 @@ class Scheduler(SchedulerInterface):
                 # 게이트 성립. head의 novel(캐시 히트 반영)이 T 초과면
                 # 이번 스텝만 skip, 이하면 정상 입장(소형 우회).
                 try:
-                    _gb_T = int(
-                        os.environ.get("DSPARK_GATE_BYPASS_TOKENS", "0") or 0
-                    )
+                    _gb_T = int(os.environ.get("DSPARK_GATE_BYPASS_TOKENS", "0") or 0)
                 except Exception:
                     _gb_T = 0
                 if _gb_T > 0:
@@ -806,39 +816,30 @@ class Scheduler(SchedulerInterface):
                             _gb_inflight = [
                                 _gb_r
                                 for _gb_r in self.running
-                                if _gb_r.num_computed_tokens
-                                < _gb_r.num_prompt_tokens
+                                if _gb_r.num_computed_tokens < _gb_r.num_prompt_tokens
                             ]
                         _gb_long = sum(
                             1
                             for _gb_r in _gb_inflight
-                            if _gb_r.num_tokens - _gb_r.num_computed_tokens
-                            > _gb_T
+                            if _gb_r.num_tokens - _gb_r.num_computed_tokens > _gb_T
                         )
                         if _gb_limit > 0 and _gb_long >= _gb_limit:
-                            _gb_novel = (
-                                request.num_tokens - request.num_computed_tokens
-                            )
-                            if _gb_novel > _gb_T and (
-                                request.num_computed_tokens == 0
-                            ):
+                            _gb_novel = request.num_tokens - request.num_computed_tokens
+                            if _gb_novel > _gb_T and (request.num_computed_tokens == 0):
                                 # 프롬프트-대형이어도 캐시 히트를 조회해
                                 # 실제 계산량(novel)으로 재판정 — 기존
                                 # 세션의 짧은 턴은 통과 (read-only 룩업,
                                 # admission 시 어차피 수행되는 조회).
                                 try:
-                                    _gb_hit = (
-                                        self.kv_cache_manager
-                                        .get_computed_blocks(request)[1]
-                                    )
+                                    _gb_hit = self.kv_cache_manager.get_computed_blocks(
+                                        request
+                                    )[1]
                                     _gb_novel = request.num_tokens - _gb_hit
                                 except Exception:
                                     pass
                             _gb_skip = _gb_novel > _gb_T
                     except Exception:
-                        logger.exception(
-                            "[gate-small-bypass-0271] gate check failed"
-                        )
+                        logger.exception("[gate-small-bypass-0271] gate check failed")
                     if _gb_skip:
                         request_queue.pop_request()
                         step_skipped_waiting.prepend_request(request)
@@ -1030,7 +1031,11 @@ class Scheduler(SchedulerInterface):
                             break
                         pad_spec_decode = True
 
-                    threshold = getattr(self, "_lptt_eff", self.scheduler_config.long_prefill_token_threshold)  # [lptt-mixed]
+                    threshold = getattr(
+                        self,
+                        "_lptt_eff",
+                        self.scheduler_config.long_prefill_token_threshold,
+                    )  # [lptt-mixed]
                     if 0 < threshold < num_new_tokens:
                         num_new_tokens = threshold
 
@@ -1375,9 +1380,7 @@ class Scheduler(SchedulerInterface):
             partial_tail_offloads=pending_partial_tail_offloads,
             num_spec_tokens_to_schedule=num_spec_tokens_to_schedule,
             ec_manager_metadata=self.encoder_cache_manager.get_manager_metadata(),
-            dspark_force_reasoning_end=(
-                self._dspark_pending_force_end or None
-            ),
+            dspark_force_reasoning_end=(self._dspark_pending_force_end or None),
         )
         if self._dspark_pending_force_end:
             self._dspark_pending_force_end = {}
@@ -1433,9 +1436,7 @@ class Scheduler(SchedulerInterface):
                 )
             except Exception:
                 # Never let diagnostics kill the scheduler.
-                logger.warning(
-                    "[issue43-step-diag] step log failed", exc_info=True
-                )
+                logger.warning("[issue43-step-diag] step log failed", exc_info=True)
 
         with record_function_or_nullcontext("schedule: update_after_schedule"):
             self._update_after_schedule(scheduler_output)
@@ -3003,10 +3004,7 @@ class Scheduler(SchedulerInterface):
                     )
                     for idx_blocks in zip(*req_block_id_groups)
                 ]
-                if any(
-                    len(g) != len(req_block_ids)
-                    for g in req_block_id_groups
-                ):
+                if any(len(g) != len(req_block_ids) for g in req_block_id_groups):
                     # zip() above silently truncated to the shortest
                     # group: the per-group block lists are NOT
                     # equal-length (measured on DS4F: per-group block

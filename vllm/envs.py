@@ -2043,9 +2043,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
     ),
     # DSpark branch-local CUDA graph controls. Stable DSpark fast-path kernels
     # default on through SpeculativeConfig and are not environment-gated.
-    "VLLM_DSPARK_FORWARD_CUDAGRAPH": lambda: env_bool(
-        "VLLM_DSPARK_FORWARD_CUDAGRAPH"
-    ),
+    "VLLM_DSPARK_FORWARD_CUDAGRAPH": lambda: env_bool("VLLM_DSPARK_FORWARD_CUDAGRAPH"),
     "VLLM_DSPARK_FORWARD_CUDAGRAPH_ALLOW_TP": lambda: env_bool(
         "VLLM_DSPARK_FORWARD_CUDAGRAPH_ALLOW_TP"
     ),

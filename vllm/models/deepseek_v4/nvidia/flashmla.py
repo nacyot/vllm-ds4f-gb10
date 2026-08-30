@@ -1,9 +1,8 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
-from typing import TYPE_CHECKING, ClassVar, cast
-
 import os
+from typing import TYPE_CHECKING, ClassVar, cast
 
 import torch
 
@@ -968,8 +967,7 @@ class DeepseekV4FlashMLAAttention(DeepseekV4Attention):
                     )
                     _req_local = (
                         swa_metadata.token_to_req_indices[
-                            num_decode_tokens : num_decode_tokens
-                            + num_prefill_tokens
+                            num_decode_tokens : num_decode_tokens + num_prefill_tokens
                         ]
                         - num_decodes
                     ).long()
