@@ -73,6 +73,7 @@ class RequestState:
     pending_primary_stores: int = 0
     is_finished: bool = False
     request_level_tiers: set[SecondaryTierManager] | None = None
+    pending_cascade_keys: list[OffloadKey] = field(default_factory=list)
     sync_lookup_delay: float = 0.0
     # time.monotonic() of this request's first deferred secondary-tier lookup;
     # None once consumed (observed) or while no secondary lookup is pending.
@@ -844,19 +845,51 @@ class TieringOffloadingManager(OffloadingManager):
         """
         For tiers that requested request-level policy, submit_store() for
         blocks that are already present in the primary tier.
+
+        A key whose primary write is still in flight (HIT_PENDING) cannot be
+        dropped: prepare_store already excluded it as present, and the
+        scheduler advances past its chunk, so no path offers it again. Park it
+        instead. MISS keys are dropped, since nothing is there to read.
+
+        The primary tier resolves every key it holds, so RETRY cannot reach
+        here. Parking on it would have no guarantee of ever draining, which is
+        what makes parking HIT_PENDING safe, so it is rejected rather than
+        guessed at. (vLLM #53329)
         """
-        # Filter out keys that are not ready in primary (e.g. in-flight)
-        ready_keys = tuple(
-            k
-            for k in keys
-            if self.primary_tier.lookup(k, req_context) is LookupResult.HIT
-        )
+        state = self._req_state[req_context.req_id]
+        ready_keys: list[OffloadKey] = []
+        for key in keys:
+            result = self.primary_tier.lookup(key, req_context)
+            if result is LookupResult.HIT:
+                ready_keys.append(key)
+            elif result is LookupResult.HIT_PENDING:
+                state.pending_cascade_keys.append(key)
+            else:
+                assert result is LookupResult.MISS, (
+                    f"primary tier returned {result} for a cascade key"
+                )
         if not ready_keys:
             return
 
         for tier in request_level_tiers:
-            job_metadata = self.create_store_job(ready_keys, req_context)
+            job_metadata = self.create_store_job(tuple(ready_keys), req_context)
             tier.submit_store(job_metadata)
+
+    def _flush_pending_cascades(self) -> None:
+        """Retry request-level cascades parked on an in-flight primary write.
+
+        A parked key always resolves, to HIT or to MISS, so the set drains and
+        a request cannot be held from finalization forever. (vLLM #53329)
+        """
+        for req_id, state in list(self._req_state.items()):
+            if not state.pending_cascade_keys:
+                continue
+            assert state.request_level_tiers
+            keys, state.pending_cascade_keys = state.pending_cascade_keys, []
+            self._cascade_existing_blocks_to_request_level_tiers(
+                keys, state.req_context, state.request_level_tiers
+            )
+            self._maybe_finalize_request(req_id)
 
     @override
     def complete_store(
@@ -992,6 +1025,8 @@ class TieringOffloadingManager(OffloadingManager):
             return
         if state.pending_primary_stores != 0:
             return
+        if state.pending_cascade_keys:
+            return
 
         for tier in self.secondary_tiers:
             if tier is exclude_tier:
@@ -1022,6 +1057,7 @@ class TieringOffloadingManager(OffloadingManager):
         self._processed_jobs_this_step = False
 
         self._flush_pending_promotions()
+        self._flush_pending_cascades()
         for tier in self.secondary_tiers:
             tier.on_schedule_end(context)
 
@@ -1037,8 +1073,10 @@ class TieringOffloadingManager(OffloadingManager):
         # In-flight primary<->secondary transfers (pending promotions are
         # translated to transfer jobs in on_schedule_end), plus any work the
         # secondary tiers themselves still have outstanding.
-        return bool(self._transfer_jobs) or any(
-            tier.has_pending_work() for tier in self.secondary_tiers
+        return (
+            bool(self._transfer_jobs)
+            or any(state.pending_cascade_keys for state in self._req_state.values())
+            or any(tier.has_pending_work() for tier in self.secondary_tiers)
         )
 
     @override
@@ -1081,6 +1119,7 @@ class TieringOffloadingManager(OffloadingManager):
         finished_req_ids = []
         for req_id, state in self._req_state.items():
             state.pending_primary_stores = 0
+            state.pending_cascade_keys.clear()
             if not state.is_finished:
                 continue
             for tier in self.secondary_tiers:
