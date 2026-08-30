@@ -53,6 +53,20 @@ _DECODE_MAX_TOKENS = 64
 _DECODE_SPLIT_TILE = 64
 _C128A_TOPK_ALIGNMENT = 128
 
+# DSPARK (2026-08-30): the FlashInfer runner auto-dispatches on the query row
+# count: <= _DECODE_MAX_TOKENS goes to the standalone decode kernels, anything
+# larger to the prefill orchestrator. In the DSpark verify shape the row count
+# is max_num_seqs x (k+1), so seqs 16 x 6 = 96 rows took the prefill path on
+# every busy step; on SM121 that path deadlocks stochastically (mia #141,
+# flashinfer #3700/#4732) and it also allocates split-K scratch per step. Tile
+# the batch into <= 64-row runner calls instead. 0 disables (old behaviour).
+try:
+    _DECODE_TILE = int(os.environ.get("DSPARK_SM120_DECODE_TILE", "64") or 0)
+except ValueError:
+    _DECODE_TILE = 64
+if _DECODE_TILE > _DECODE_MAX_TOKENS:
+    _DECODE_TILE = _DECODE_MAX_TOKENS
+
 
 def _cdiv(x: int, y: int) -> int:
     return (int(x) + int(y) - 1) // int(y)
@@ -157,7 +171,9 @@ class DeepseekV4FlashInferSM120DecodeAttention(DeepseekV4FlashMLAAttention):
         )
         logger.info_once(
             "DeepSeek V4: using official FlashInfer SM120 packed sparse-MLA decode "
-            "via the low-level runner (VLLM_DEEPSEEK_V4_FLASHINFER_SM120_DECODE=1)."
+            "via the low-level runner (VLLM_DEEPSEEK_V4_FLASHINFER_SM120_DECODE=1). "
+            "DSPARK decode tiling: %s rows per runner call.",
+            _DECODE_TILE if _DECODE_TILE > 0 else "off (whole batch)",
         )
 
     def _reserve_sm120_decode_workspace(self) -> None:
@@ -264,13 +280,6 @@ class DeepseekV4FlashInferSM120DecodeAttention(DeepseekV4FlashMLAAttention):
         assert swa_lens is not None
 
         extra_topk = topk_indices.shape[-1] if topk_indices is not None else 0
-        mid_out, mid_lse = _get_decode_scratch(
-            num_decode_tokens,
-            output.shape[1],
-            output.shape[-1],
-            swa_indices.shape[-1],
-            extra_topk,
-        )
 
         # Each decode token is a one-token query: [num_decode_tokens, 1, h, d];
         # the runner squeezes the singleton s_q dim internally.
@@ -281,20 +290,41 @@ class DeepseekV4FlashInferSM120DecodeAttention(DeepseekV4FlashMLAAttention):
             if (kv_cache is not None and not swa_only)
             else None
         )
-        self._sm120_runner.run(
-            q,
-            swa_cache,
-            swa_indices,
-            output,
-            self.scale,
-            topk_length=swa_lens,
-            attn_sink=self.attn_sink,
-            extra_kv_cache=extra_cache,
-            extra_indices=topk_indices,
-            extra_topk_length=topk_lens,
-            mid_out=mid_out,
-            mid_lse=mid_lse,
-        )
+        # DSPARK: <= 64-row tiles keep every runner call on the standalone
+        # decode kernels (see _DECODE_TILE). Row-0 slices of these contiguous
+        # tensors stay contiguous; the split-K scratch is the warmup-reserved
+        # 64-row region reused per tile (same stream, so no overlap hazard).
+        # The tile count is a pure function of num_decode_tokens, so a captured
+        # CUDA graph replays the same fixed sequence of launches.
+        tile = _DECODE_TILE if _DECODE_TILE > 0 else num_decode_tokens
+        tile = max(1, tile)
+        for start in range(0, num_decode_tokens, tile):
+            end = min(start + tile, num_decode_tokens)
+            mid_out, mid_lse = _get_decode_scratch(
+                end - start,
+                output.shape[1],
+                output.shape[-1],
+                swa_indices.shape[-1],
+                extra_topk,
+            )
+            self._sm120_runner.run(
+                q[start:end],
+                swa_cache,
+                swa_indices[start:end],
+                output[start:end],
+                self.scale,
+                topk_length=swa_lens[start:end],
+                attn_sink=self.attn_sink,
+                extra_kv_cache=extra_cache,
+                extra_indices=(
+                    topk_indices[start:end] if topk_indices is not None else None
+                ),
+                extra_topk_length=(
+                    topk_lens[start:end] if topk_lens is not None else None
+                ),
+                mid_out=mid_out,
+                mid_lse=mid_lse,
+            )
 
     def _forward_prefill(
         self,
