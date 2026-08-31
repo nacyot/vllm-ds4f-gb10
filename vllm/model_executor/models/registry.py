@@ -367,6 +367,10 @@ _MULTIMODAL_MODELS = {
         "cosmos3_edge",
         "Cosmos3EdgeForConditionalGeneration",
     ),
+    "DeepseekV4VForConditionalGeneration": (
+        "vllm.models.deepseek_v4.vision_model",
+        "DeepseekV4VForConditionalGeneration",
+    ),
     "DeepseekVLV2ForCausalLM": ("deepseek_vl2", "DeepseekVLV2ForCausalLM"),
     "DeepseekOCRForCausalLM": ("deepseek_ocr", "DeepseekOCRForCausalLM"),
     "DeepseekOCR2ForCausalLM": ("deepseek_ocr2", "DeepseekOCR2ForCausalLM"),
@@ -1215,11 +1219,36 @@ class _ModelRegistry:
 
         return model_config._get_transformers_backend_cls()
 
+    @staticmethod
+    def _upgrade_deepseek_v4_vision_arch(
+        architecture: str,
+        model_config: ModelConfig,
+    ) -> str:
+        """DeepSeek-V4-Flash-Vision-Exp declares the text architecture.
+
+        Its ``config.json`` has ``architectures=["DeepseekV4ForCausalLM"]``
+        and signals the ViT only through the flat ``vision_*`` fields, so
+        without this hook the text model is built and weight loading fails on
+        the first ``vision.*`` key. Resolve to the multimodal wrapper here. The
+        architecture *name* handed back to ``ModelConfig`` stays the text one
+        on purpose: the per-arch config hook (``MODELS_CONFIG_MAP``, which
+        rewrites ``quant_method`` fp8 -> deepseek_v4_fp8) and the
+        ``tokenizer_mode`` default are keyed on it. The wrapper builds its
+        inner LM by explicit class, not by name, so this cannot recurse.
+        """
+        if architecture != "DeepseekV4ForCausalLM":
+            return architecture
+        hf_config = getattr(model_config, "hf_config", None)
+        if int(getattr(hf_config, "vision_n_layers", 0) or 0) > 0:
+            return "DeepseekV4VForConditionalGeneration"
+        return architecture
+
     def _normalize_arch(
         self,
         architecture: str,
         model_config: ModelConfig,
     ) -> str:
+        architecture = self._upgrade_deepseek_v4_vision_arch(architecture, model_config)
         if architecture in self.models:
             return architecture
 

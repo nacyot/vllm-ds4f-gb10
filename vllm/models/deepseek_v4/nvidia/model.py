@@ -39,7 +39,9 @@ from vllm.model_executor.layers.fused_moe.router.base_router import (
     eplb_map_to_physical_and_record,
 )
 from vllm.model_executor.layers.fused_moe.router.fused_topk_bias_router import (
+    FusedTopKBiasRouter,
     fused_topk_bias,
+    fused_topk_bias_vl,
 )
 from vllm.model_executor.layers.fused_moe.router.gate_linear import GateLinear
 from vllm.model_executor.layers.layernorm import RMSNorm
@@ -688,6 +690,20 @@ class DeepseekV4MoE(nn.Module):
                 requires_grad=False,
             )
 
+        # Vision checkpoints (DeepSeek-V4-Flash-Vision-Exp) carry a second,
+        # modality-specific expert-selection bias per gate, on EVERY layer
+        # (hash layers included: image rows there route by topk(scores +
+        # bias_vl) instead of the tid2eid lookup). Applied only to image
+        # positions, i.e. rows whose input id is an out-of-vocabulary sentinel
+        # (>= vocab_size). Text routing is unchanged.
+        self.vl_vocab_size = config.vocab_size
+        self.gate.bias_vl = None
+        if int(getattr(config, "vision_n_layers", 0) or 0) > 0:
+            self.gate.bias_vl = nn.Parameter(
+                torch.empty(config.n_routed_experts, dtype=torch.float32),
+                requires_grad=False,
+            )
+
         if config.n_shared_experts is None:
             self.shared_experts = None
         else:
@@ -802,6 +818,28 @@ class DeepseekV4MoE(nn.Module):
             is_sequence_parallel=self.use_sequence_parallel,
         )
         self._sync_fused_moe_metadata()
+        if self.gate.bias_vl is not None:
+            self._attach_vl_routing_to_router()
+
+    def _attach_vl_routing_to_router(self) -> None:
+        """Hand ``bias_vl`` to the router the fused-MoE path routes with.
+
+        ``FusedMoEFactory`` returns a ``MoERunner`` whose ``.router`` is the
+        ``FusedTopKBiasRouter`` built from our gate tensors (selected whenever
+        ``e_score_correction_bias`` or ``hash_indices_table`` is set, i.e. on
+        every DeepSeek-V4 layer). Fail loudly if that is not what we got:
+        silently skipping would route image tokens with the text bias.
+        """
+        router = getattr(self.experts, "router", None)
+        if not isinstance(router, FusedTopKBiasRouter):
+            raise TypeError(
+                f"{self.prefix}: DeepSeek-V4 vision routing needs "
+                "self.experts.router to be a FusedTopKBiasRouter, got "
+                f"{type(router).__name__} on {type(self.experts).__name__}. "
+                "The bias_vl hook has no other place to attach."
+            )
+        router.bias_vl = self.gate.bias_vl
+        router.vl_vocab_size = self.vl_vocab_size
 
     def _sync_fused_moe_metadata(self) -> None:
         experts = self.experts
@@ -844,26 +882,53 @@ class DeepseekV4MoE(nn.Module):
     ) -> torch.Tensor:
         if self.gate.tid2eid is not None and input_ids is None:
             raise ValueError("DeepSeek V4 hash MoE routing requires input_ids.")
+        # Vision checkpoint: every layer needs the ids to tell image rows
+        # (bias_vl) from text rows. Fail loudly rather than route image rows
+        # with the text bias (PP ranks > 0 get input_ids=None from the runner).
+        if self.gate.bias_vl is not None and input_ids is None:
+            raise ValueError(
+                "DeepSeek V4 vision MoE routing (bias_vl) requires input_ids."
+            )
 
         if not self.use_mega_moe:
             return self._forward_fused_moe(hidden_states, input_ids)
 
         org_shape = hidden_states.shape
         router_logits, _ = self.gate(hidden_states)
-        topk_weights, topk_ids = fused_topk_bias(
-            hidden_states=hidden_states,
-            gating_output=router_logits,
-            scoring_func=self.scoring_func,
-            e_score_correction_bias=self.gate.e_score_correction_bias.data
-            if self.gate.e_score_correction_bias is not None
-            else None,
-            topk=self.n_activated_experts,
-            renormalize=self.renormalize,
-            indices_type=self.hash_indices_dtype,
-            input_tokens=input_ids,
-            hash_indices_table=self.gate.tid2eid,
-            routed_scaling_factor=self.routed_scaling_factor,
-        )
+        if self.gate.bias_vl is not None:
+            # Vision checkpoint: image rows (OOV sentinel ids) route by
+            # bias_vl; sentinels are masked to 0 before the tid2eid lookup.
+            topk_weights, topk_ids = fused_topk_bias_vl(
+                hidden_states=hidden_states,
+                gating_output=router_logits,
+                scoring_func=self.scoring_func,
+                e_score_correction_bias=self.gate.e_score_correction_bias.data
+                if self.gate.e_score_correction_bias is not None
+                else None,
+                bias_vl=self.gate.bias_vl.data,
+                vl_vocab_size=self.vl_vocab_size,
+                topk=self.n_activated_experts,
+                renormalize=self.renormalize,
+                indices_type=self.hash_indices_dtype,
+                input_tokens=input_ids,
+                hash_indices_table=self.gate.tid2eid,
+                routed_scaling_factor=self.routed_scaling_factor,
+            )
+        else:
+            topk_weights, topk_ids = fused_topk_bias(
+                hidden_states=hidden_states,
+                gating_output=router_logits,
+                scoring_func=self.scoring_func,
+                e_score_correction_bias=self.gate.e_score_correction_bias.data
+                if self.gate.e_score_correction_bias is not None
+                else None,
+                topk=self.n_activated_experts,
+                renormalize=self.renormalize,
+                indices_type=self.hash_indices_dtype,
+                input_tokens=input_ids,
+                hash_indices_table=self.gate.tid2eid,
+                routed_scaling_factor=self.routed_scaling_factor,
+            )
         activation_clamp = (
             float(self.swiglu_limit) if self.swiglu_limit is not None else None
         )
@@ -1678,6 +1743,19 @@ class DeepseekV4Model(nn.Module, EagleModelMixin):
             )
 
 
+# ``layers.{i}.ffn.gate.bias`` for a hash layer (i < num_hash_layers). The
+# vision checkpoint ships them but the reference Gate never reads ``bias`` on
+# hash layers, and our hash-layer gates register no e_score_correction_bias, so
+# the mapped name has no parameter. Accept an optional ``model.`` prefix in case
+# the outer wrapper's mapper already added it.
+_DEAD_HASH_GATE_BIAS_RE = re.compile(r"^(?:model\.)?layers\.(\d+)\.ffn\.gate\.bias$")
+
+
+def _is_dead_hash_gate_bias(name: str, num_hash_layers: int) -> bool:
+    m = _DEAD_HASH_GATE_BIAS_RE.match(name)
+    return m is not None and int(m.group(1)) < num_hash_layers
+
+
 def _make_deepseek_v4_weights_mapper(expert_dtype: str) -> WeightsMapper:
     if expert_dtype == "fp4":
         # MXFP4 experts use Mxfp4MoEMethod, which registers scales as
@@ -1843,12 +1921,34 @@ class DeepseekV4ForCausalLM(
         return getattr(self.model, "_mtp_hidden_buffer", None)
 
     def skip_weight_name_before_load(self, name: str) -> bool:
+        if _is_dead_hash_gate_bias(name, self._num_hash_layers()):
+            return True
         mapped = self.hf_to_vllm_mapper._map_name(name)
         return mapped is None or "mtp." in mapped
 
+    def _num_hash_layers(self) -> int:
+        return int(getattr(self.config, "num_hash_layers", 0) or 0)
+
+    def _drop_dead_hash_gate_bias(
+        self, weights: Iterable[tuple[str, torch.Tensor]]
+    ) -> Iterable[tuple[str, torch.Tensor]]:
+        """Drop ``layers.{i<num_hash_layers}.ffn.gate.bias`` (dead weights).
+
+        Everything else passes through untouched, including ``bias_vl``, which
+        the mapper leaves alone (suffix rule ``.ffn.gate.bias`` does not match
+        ``.ffn.gate.bias_vl``) and which lands on the registered parameter.
+        """
+        num_hash_layers = self._num_hash_layers()
+        for name, weight in weights:
+            if _is_dead_hash_gate_bias(name, num_hash_layers):
+                continue
+            yield name, weight
+
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
         loader = AutoWeightsLoader(self, skip_substrs=["mtp."])
-        loaded_params = loader.load_weights(weights, mapper=self.hf_to_vllm_mapper)
+        loaded_params = loader.load_weights(
+            self._drop_dead_hash_gate_bias(weights), mapper=self.hf_to_vllm_mapper
+        )
         self.model.finalize_mega_moe_weights()
         self.model.finalize_mhc_broadcast_weights()
         return loaded_params

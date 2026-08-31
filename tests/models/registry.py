@@ -819,6 +819,13 @@ _MULTIMODAL_EXAMPLE_MODELS = {
         max_model_len=4096,
         is_available_online=False,
     ),
+    # config.json declares DeepseekV4ForCausalLM; ModelRegistry upgrades it to
+    # the vision wrapper from vision_n_layers > 0. No architectures override on
+    # purpose: that would skip the DeepseekV4ForCausalLM config hook (fp8 ->
+    # deepseek_v4_fp8) and the deepseek_v4 tokenizer_mode default.
+    "DeepseekV4VForConditionalGeneration": _HfExamplesInfo(
+        "deepseek-ai/DeepSeek-V4-Flash-Vision-Exp", is_available_online=False
+    ),
     "DeepseekVLV2ForCausalLM": _HfExamplesInfo(
         "deepseek-ai/deepseek-vl2-tiny",
         extras={"fork": "Isotr0py/deepseek-vl2-tiny"},

@@ -325,6 +325,20 @@ class InputProcessor:
             prompt_embeds = None
             prompt_is_token_ids = None
 
+        if (
+            isinstance(params, SamplingParams)
+            and params.prompt_logprobs is not None
+            and prompt_token_ids
+            and self._has_vl_sentinel_ids(prompt_token_ids)
+        ):
+            # Prompt logprobs gather the logits at every prompt id; the image
+            # block ids are >= vocab_size (see _validate_model_input) and have
+            # no logit column, so the gather would be a device-side assert.
+            raise VLLMValidationError(
+                "prompt_logprobs is not supported for prompts that contain "
+                "image tokens on DeepSeek-V4 vision models."
+            )
+
         sampling_params = None
         pooling_params = None
         if isinstance(params, SamplingParams):
@@ -497,10 +511,26 @@ class InputProcessor:
             # Here we take the max of the two to determine if a token id is
             # truly out-of-vocabulary.
             model_vocab_size = model_config.get_vocab_size()
-            if max_input_id > max(tokenizer.max_token_id, model_vocab_size - 1):
+            allowed_max = max(tokenizer.max_token_id, model_vocab_size - 1)
+            # DeepSeek-V4 vision expands each image into a block of sentinel ids
+            # vocab_size + {0..4}. They never index the embedding table (the
+            # embeddings arrive through the multimodal path) but the language
+            # model reads them, to pick the bias_vl expert bias and to identify
+            # image spans.
+            hf_cfg = getattr(model_config, "hf_config", None)
+            if int(getattr(hf_cfg, "vision_n_layers", 0) or 0) > 0:
+                allowed_max = max(allowed_max, model_vocab_size + 4)
+            if max_input_id > allowed_max:
                 raise VLLMValidationError(
                     f"Token id {max_input_id} is out of vocabulary"
                 )
+
+    def _has_vl_sentinel_ids(self, prompt_ids: list[int]) -> bool:
+        """DeepSeek-V4 vision: any image-block sentinel (>= vocab_size)?"""
+        hf_cfg = getattr(self.model_config, "hf_config", None)
+        if int(getattr(hf_cfg, "vision_n_layers", 0) or 0) <= 0:
+            return False
+        return max(prompt_ids) >= self.model_config.get_vocab_size()
 
     def _validate_model_inputs(
         self,

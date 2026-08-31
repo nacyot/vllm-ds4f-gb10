@@ -57,6 +57,7 @@ from vllm.models.deepseek_v4.common.ops import (
 )
 from vllm.sequence import IntermediateTensors
 
+from ..vl_routing import sanitize_vl_input_ids
 from .model import (
     DeepseekV4DecoderLayer,
     DeepseekV4Model,
@@ -232,9 +233,27 @@ class DeepSeekV4MultiTokenPredictor(nn.Module):
             prefix=maybe_prefix(prefix, "embed_tokens"),
         )
         self.logits_processor = LogitsProcessor(config.vocab_size)
+        # Vision checkpoints: the draft's input ids are the target ids shifted
+        # by one, so image-span sentinels (vocab_size + 0..4) reach this
+        # embedding during prefill. Mask them to 0 before the gather (a raw
+        # index assert at TP=1, silent zeros at TP>1); the raw ids still go to
+        # the MTP block so its MoE gate applies bias_vl. Same treatment as
+        # the DSpark draft (dspark.py). None for text checkpoints (no-op).
+        self.vl_vocab_size: int | None = (
+            int(config.vocab_size)
+            if int(getattr(config, "vision_n_layers", 0) or 0) > 0
+            else None
+        )
+
+    def _sanitize_token_ids(self, token_ids: torch.Tensor) -> torch.Tensor:
+        """Mask vision sentinel ids (>= vocab_size) to 0; branch-free."""
+        if self.vl_vocab_size is None:
+            return token_ids
+        _, safe_ids = sanitize_vl_input_ids(token_ids, self.vl_vocab_size)
+        return safe_ids
 
     def embed_input_ids(self, input_ids: torch.Tensor) -> torch.Tensor:
-        return self.embed_tokens(input_ids)
+        return self.embed_tokens(self._sanitize_token_ids(input_ids))
 
     def forward(
         self,
@@ -245,7 +264,7 @@ class DeepSeekV4MultiTokenPredictor(nn.Module):
         spec_step_idx: int = 0,
     ) -> torch.Tensor:
         if inputs_embeds is None:
-            inputs_embeds = self.embed_tokens(input_ids)
+            inputs_embeds = self.embed_tokens(self._sanitize_token_ids(input_ids))
         current_step_idx = spec_step_idx % self.num_mtp_layers
         return self.layers[str(self.mtp_start_layer_idx + current_step_idx)](
             input_ids,

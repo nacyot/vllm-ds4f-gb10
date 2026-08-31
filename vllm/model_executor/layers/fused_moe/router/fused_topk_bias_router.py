@@ -352,8 +352,84 @@ def fused_topk_bias(
     )
 
 
+def fused_topk_bias_vl(
+    hidden_states: torch.Tensor,
+    gating_output: torch.Tensor,
+    scoring_func: str,
+    e_score_correction_bias: torch.Tensor | None,
+    bias_vl: torch.Tensor,
+    vl_vocab_size: int,
+    topk: int,
+    renormalize: bool,
+    indices_type: torch.dtype | None = None,
+    input_tokens: torch.Tensor | None = None,
+    hash_indices_table: torch.Tensor | None = None,
+    routed_scaling_factor: float = 1.0,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """DeepSeek-V4 vision routing: two ``fused_topk_bias`` passes merged per row.
+
+    Image positions are the rows whose ``input_tokens`` are out-of-vocabulary
+    sentinels (``>= vl_vocab_size``). They route by ``topk(scores + bias_vl)``
+    on every layer, hash layers included; text rows keep the unchanged text
+    routing (``tid2eid`` lookup on hash layers, ``topk(scores + bias)``
+    elsewhere). Sentinel ids are masked to 0 before the ``tid2eid`` gather.
+    This mirrors the reference ``Gate.forward`` exactly, and each pass still
+    runs through the existing CUDA/Triton kernels (both take one bias vector).
+    """
+    # Lazy import: this module is imported while the fused_moe package is
+    # initializing, and ``vllm.models.deepseek_v4`` pulls that package back in.
+    from vllm.models.deepseek_v4.vl_routing import (
+        merge_vl_routing,
+        sanitize_vl_input_ids,
+    )
+
+    if input_tokens is None:
+        raise ValueError("DeepSeek V4 vision MoE routing (bias_vl) requires input_ids.")
+    image_mask, safe_ids = sanitize_vl_input_ids(input_tokens, vl_vocab_size)
+    # CUDA-graph padding rows keep stale input ids (the runner only rewrites
+    # ids[:num_tokens]), which can be sentinels from an earlier image batch.
+    # The text pass honours the padding mask inside its kernels (hash layers
+    # emit expert id -1 / weight 0 for padded rows) but the image pass runs
+    # dsv4_topk, which has no is_padding argument; keep the text pass on
+    # padded rows so they never cost real expert work. Still branch-free on
+    # tensor data (the None check is host-side and capture-invariant).
+    is_padding = _get_padding_mask(image_mask.shape[0])
+    if is_padding is not None:
+        image_mask = image_mask & ~is_padding.to(torch.bool)
+    text_weights, text_ids = fused_topk_bias(
+        hidden_states=hidden_states,
+        gating_output=gating_output,
+        scoring_func=scoring_func,
+        e_score_correction_bias=e_score_correction_bias,
+        topk=topk,
+        renormalize=renormalize,
+        indices_type=indices_type,
+        input_tokens=safe_ids,
+        hash_indices_table=hash_indices_table,
+        routed_scaling_factor=routed_scaling_factor,
+    )
+    vl_weights, vl_ids = fused_topk_bias(
+        hidden_states=hidden_states,
+        gating_output=gating_output,
+        scoring_func=scoring_func,
+        e_score_correction_bias=bias_vl,
+        topk=topk,
+        renormalize=renormalize,
+        indices_type=indices_type,
+        input_tokens=None,
+        hash_indices_table=None,
+        routed_scaling_factor=routed_scaling_factor,
+    )
+    return merge_vl_routing(text_weights, text_ids, vl_weights, vl_ids, image_mask)
+
+
 class FusedTopKBiasRouter(BaseRouter):
-    """Router using fused top-k with e_score_correction_bias."""
+    """Router using fused top-k with e_score_correction_bias.
+
+    ``bias_vl`` / ``vl_vocab_size`` are optional attributes set after
+    construction by ``DeepseekV4MoE`` for vision checkpoints; when present and
+    ``input_ids`` are given, routing goes through ``fused_topk_bias_vl``.
+    """
 
     def __init__(
         self,
@@ -380,6 +456,9 @@ class FusedTopKBiasRouter(BaseRouter):
         self.routed_scaling_factor = routed_scaling_factor
         self.scoring_func = scoring_func
         self._hash_indices_table = hash_indices_table
+        # DeepSeek-V4 vision: modality-specific selection bias for image rows.
+        self.bias_vl: torch.Tensor | None = None
+        self.vl_vocab_size: int | None = None
         # Fused shared experts: append constant slots (ids immediately after
         # the routed experts, [global, global+n)) routed to by every token at
         # ``shared_expert_weight``, AFTER the routed top-k is renormalized.
@@ -406,20 +485,47 @@ class FusedTopKBiasRouter(BaseRouter):
         input_ids: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         """Compute routing using fused top-k with bias."""
-        topk_weights, topk_ids = fused_topk_bias(
-            hidden_states=hidden_states,
-            gating_output=router_logits,
-            scoring_func=self.scoring_func,
-            e_score_correction_bias=self.e_score_correction_bias.data
-            if self.e_score_correction_bias is not None
-            else None,
-            topk=self.top_k,
-            renormalize=self.renormalize,
-            indices_type=indices_type,
-            input_tokens=input_ids,
-            hash_indices_table=self._hash_indices_table,
-            routed_scaling_factor=self.routed_scaling_factor,
-        )
+        bias_vl = getattr(self, "bias_vl", None)
+        if bias_vl is not None:
+            # Never fall back to text routing for a vision checkpoint: image
+            # rows would silently take ``bias`` instead of ``bias_vl`` (e.g.
+            # PP ranks > 0, which receive input_ids=None from the runner).
+            if input_ids is None:
+                raise ValueError(
+                    "DeepSeek V4 vision MoE routing (bias_vl) requires input_ids."
+                )
+            assert self.vl_vocab_size is not None
+            topk_weights, topk_ids = fused_topk_bias_vl(
+                hidden_states=hidden_states,
+                gating_output=router_logits,
+                scoring_func=self.scoring_func,
+                e_score_correction_bias=self.e_score_correction_bias.data
+                if self.e_score_correction_bias is not None
+                else None,
+                bias_vl=bias_vl.data,
+                vl_vocab_size=self.vl_vocab_size,
+                topk=self.top_k,
+                renormalize=self.renormalize,
+                indices_type=indices_type,
+                input_tokens=input_ids,
+                hash_indices_table=self._hash_indices_table,
+                routed_scaling_factor=self.routed_scaling_factor,
+            )
+        else:
+            topk_weights, topk_ids = fused_topk_bias(
+                hidden_states=hidden_states,
+                gating_output=router_logits,
+                scoring_func=self.scoring_func,
+                e_score_correction_bias=self.e_score_correction_bias.data
+                if self.e_score_correction_bias is not None
+                else None,
+                topk=self.top_k,
+                renormalize=self.renormalize,
+                indices_type=indices_type,
+                input_tokens=input_ids,
+                hash_indices_table=self._hash_indices_table,
+                routed_scaling_factor=self.routed_scaling_factor,
+            )
 
         if self.num_fused_shared_experts > 0:
             m = topk_ids.shape[0]

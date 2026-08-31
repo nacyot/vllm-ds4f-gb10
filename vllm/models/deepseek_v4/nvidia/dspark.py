@@ -61,6 +61,7 @@ from vllm.v1.attention.backends.mla.sparse_mla_kernels import (
     matmul_sparse_mla_attention_with_sink,
 )
 
+from ..vl_routing import sanitize_vl_input_ids
 from .dspark_triton import (
     dspark_context_kv_store,
     dspark_qkv_postprocess,
@@ -730,6 +731,16 @@ class DSparkDeepseekV4ForCausalLM(nn.Module):
         assert vllm_config.speculative_config is not None
         config = vllm_config.speculative_config.draft_model_config.hf_config
         self.config = config
+        # Vision checkpoints feed image positions as out-of-vocabulary sentinel
+        # ids (vocab_size + 0..4). The draft embeds ids itself (embed_tokens,
+        # markov_w1), so they must be masked to 0 before every gather; the raw
+        # ids still reach the layers' MoE gates for bias_vl routing. None for
+        # text checkpoints (no-op).
+        self.vl_vocab_size: int | None = (
+            int(config.vocab_size)
+            if int(getattr(config, "vision_n_layers", 0) or 0) > 0
+            else None
+        )
         self.block_size = int(getattr(config, "dspark_block_size", 0))
         self.target_layer_ids = tuple(getattr(config, "dspark_target_layer_ids", ()))
         if self.block_size <= 0:
@@ -841,8 +852,15 @@ class DSparkDeepseekV4ForCausalLM(nn.Module):
                 prefix=f"{prefix}mtp.2.confidence_head",
             )
 
+    def _sanitize_token_ids(self, token_ids: torch.Tensor) -> torch.Tensor:
+        """Mask vision sentinel ids (>= vocab_size) to 0; branch-free."""
+        if self.vl_vocab_size is None:
+            return token_ids
+        _, safe_ids = sanitize_vl_input_ids(token_ids, self.vl_vocab_size)
+        return safe_ids
+
     def embed_input_ids(self, input_ids: torch.Tensor) -> torch.Tensor:
-        return self.embed_tokens(input_ids)
+        return self.embed_tokens(self._sanitize_token_ids(input_ids))
 
     def combine_hidden_states(self, aux_hidden_states: torch.Tensor) -> torch.Tensor:
         return self.main_norm(_linear_output(self.main_proj(aux_hidden_states)))
@@ -965,7 +983,7 @@ class DSparkDeepseekV4ForCausalLM(nn.Module):
             main_x = self.main_norm(main_x)
 
         if inputs_embeds is None:
-            inputs_embeds = self.embed_tokens(input_ids)
+            inputs_embeds = self.embed_tokens(self._sanitize_token_ids(input_ids))
         x = inputs_embeds.unsqueeze(-2).repeat(1, self.hc_mult, 1)
 
         residual, post_mix, res_mix = None, None, None
@@ -1016,7 +1034,9 @@ class DSparkDeepseekV4ForCausalLM(nn.Module):
         return draft_ids  # full-vocab: draft ids are target ids
 
     def _markov_w1_embedding(self, prev_token_ids: torch.Tensor) -> torch.Tensor:
-        return self.markov_w1(prev_token_ids.long())
+        # The anchor token (input id at query offset 0) can be a vision
+        # sentinel during chunked prefill; sampled draft ids never are.
+        return self.markov_w1(self._sanitize_token_ids(prev_token_ids).long())
 
     def markov_embed(self, token_ids: torch.Tensor) -> torch.Tensor:
         return self._markov_w1_embedding(token_ids)
@@ -1210,6 +1230,11 @@ class DSparkDeepseekV4ForCausalLM(nn.Module):
                         ".ffn.gate.bias",
                         ".ffn.gate.e_score_correction_bias",
                     )
+                if name.endswith(".ffn.gate.bias_vl") and name not in params_dict:
+                    # mtp.N.ffn.gate.bias_vl from a vision checkpoint served
+                    # with vision off: DeepseekV4MoE registered no bias_vl,
+                    # the tensor is unused.
+                    continue
                 param = params_dict[name]
                 weight_loader = getattr(param, "weight_loader", default_weight_loader)
                 weight_loader(param, loaded_weight)
