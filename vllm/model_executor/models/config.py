@@ -316,6 +316,26 @@ class DiffusionGemmaModelForBlockDiffusionConfig(VerifyAndUpdateConfig):
 
 class DeepseekV4ForCausalLMConfig(VerifyAndUpdateConfig):
     @staticmethod
+    def verify_and_update_config(vllm_config: "VllmConfig") -> None:
+        # DeepSeek-V4 vision (DSPARK_VISION_BIDI): an image sentinel block
+        # must be prefilled inside one chunk so its bidirectional span is
+        # never split across steps (the reference asserts whole-span
+        # prefill; a split span degrades that step to causal attention at
+        # runtime). No-op for text checkpoints (vision_n_layers == 0).
+        hf_config = vllm_config.model_config.hf_config
+        if int(getattr(hf_config, "vision_n_layers", 0) or 0) <= 0:
+            return
+        scheduler_config = vllm_config.scheduler_config
+        if not scheduler_config.disable_chunked_mm_input:
+            scheduler_config.disable_chunked_mm_input = True
+            logger.info(
+                "DeepSeek-V4 vision: forcing disable_chunked_mm_input=True "
+                "so an image sentinel block (<= %d tokens) is always "
+                "prefilled inside one chunk.",
+                int(getattr(hf_config, "vision_max_n_token", 0) or 0) + 3,
+            )
+
+    @staticmethod
     def verify_and_update_model_config(model_config: "ModelConfig") -> None:
         quant_config = getattr(model_config.hf_config, "quantization_config", None)
         if quant_config is not None and quant_config.get("quant_method") == "fp8":
@@ -923,6 +943,7 @@ MODELS_CONFIG_MAP: dict[str, type[VerifyAndUpdateConfig]] = {
     "ColBERTJinaRobertaModel": JinaRobertaModelConfig,
     "ColQwen3_5": ColQwen3_5Config,
     "DeepseekV4ForCausalLM": DeepseekV4ForCausalLMConfig,
+    "DeepseekV4VForConditionalGeneration": DeepseekV4ForCausalLMConfig,
     "DeepseekV32ForCausalLM": DeepseekV32ForCausalLM,
     "DiffusionGemmaForBlockDiffusion": DiffusionGemmaModelForBlockDiffusionConfig,  # noqa: E501
     "Ernie4_5_VLMoeForConditionalGeneration": Ernie4_5_VLMoeForConditionalGenerationConfig,  # noqa: E501

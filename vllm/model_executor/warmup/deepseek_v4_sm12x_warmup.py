@@ -870,6 +870,205 @@ def _deepseek_v4_paged_mqa_rowwise_decode_warmup(runner: "GPUModelRunner") -> No
         )
 
 
+def _disable_vision_bidi_builders(runner: "GPUModelRunner") -> int:
+    """Kill switch for DSPARK_VISION_BIDI after a failed warmup probe.
+
+    Zeroing ``vision_index_width`` makes every later ``build()`` publish no
+    ``vis_*`` buffers, and the vision wrapper's per-step publish bails out
+    when ``vis_prefill_swa_indices is None`` -- image spans then fall back
+    to causal (phase-1) attention instead of crashing in the first live
+    wide-segment launch. Returns the number of builders disabled.
+    """
+    disabled = 0
+    try:
+        from vllm.v1.attention.backends.mla.sparse_swa import (
+            DeepseekSparseSWAMetadataBuilder,
+        )
+
+        for group_list in getattr(runner, "attn_groups", []):
+            for group in group_list:
+                for builder in getattr(group, "metadata_builders", []):
+                    if (
+                        isinstance(builder, DeepseekSparseSWAMetadataBuilder)
+                        and builder.vision_index_width > 0
+                    ):
+                        builder.vision_index_width = 0
+                        # Release the wide index buffers (max_tokens x 512).
+                        builder.vis_prefill_swa_indices = None
+                        builder.vis_prefill_swa_lens = None
+                        builder.vis_left = None
+                        builder.vis_right = None
+                        disabled += 1
+    except Exception:  # noqa: BLE001 - the kill switch must never raise
+        return disabled
+    return disabled
+
+
+def _deepseek_v4_vision_bidi_warmup(runner: "GPUModelRunner") -> None:
+    """Warm the DSPARK_VISION_BIDI kernels (vision checkpoints only).
+
+    (i) The wide-row Triton index kernel: ``do_not_specialize`` covers every
+    integer arg, so one launch at any shape compiles the runtime cubin.
+    (ii) One 64-row wide-tile FlashInfer runner call per present DeepseekV4
+    layer type (cr 1/4/128): compiles the (padded_heads, 512)+extra decode
+    dispatch and reserves its split-K scratch at startup instead of on the
+    first image request.
+    """
+    hf_config = runner.model_config.hf_config
+    try:
+        from vllm.models.deepseek_v4.image_attention import (
+            DECODE_WIDTHS,
+            vision_bidi_enabled,
+            vision_index_width,
+        )
+
+        if not vision_bidi_enabled(hf_config):
+            return
+        width = vision_index_width(hf_config)
+        if width not in DECODE_WIDTHS:
+            return
+        from vllm.utils.flashinfer import is_dsv4_sm120_fi_prefill_active
+
+        if not (
+            is_dsv4_sm120_fi_prefill_active()
+            and envs.VLLM_DEEPSEEK_V4_FLASHINFER_SM120_PREFILL
+        ):
+            return
+        from vllm.models.deepseek_v4.nvidia.flashinfer_sm120_decode import (
+            _DECODE_MAX_TOKENS,
+            DeepseekV4FlashInferSM120DecodeAttention,
+            _as_sparse_sm120_cache,
+            _c128a_max_compressed,
+            _get_decode_scratch,
+        )
+        from vllm.v1.attention.backends.mla.sparse_swa import (
+            _compute_vision_swa_indices_and_lens_kernel,
+        )
+
+        modules = [
+            m
+            for m in runner.get_model().modules()
+            if isinstance(m, DeepseekV4FlashInferSM120DecodeAttention)
+        ]
+        if not modules:
+            return
+        device = modules[0].attn_sink.device
+        window_size = max(1, int(getattr(hf_config, "sliding_window", 128) or 128))
+        rows = _DECODE_MAX_TOKENS
+
+        # (i) Wide-row index kernel: throwaway tensors, all-valid rows over a
+        # single 16-block table row, left/right = 0 (the causal special case).
+        idx = torch.zeros((rows, 1, width), dtype=torch.int32, device=device)
+        lens = torch.zeros((rows,), dtype=torch.int32, device=device)
+        zeros_i32 = torch.zeros((rows,), dtype=torch.int32, device=device)
+        qsl = torch.tensor([0, rows], dtype=torch.int32, device=device)
+        seq_lens = torch.tensor([rows], dtype=torch.int32, device=device)
+        is_valid = torch.ones((rows,), dtype=torch.bool, device=device)
+        block_table = torch.zeros((1, 16), dtype=torch.int32, device=device)
+        _compute_vision_swa_indices_and_lens_kernel[(rows,)](
+            idx,
+            idx.stride(0),
+            lens,
+            window_size,
+            width,
+            zeros_i32,
+            zeros_i32,
+            qsl,
+            seq_lens,
+            zeros_i32,
+            is_valid,
+            block_table,
+            block_table.stride(0),
+            64,
+            token_offset=0,
+            TRITON_BLOCK_SIZE=1024,
+        )
+
+        # (ii) One wide 64-row tile per layer type: all-(-1) indices with
+        # zero lengths touch no KV but compile/validate the wide dispatch and
+        # reserve the wide split-K scratch in the shared workspace.
+        warmed_ratios: set[int] = set()
+        for module in modules:
+            ratio = int(module.compress_ratio)
+            if ratio in warmed_ratios:
+                continue
+            swa_cache_tensor = module.swa_cache_layer.kv_cache
+            if swa_cache_tensor is None or swa_cache_tensor.numel() == 0:
+                continue
+            extra_cache = None
+            extra_indices = None
+            extra_lens = None
+            extra_topk = 0
+            if ratio > 1:
+                kv_cache = module.kv_cache
+                if kv_cache is None or kv_cache.numel() == 0:
+                    continue
+                if ratio == 4:
+                    assert module.topk_indices_buffer is not None
+                    extra_topk = int(module.topk_indices_buffer.shape[-1])
+                else:
+                    extra_topk = _c128a_max_compressed(int(module.max_model_len), ratio)
+                extra_cache = _as_sparse_sm120_cache(kv_cache)
+                extra_indices = torch.full(
+                    (rows, 1, extra_topk), -1, dtype=torch.int32, device=device
+                )
+                extra_lens = torch.zeros((rows,), dtype=torch.int32, device=device)
+            warmed_ratios.add(ratio)
+            padded_heads = int(module.padded_heads)
+            head_dim = int(module.head_dim)
+            q = torch.zeros(
+                (rows, padded_heads, head_dim),
+                dtype=torch.bfloat16,
+                device=device,
+            )
+            out = torch.zeros_like(q)
+            indices = torch.full((rows, 1, width), -1, dtype=torch.int32, device=device)
+            topk_length = torch.zeros((rows,), dtype=torch.int32, device=device)
+            mid_out, mid_lse = _get_decode_scratch(
+                rows, padded_heads, head_dim, width, extra_topk
+            )
+            module._sm120_runner.run(
+                q,
+                _as_sparse_sm120_cache(swa_cache_tensor),
+                indices,
+                out,
+                module.scale,
+                topk_length=topk_length,
+                attn_sink=module.attn_sink,
+                extra_kv_cache=extra_cache,
+                extra_indices=extra_indices,
+                extra_topk_length=extra_lens,
+                mid_out=mid_out,
+                mid_lse=mid_lse,
+            )
+        torch.accelerator.synchronize()
+        logger.info(
+            "Warmed DeepSeek V4 vision-bidi kernels (index width %d, layer "
+            "types cr=%s).",
+            width,
+            sorted(warmed_ratios),
+        )
+    except Exception as exc:  # noqa: BLE001 - warmup must never break startup
+        # The probe exercises the exact dispatches the live image path needs
+        # (wide index kernel + (padded_heads, 512)+extra decode dispatch); a
+        # failure here would otherwise resurface as a crash inside the first
+        # request that carries an image. Flip the kill switch instead.
+        if _disable_vision_bidi_builders(runner):
+            logger.warning(
+                "DeepSeek V4 vision-bidi warmup probe FAILED; disabling "
+                "DSPARK_VISION_BIDI for this run (image spans fall back to "
+                "causal phase-1 attention): %s",
+                exc,
+            )
+        else:
+            logger.warning(
+                "DeepSeek V4 vision-bidi warmup probe FAILED and no live "
+                "SWA metadata builder was found to disable; the first image "
+                "request may fail in-inference: %s",
+                exc,
+            )
+
+
 def _deepseek_v4_sparse_mla_attention_warmup(worker: "Worker") -> None:
     if not envs.VLLM_ENABLE_DEEPSEEK_V4_SPARSE_MLA_WARMUP:
         return
@@ -943,6 +1142,11 @@ def _deepseek_v4_sparse_mla_attention_warmup(worker: "Worker") -> None:
     # seq_lens == max_query_len, so the indexer short-circuits and never
     # reaches the paged-MQA logits kernel.
     _deepseek_v4_paged_mqa_rowwise_decode_warmup(runner)
+
+    # DSPARK_VISION_BIDI: wide image-span index rows + the (padded_heads,
+    # 512)+extra decode-kernel dispatch (vision checkpoints only; no-op
+    # otherwise).
+    _deepseek_v4_vision_bidi_warmup(runner)
 
     query_len = getattr(runner, "uniform_decode_query_len", 0)
     for num_reqs in uniform_decode_reqs:

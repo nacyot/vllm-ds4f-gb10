@@ -296,6 +296,7 @@ if TYPE_CHECKING:
     VLLM_NVTX_SCOPES_FOR_PROFILING: bool = False
     VLLM_DSPARK_FORWARD_CUDAGRAPH: bool = False
     VLLM_DSPARK_FORWARD_CUDAGRAPH_ALLOW_TP: bool = False
+    DSPARK_VISION_BIDI: bool = True
     VLLM_KV_EVENTS_USE_INT_BLOCK_HASHES: bool = True
     VLLM_OBJECT_STORAGE_SHM_BUFFER_NAME: str = "VLLM_OBJECT_STORAGE_SHM_BUFFER"
     VLLM_DEEPEP_BUFFER_SIZE_MB: int = 1024
@@ -2046,6 +2047,14 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "VLLM_DSPARK_FORWARD_CUDAGRAPH": lambda: env_bool("VLLM_DSPARK_FORWARD_CUDAGRAPH"),
     "VLLM_DSPARK_FORWARD_CUDAGRAPH_ALLOW_TP": lambda: env_bool(
         "VLLM_DSPARK_FORWARD_CUDAGRAPH_ALLOW_TP"
+    ),
+    # DeepSeek-V4 vision: bidirectional SWA attention inside image sentinel
+    # spans (reference-faithful; SM120 packed prefill only). Default on for
+    # vision checkpoints; text checkpoints never read it. The pure helper
+    # vllm/models/deepseek_v4/image_attention.py reads the same variable
+    # directly (same default) so it stays importable without vllm.
+    "DSPARK_VISION_BIDI": lambda: (
+        os.environ.get("DSPARK_VISION_BIDI", "1").strip() != "0"
     ),
     # Represent block hashes in KV cache events as 64-bit integers instead of
     # raw bytes. Defaults to True for backward compatibility.

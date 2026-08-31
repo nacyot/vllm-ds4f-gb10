@@ -35,6 +35,11 @@ from vllm.config import get_current_vllm_config
 from vllm.forward_context import get_forward_context
 from vllm.logger import init_logger
 from vllm.models.deepseek_v4.common.ops import compute_global_topk_indices_and_lens
+from vllm.models.deepseek_v4.image_attention import (
+    DECODE_WIDTHS,
+    vision_bidi_enabled,
+    vision_index_width,
+)
 from vllm.models.deepseek_v4.nvidia.flashmla import DeepseekV4FlashMLAAttention
 from vllm.v1.worker.workspace import current_workspace_manager
 
@@ -175,6 +180,27 @@ class DeepseekV4FlashInferSM120DecodeAttention(DeepseekV4FlashMLAAttention):
             _DECODE_TILE if _DECODE_TILE > 0 else "off (whole batch)",
         )
 
+        # DSPARK_VISION_BIDI: vision checkpoints carry 512-wide prefill index
+        # rows (window + vision_max_n_token) on <= 64-row decode-kernel
+        # tiles; size the split-K decode scratch reservation for that width.
+        # Gate exactly like the builder (sparse_swa) and the wrapper
+        # (vision_model): with the packed SM120 prefill path inactive no
+        # wide row is ever built or launched, so a wide reservation would
+        # only waste workspace memory. Text checkpoints keep the causal
+        # window width everywhere.
+        import vllm.envs as envs
+        from vllm.utils.flashinfer import is_dsv4_sm120_fi_prefill_active
+
+        hf_config = get_current_vllm_config().model_config.hf_config
+        self._sm120_swa_index_width = self.window_size
+        if (
+            vision_bidi_enabled(hf_config)
+            and is_dsv4_sm120_fi_prefill_active()
+            and envs.VLLM_DEEPSEEK_V4_FLASHINFER_SM120_PREFILL
+            and vision_index_width(hf_config) in DECODE_WIDTHS
+        ):
+            self._sm120_swa_index_width = vision_index_width(hf_config)
+
     def _reserve_sm120_decode_workspace(self) -> None:
         if self.compress_ratio <= 1:
             extra_topk = 0
@@ -192,7 +218,7 @@ class DeepseekV4FlashInferSM120DecodeAttention(DeepseekV4FlashMLAAttention):
             _max_decode_workspace_tokens(self.max_num_batched_tokens),
             self.padded_heads,
             self.head_dim,
-            self.window_size,
+            self._sm120_swa_index_width,
             extra_topk,
         )
 
@@ -509,28 +535,59 @@ class DeepseekV4FlashInferSM120DecodeAttention(DeepseekV4FlashMLAAttention):
             if (compressed_k_cache is not None and not swa_only)
             else None
         )
-        mid_out = None
-        mid_lse = None
-        if num_prefill_tokens <= _DECODE_MAX_TOKENS:
-            extra_topk = topk_indices.shape[-1] if topk_indices is not None else 0
-            mid_out, mid_lse = _get_decode_scratch(
-                num_prefill_tokens,
-                output.shape[1],
-                output.shape[-1],
-                swa_indices.shape[-1],
-                extra_topk,
-            )
-        self._sm120_runner.run(
-            query,
-            swa_cache,
-            swa_indices,
-            out,
-            self.scale,
-            topk_length=swa_lens,
-            attn_sink=self.attn_sink,
-            extra_kv_cache=extra_cache,
-            extra_indices=topk_indices,
-            extra_topk_length=topk_lens,
-            mid_out=mid_out,
-            mid_lse=mid_lse,
-        )
+        # --- Launch via the runner, per DSPARK_VISION_BIDI segment. Text-only
+        # steps (vis_segments unset) run exactly one whole-batch call: > 64
+        # rows auto-dispatches the prefill orchestrator (TOPK=128), <= 64 rows
+        # the standalone decode kernel -- byte-identical to the pre-vision
+        # path. Vision steps split the prefill rows into causal segments
+        # (narrow 128-wide rows, one launch each: >= 65 rows hit the
+        # orchestrator, shorter runs were absorbed into a wide segment) and
+        # image segments (512-wide rows with look-ahead, tiled to <= 64-row
+        # decode-kernel calls -- the dual-cache orchestrator is TOPK=128 only).
+        segments = swa_metadata.vis_segments or [(0, num_prefill_tokens, False)]
+        tile = _DECODE_TILE if _DECODE_TILE > 0 else _DECODE_MAX_TOKENS
+        tile = max(1, min(tile, _DECODE_MAX_TOKENS))
+        extra_topk = topk_indices.shape[-1] if topk_indices is not None else 0
+        for seg_start, seg_end, seg_wide in segments:
+            if seg_wide:
+                idx_all = swa_metadata.vis_prefill_swa_indices
+                len_all = swa_metadata.vis_prefill_swa_lens
+                assert idx_all is not None and len_all is not None
+                step = tile
+            else:
+                idx_all = swa_indices
+                len_all = swa_lens
+                step = seg_end - seg_start
+            for start in range(seg_start, seg_end, step):
+                end = min(start + step, seg_end)
+                rows = end - start
+                mid_out = None
+                mid_lse = None
+                if rows <= _DECODE_MAX_TOKENS:
+                    # Decode-kernel dispatch: feed the warmup-reserved split-K
+                    # scratch so nothing allocates per step.
+                    mid_out, mid_lse = _get_decode_scratch(
+                        rows,
+                        output.shape[1],
+                        output.shape[-1],
+                        idx_all.shape[-1],
+                        extra_topk,
+                    )
+                self._sm120_runner.run(
+                    query[start:end],
+                    swa_cache,
+                    idx_all[start:end],
+                    out[start:end],
+                    self.scale,
+                    topk_length=len_all[start:end],
+                    attn_sink=self.attn_sink,
+                    extra_kv_cache=extra_cache,
+                    extra_indices=(
+                        topk_indices[start:end] if topk_indices is not None else None
+                    ),
+                    extra_topk_length=(
+                        topk_lens[start:end] if topk_lens is not None else None
+                    ),
+                    mid_out=mid_out,
+                    mid_lse=mid_lse,
+                )

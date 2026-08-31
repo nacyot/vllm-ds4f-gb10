@@ -33,12 +33,17 @@ and keep the hash-layer ``gate.bias`` mapping, so the vision checkpoint cannot
 load there; the constructor refuses early instead of failing at weight load.
 """
 
+import os
 from collections.abc import Iterable
 
 import torch
 import torch.nn as nn
 
+import vllm.envs as envs
+from vllm.compilation.breakable_cudagraph import eager_break_during_capture
 from vllm.config import VllmConfig
+from vllm.forward_context import get_forward_context, is_forward_context_available
+from vllm.logger import init_logger
 from vllm.model_executor.models.interfaces import (
     MultiModalEmbeddings,
     SupportsEagle3,
@@ -52,6 +57,15 @@ from vllm.model_executor.models.utils import (
     maybe_prefix,
 )
 from vllm.models.deepseek_v4 import DeepseekV4ForCausalLM
+from vllm.models.deepseek_v4.image_attention import (
+    DECODE_WIDTHS,
+    image_visible_flat,
+    slots_from_positions,
+    vision_bidi_enabled,
+    vision_index_width,
+    wide_segments,
+    window_rows_visible,
+)
 from vllm.models.deepseek_v4.image_processing import IMAGE, IMAGE_PLACEHOLDER
 from vllm.models.deepseek_v4.mm_preprocess import (
     DeepseekV4VDummyInputsBuilder,
@@ -62,6 +76,12 @@ from vllm.models.deepseek_v4.vision import DeepseekV4Aligner, DeepseekV4ViT
 from vllm.multimodal import MULTIMODAL_REGISTRY
 from vllm.platforms import current_platform
 from vllm.sequence import IntermediateTensors
+from vllm.utils.flashinfer import is_dsv4_sm120_fi_prefill_active
+from vllm.v1.attention.backends.mla.sparse_swa import (
+    compute_vision_prefill_swa_indices,
+)
+
+logger = init_logger(__name__)
 
 _LM_PREFIX = "language_model."
 _LM_ARCH = "DeepseekV4ForCausalLM"
@@ -191,6 +211,36 @@ class DeepseekV4VForConditionalGeneration(
         vocab_size = config.vocab_size
         self.configure_mm_token_handling(vocab_size, [vocab_size + i for i in range(5)])
 
+        # --- DSPARK_VISION_BIDI: bidirectional SWA inside image spans ------
+        # Active only on the SM120 packed prefill path with a supported index
+        # width; anything else keeps the phase-1 causal behaviour (logged).
+        self._vl_vocab_size = vocab_size
+        self._vision_max_n_token = int(getattr(config, "vision_max_n_token", 0) or 0)
+        self._window = int(getattr(config, "sliding_window", 0) or 0)
+        self._vision_bidi = (
+            vision_bidi_enabled(config)
+            and is_dsv4_sm120_fi_prefill_active()
+            and envs.VLLM_DEEPSEEK_V4_FLASHINFER_SM120_PREFILL
+            and vision_index_width(config) in DECODE_WIDTHS
+        )
+        if vision_bidi_enabled(config) and not self._vision_bidi:
+            logger.warning_once(
+                "DSPARK_VISION_BIDI: image spans stay causal (packed SM120 "
+                "prefill inactive, or index width %d not in %s).",
+                vision_index_width(config),
+                DECODE_WIDTHS,
+            )
+        self._swa_prefix = ""
+        self._bidi_checked = False
+        self._bad_span_steps = 0
+        if self._vision_bidi:
+            assert vllm_config.parallel_config.pipeline_parallel_size == 1, (
+                "DSPARK_VISION_BIDI needs pipeline_parallel_size == 1 (later "
+                "PP ranks never see input_ids); set DSPARK_VISION_BIDI=0."
+            )
+            lm = self.language_model.model
+            self._swa_prefix = lm.layers[lm.start_layer].attn.swa_cache_layer.prefix
+
     # ----------------------------------------------------------------- vision
 
     def _encode_one(
@@ -273,15 +323,169 @@ class DeepseekV4VForConditionalGeneration(
         if intermediate_tensors is not None:
             inputs_embeds = None
 
+        # DSPARK_VISION_BIDI: hand the step's image-span visibility to the
+        # shared SWA metadata before the LM shards/consumes the raw ids.
+        # Runs before sp_shard(input_ids) inside the LM, so every TP rank
+        # sees identical unsharded ids and makes the same host decision.
+        if self._vision_bidi and intermediate_tensors is None and input_ids is not None:
+            self._publish_image_visibility(input_ids)
+
         # Both input_ids (raw, incl. the OOV sentinels for routing) and the
         # merged inputs_embeds reach the LM; DeepseekV4Model uses the embeds
         # and still hands the ids to every layer's MoE gate.
-        return self.language_model(
+        hidden_states = self.language_model(
             input_ids=input_ids,
             positions=positions,
             intermediate_tensors=intermediate_tensors,
             inputs_embeds=inputs_embeds,
         )
+        # DSPARK_VISION_BIDI: drop the per-step wide-launch plan now that the
+        # target LM consumed it. The DSpark/DFlash draft prefill reuses this
+        # step's attention metadata objects directly (autoregressive
+        # speculator propose: the target metadata "can directly be used for
+        # draft prefill"), and the drafter's SWA layers share the target's
+        # KV-cache group, i.e. the SAME DeepseekSparseSWAMetadata instance; a
+        # stale vis_segments would run the draft prefill bidirectionally
+        # inside image spans, while the reference DSpark draft is causal.
+        if self._vision_bidi:
+            self._clear_image_visibility()
+        return hidden_states
+
+    @eager_break_during_capture
+    def _publish_image_visibility(self, input_ids: torch.Tensor) -> None:
+        """Per-step DSPARK_VISION_BIDI publish: visibility + wide index rows.
+
+        Computes the reference left/right visibility from the raw ids, writes
+        them into the builder-owned buffers on the shared SWA metadata
+        (in-place writes only: the eager-break contract under breakable CUDA
+        graphs), makes ONE host sync for the go/no-go decision plus the
+        wide-row mask, then launches the wide index kernel and sets
+        ``vis_segments``. Every bail-out leaves ``vis_segments`` unset, so
+        the step runs causally exactly as phase 1 did.
+        """
+        if not is_forward_context_available():
+            return
+        attn_metadata = get_forward_context().attn_metadata
+        if attn_metadata is None:  # profile / warmup dummy run
+            return
+        if not isinstance(attn_metadata, dict):
+            logger.warning_once(
+                "DSPARK_VISION_BIDI: list-typed attn_metadata (DBO); image "
+                "spans stay causal."
+            )
+            return
+        swa = attn_metadata.get(self._swa_prefix)
+        if (
+            swa is None
+            or swa.num_prefill_tokens == 0
+            or swa.vis_prefill_swa_indices is None
+        ):
+            return
+        if torch.cuda.is_current_stream_capturing():
+            # FULL-graph capture dummies carry no sentinel ids, and host
+            # branching must never be baked into a graph (attention.py
+            # is_current_stream_capturing precedent).
+            return
+        assert swa.is_valid_token is not None
+        assert swa.query_start_loc is not None
+        assert swa.vis_left is not None and swa.vis_right is not None
+        num_tokens = swa.num_decode_tokens + swa.num_prefill_tokens
+        n = min(input_ids.shape[0], swa.is_valid_token.shape[0])
+        if n < num_tokens:
+            logger.warning_once(
+                "DSPARK_VISION_BIDI: input_ids rows (%d) do not cover the "
+                "step's %d tokens; image spans stay causal.",
+                n,
+                num_tokens,
+            )
+            return
+        num_reqs = swa.num_decodes + swa.num_prefills
+        left, right, bad = image_visible_flat(
+            input_ids[:n],
+            self._vl_vocab_size,
+            self._vision_max_n_token,
+            valid_mask=swa.is_valid_token[:n],
+            query_start_loc=swa.query_start_loc[: num_reqs + 1],
+        )
+        swa.vis_left[:n].copy_(left)
+        swa.vis_right[:n].copy_(right)
+        pf = slice(swa.num_decode_tokens, num_tokens)
+        # ONE D2H sync per prefill step of a vision deployment: the span-cut
+        # flag plus the per-prefill-row wide mask for segment planning.
+        host = torch.cat([bad.reshape(1), (left[pf] + right[pf]) > 0]).cpu()
+        if bool(host[0]):
+            # A chunk boundary or prefix-cache resume landed inside an image
+            # span. image_visible_flat already zeroed the broken requests'
+            # rows (they run plain causal, the phase-1 behaviour); the rest
+            # of the step keeps bidi. Rate-limited warning, not warning_once:
+            # operators must be able to see the recurrence frequency.
+            self._bad_span_steps += 1
+            if self._bad_span_steps <= 5 or self._bad_span_steps % 1000 == 0:
+                logger.warning(
+                    "DSPARK_VISION_BIDI: an image span is cut by a chunk "
+                    "boundary or prefix-cache resume; the affected "
+                    "request(s) run causal this step (occurrence %d).",
+                    self._bad_span_steps,
+                )
+        segments = wide_segments(host[1:].tolist())
+        if segments is None:
+            return  # text-only step: single causal launch (today's path)
+        compute_vision_prefill_swa_indices(swa, self._window)
+        swa.vis_segments = segments
+        if (
+            os.environ.get("DSPARK_VISION_BIDI_CHECK", "0") == "1"
+            and not self._bidi_checked
+        ):
+            self._bidi_checked = True
+            self._check_vision_rows(swa, left, right)
+
+    def _clear_image_visibility(self) -> None:
+        """Reset ``vis_segments`` on the shared SWA metadata (host attribute
+        only, safe under capture) so any later consumer of this step's
+        metadata -- the speculative draft prefill above all -- takes the
+        single causal whole-range launch."""
+        if not is_forward_context_available():
+            return
+        attn_metadata = get_forward_context().attn_metadata
+        if not isinstance(attn_metadata, dict):
+            return
+        swa = attn_metadata.get(self._swa_prefix)
+        if swa is not None and swa.vis_segments is not None:
+            swa.vis_segments = None
+
+    def _check_vision_rows(self, swa, left, right) -> None:
+        """GPU self-check (``DSPARK_VISION_BIDI_CHECK=1``, first vision step):
+        the wide kernel's slot rows must equal the torch port's position rows
+        mapped through the block table."""
+        nd = swa.num_decode_tokens
+        npf = swa.num_prefill_tokens
+        token_idx = torch.arange(nd, nd + npf, device=left.device)
+        req = swa.token_to_req_indices[token_idx].long()
+        query_start = swa.query_start_loc[req].long()
+        query_len = swa.query_start_loc[req + 1].long() - query_start
+        prefix = swa.seq_lens[req].long() - query_len
+        pos = prefix + token_idx - query_start
+        rows, lens = window_rows_visible(
+            pos,
+            left[nd : nd + npf],
+            right[nd : nd + npf],
+            self._window,
+            swa.vis_prefill_swa_indices.shape[-1],
+        )
+        expect = slots_from_positions(rows, swa.block_table[req], swa.block_size)
+        valid = swa.is_valid_token[nd : nd + npf]
+        got_rows = swa.vis_prefill_swa_indices[:npf, 0, :]
+        got_lens = swa.vis_prefill_swa_lens[:npf]
+        rows_ok = bool(torch.equal(got_rows[valid], expect[valid]))
+        lens_ok = bool(torch.equal(got_lens[valid], lens[valid]))
+        if rows_ok and lens_ok:
+            logger.info("DSPARK_VISION_BIDI_CHECK passed (%d prefill rows).", int(npf))
+        else:
+            logger.warning(
+                "DSPARK_VISION_BIDI_CHECK FAILED: rows_ok=%s lens_ok=%s",
+                rows_ok,
+                lens_ok,
+            )
 
     def compute_logits(self, hidden_states: torch.Tensor) -> torch.Tensor | None:
         return self.language_model.compute_logits(hidden_states)

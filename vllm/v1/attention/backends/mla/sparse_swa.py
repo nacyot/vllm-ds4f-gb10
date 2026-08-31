@@ -7,6 +7,7 @@ import torch
 
 import vllm.envs as envs
 from vllm.config import CacheConfig, VllmConfig, get_current_vllm_config
+from vllm.logger import init_logger
 from vllm.model_executor.layers.attention_layer_base import AttentionLayerBase
 from vllm.model_executor.warmup.jit_warmup import (
     VllmJitKernel,
@@ -38,6 +39,8 @@ from vllm.v1.kv_cache_interface import (
     SlidingWindowMLASpec,
     get_kv_quant_mode,
 )
+
+logger = init_logger(__name__)
 
 # DeepseekV4 decode layer types, keyed by compress_ratio. Each type has a distinct
 # (topk, extra_topk, extra_page_block_size) config, so they cannot share a
@@ -180,13 +183,27 @@ class DeepseekSparseSWAMetadata:
 
     is_valid_token: torch.Tensor | None = None  # [num_tokens]
     token_to_req_indices: torch.Tensor | None = None  # [num_tokens]
-    decode_swa_indices: torch.Tensor | None = None  # [num_decode_tokens, window_size]
+    decode_swa_indices: torch.Tensor | None = (
+        None  # [num_decode_tokens, 1, window_size]
+    )
     decode_swa_lens: torch.Tensor | None = None  # [num_decode_tokens]
     # Paged-coordinate prefill SWA indices/lens (FP8 paged-direct prefill).
     prefill_swa_indices: torch.Tensor | None = (
         None  # [num_prefill_tokens, 1, window_size]
     )
     prefill_swa_lens: torch.Tensor | None = None  # [num_prefill_tokens]
+
+    # DSPARK_VISION_BIDI (vision checkpoints on the SM120 packed prefill path
+    # only; all None otherwise). vis_left/vis_right are builder-owned int32
+    # buffers the vision wrapper fills in-place each step; vis_segments is
+    # set by the wrapper per step (None = single causal launch, today's path).
+    vis_prefill_swa_indices: torch.Tensor | None = (
+        None  # [num_prefill_tokens, 1, W], W = window + vision_max_n_token
+    )
+    vis_prefill_swa_lens: torch.Tensor | None = None  # [num_prefill_tokens]
+    vis_left: torch.Tensor | None = None  # [num_tokens_after_padding]
+    vis_right: torch.Tensor | None = None  # [num_tokens_after_padding]
+    vis_segments: list[tuple[int, int, bool]] | None = None
 
     # Number of decode/prefill requests/tokens (batch is reordered: decodes first)
     num_decodes: int = 0
@@ -510,6 +527,53 @@ class DeepseekSparseSWAMetadataBuilder(AttentionMetadataBuilder):
         self.decode_swa_indices_noncausal: torch.Tensor | None = None
         self._max_tokens = max_tokens
 
+        # DSPARK_VISION_BIDI: wide per-row prefill index buffers for vision
+        # checkpoints on the SM120 packed-prefill path. Text checkpoints
+        # (vision_n_layers == 0) take none of this. Lazy import: the
+        # deepseek_v4 package __init__ imports the model stack, which imports
+        # this module back (attention.py); a top-level import here could
+        # re-enter sparse_swa before DeepseekV4SWACache is defined (same
+        # reason the flashmla import in get_builder_cls stays lazy).
+        self.vision_index_width = 0
+        if int(getattr(hf_config, "vision_n_layers", 0) or 0) > 0:
+            from vllm.models.deepseek_v4.image_attention import (
+                DECODE_WIDTHS,
+                vision_bidi_enabled,
+                vision_index_width,
+            )
+
+            if (
+                vision_bidi_enabled(hf_config)
+                and is_dsv4_sm120_fi_prefill_active()
+                and envs.VLLM_DEEPSEEK_V4_FLASHINFER_SM120_PREFILL
+            ):
+                width = vision_index_width(hf_config)
+                if width in DECODE_WIDTHS:
+                    self.vision_index_width = width
+                    self.vis_prefill_swa_indices = torch.zeros(
+                        max_tokens,
+                        1,
+                        width,
+                        dtype=torch.int32,
+                        device=self.device,
+                    )
+                    self.vis_prefill_swa_lens = torch.zeros(
+                        max_tokens, dtype=torch.int32, device=self.device
+                    )
+                    self.vis_left = torch.zeros(
+                        max_tokens, dtype=torch.int32, device=self.device
+                    )
+                    self.vis_right = torch.zeros(
+                        max_tokens, dtype=torch.int32, device=self.device
+                    )
+                else:
+                    logger.warning_once(
+                        "DSPARK_VISION_BIDI: vision index width %d not in "
+                        "%s; image spans stay causal.",
+                        width,
+                        DECODE_WIDTHS,
+                    )
+
     def build(
         self,
         common_prefix_len: int,
@@ -639,6 +703,12 @@ class DeepseekSparseSWAMetadataBuilder(AttentionMetadataBuilder):
                 TRITON_BLOCK_SIZE=1024,
             )
 
+        # DSPARK_VISION_BIDI: expose the wide vision buffers only when the
+        # causal prefill rows are live too (same gate). The vision wrapper
+        # fills vis_left/vis_right and launches the wide index kernel per
+        # step; vis_segments stays None until it does.
+        vision_prefill = self.vision_index_width > 0 and want_prefill_swa
+
         # Pre-compute DeepseekV4 prefill metadata shared across all attention layers.
         deepseek_v4_fields = self._build_deepseek_v4_metadata(
             num_decodes,
@@ -672,6 +742,22 @@ class DeepseekSparseSWAMetadataBuilder(AttentionMetadataBuilder):
             ),
             prefill_swa_lens=(
                 self.prefill_swa_lens[:num_prefill_tokens] if want_prefill_swa else None
+            ),
+            vis_prefill_swa_indices=(
+                self.vis_prefill_swa_indices[:num_prefill_tokens]
+                if vision_prefill
+                else None
+            ),
+            vis_prefill_swa_lens=(
+                self.vis_prefill_swa_lens[:num_prefill_tokens]
+                if vision_prefill
+                else None
+            ),
+            vis_left=(
+                self.vis_left[: slot_mapping.shape[0]] if vision_prefill else None
+            ),
+            vis_right=(
+                self.vis_right[: slot_mapping.shape[0]] if vision_prefill else None
             ),
             block_size=self.block_size,
             num_decodes=num_decodes,
@@ -966,3 +1052,141 @@ def _compute_dspark_noncausal_swa_indices_kernel(
             slot_ids,
             mask=offset < index_width,
         )
+
+
+@triton.jit(
+    do_not_specialize=[
+        "window_size",
+        "index_width",
+        "swa_indices_stride",
+        "block_table_stride",
+        "block_size",
+        "token_offset",
+    ]
+)
+def _compute_vision_swa_indices_and_lens_kernel(
+    swa_indices_ptr,
+    swa_indices_stride,
+    swa_lens_ptr,
+    window_size,
+    index_width,
+    vis_left_ptr,
+    vis_right_ptr,
+    query_start_loc_ptr,
+    seq_lens_ptr,
+    token_to_req_indices_ptr,
+    is_valid_token_ptr,
+    block_table_ptr,
+    block_table_stride,
+    block_size,
+    token_offset,
+    TRITON_BLOCK_SIZE: tl.constexpr,
+):
+    """DSPARK_VISION_BIDI per-token wide SWA rows (paged slot ids).
+
+    1:1 mirror of ``image_attention.window_rows_visible`` (the marked lines
+    correspond): identical start/length arithmetic in position space, then
+    the same position -> slot mapping as ``_compute_swa_indices_and_lens_kernel``.
+    ``left = right = 0`` with ``index_width == window_size`` reproduces that
+    causal kernel exactly. ``do_not_specialize`` covers every integer arg so
+    one warmup launch at any shape compiles the runtime cubin (Triton would
+    otherwise specialize e.g. a stride-1 warmup tensor into its own cubin
+    and JIT again on the first real image request).
+    """
+    pid = tl.program_id(0)
+    token_idx = pid + token_offset
+    is_valid = tl.load(is_valid_token_ptr + token_idx)
+    if not is_valid:
+        tl.store(swa_lens_ptr + pid, 0)
+        # Clear the row so a padded token cannot gather through stale indices.
+        for i in range(0, index_width, TRITON_BLOCK_SIZE):
+            offset = i + tl.arange(0, TRITON_BLOCK_SIZE)
+            tl.store(
+                swa_indices_ptr + pid * swa_indices_stride + offset,
+                -1,
+                mask=offset < index_width,
+            )
+        return
+
+    req_idx = tl.load(token_to_req_indices_ptr + token_idx)
+
+    query_start = tl.load(query_start_loc_ptr + req_idx)
+    query_end = tl.load(query_start_loc_ptr + req_idx + 1)
+    query_len = query_end - query_start
+
+    seq_len = tl.load(seq_lens_ptr + req_idx)
+    prefix_len = seq_len - query_len
+
+    pos = prefix_len + token_idx - query_start
+    left = tl.load(vis_left_ptr + token_idx)
+    right = tl.load(vis_right_ptr + token_idx)
+    # window_rows_visible: left_add = (left - (window_size - 1)).clamp(min=0)
+    left_add = tl.maximum(left - (window_size - 1), 0)
+    # window_rows_visible: start = (pos - (window_size - 1) - left_add).clamp(min=0)
+    start_pos = tl.maximum(pos - (window_size - 1) - left_add, 0)
+    # window_rows_visible: lens = (pos + right + 1 - start).clamp(max=index_width)
+    swa_len = tl.minimum(pos + right + 1 - start_pos, index_width)
+    end_pos = start_pos + swa_len
+
+    tl.store(swa_lens_ptr + pid, swa_len)
+
+    for i in range(0, index_width, TRITON_BLOCK_SIZE):
+        offset = i + tl.arange(0, TRITON_BLOCK_SIZE)
+
+        pos_offset = start_pos + offset
+        block_indices = pos_offset // block_size
+        # Same masked-lane clamp as _compute_swa_indices_and_lens_kernel:
+        # SM12x + Triton 3.6 raises IMA on out-of-bounds address arithmetic
+        # even when the load mask gates the actual read.
+        safe_block_indices = tl.where(pos_offset < end_pos, block_indices, 0)
+        block_numbers = tl.load(
+            block_table_ptr + req_idx * block_table_stride + safe_block_indices,
+            mask=pos_offset < end_pos,
+        )
+        block_offsets = pos_offset % block_size
+        slot_ids = block_numbers * block_size + block_offsets
+
+        # window_rows_visible: rows = where(col < lens, position, -1) -- with
+        # the position replaced by its paged slot id.
+        slot_ids = tl.where(offset < swa_len, slot_ids, -1)
+        tl.store(
+            swa_indices_ptr + pid * swa_indices_stride + offset,
+            slot_ids,
+            mask=offset < index_width,
+        )
+
+
+def compute_vision_prefill_swa_indices(
+    metadata: DeepseekSparseSWAMetadata, window_size: int
+) -> None:
+    """Fill the step's wide vision prefill rows (DSPARK_VISION_BIDI).
+
+    Called by the vision wrapper once per prefill step that contains an image
+    span, after it wrote ``vis_left``/``vis_right`` for every token row.
+    """
+    idx = metadata.vis_prefill_swa_indices
+    lens = metadata.vis_prefill_swa_lens
+    assert idx is not None and lens is not None
+    assert metadata.vis_left is not None and metadata.vis_right is not None
+    assert metadata.query_start_loc is not None
+    assert metadata.seq_lens is not None
+    assert metadata.token_to_req_indices is not None
+    assert metadata.is_valid_token is not None
+    _compute_vision_swa_indices_and_lens_kernel[(metadata.num_prefill_tokens,)](
+        idx,
+        idx.stride(0),
+        lens,
+        window_size,
+        idx.shape[-1],
+        metadata.vis_left,
+        metadata.vis_right,
+        metadata.query_start_loc,
+        metadata.seq_lens,
+        metadata.token_to_req_indices,
+        metadata.is_valid_token,
+        metadata.block_table,
+        metadata.block_table.stride(0),
+        metadata.block_size,
+        token_offset=metadata.num_decode_tokens,
+        TRITON_BLOCK_SIZE=1024,
+    )
