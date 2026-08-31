@@ -1138,10 +1138,16 @@ class SpeculativeConfig:
                         # Default to max value defined in draft model config.
                         self.num_speculative_tokens = n_predict
                     elif (
-                        self.num_speculative_tokens > n_predict
+                        self.method != "dspark"
+                        and self.num_speculative_tokens > n_predict
                         and self.num_speculative_tokens % n_predict != 0
                     ):
-                        # Ensure divisibility for MTP module reuse.
+                        # Ensure divisibility for MTP module reuse. DSpark
+                        # drafts a fixed block (num_speculative_tokens =
+                        # dspark_block_size) with its own stage count, so the
+                        # MTP-reuse rule does not apply; the vision checkpoint
+                        # sets num_nextn_predict_layers=3 (block 5) and would
+                        # otherwise be rejected here.
                         raise ValueError(
                             f"num_speculative_tokens:{self.num_speculative_tokens}"
                             f" must be divisible by {n_predict=}"
