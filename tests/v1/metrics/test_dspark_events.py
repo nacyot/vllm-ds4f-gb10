@@ -120,3 +120,13 @@ def test_tracker_drains_events():
     assert ev.get(EV_LOOP_BREAK_NOVELTY) == 1
     assert ev.get(EV_BUDGET_HIT) == 1  # 64-token budget crossed on the way
     assert lb.drain_events() == {}  # drained
+
+
+def test_events_prom_counts_dsml_blocks():
+    from vllm.v1.metrics.dspark import EV_DSML_BLOCK
+
+    unregister_vllm_metrics()
+    prom = DsparkEventsProm(["model_name", "engine"], {0: ["m", "0"]})
+    prom.observe({EV_DSML_BLOCK: 2})
+    assert _sample("vllm:dspark_dsml_blocks_total", model_name="m", engine="0") == 2
+    unregister_vllm_metrics()

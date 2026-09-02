@@ -26,6 +26,7 @@ EV_LOOP_BREAK_NOVELTY = "loop_break_novelty"
 EV_ANSWER_REPETITION = "answer_repetition"
 EV_BUDGET_HIT = "thinking_budget_hit"
 EV_SECTION_TEMP_SWITCH = "section_temp_switch"
+EV_DSML_BLOCK = "dsml_block"
 
 
 class DsparkEventsProm:
@@ -69,6 +70,12 @@ class DsparkEventsProm:
                 "Tool-turn requests switched to the answer temperature at a "
                 "DSML marker (DSPARK_TOOL_TEMP0_SCOPE).",
             ),
+            (
+                "vllm:dspark_dsml_blocks",
+                "DSML tool-call openers recognised by the scheduler-side "
+                "tracker (the loop breaker and the answer-repetition detector "
+                "stand down for the block).",
+            ),
         ]
         counters = [
             create_metric_per_engine(
@@ -80,6 +87,7 @@ class DsparkEventsProm:
         self.counter_answer_repetition = counters[0]
         self.counter_budget_hits = counters[1]
         self.counter_section_temp_switches = counters[2]
+        self.counter_dsml_blocks = counters[3]
 
     def observe(self, events: dict[str, int], engine_idx: int = 0) -> None:
         if not events:
@@ -99,6 +107,9 @@ class DsparkEventsProm:
         n = events.get(EV_SECTION_TEMP_SWITCH, 0)
         if n:
             self.counter_section_temp_switches[engine_idx].inc(n)
+        n = events.get(EV_DSML_BLOCK, 0)
+        if n:
+            self.counter_dsml_blocks[engine_idx].inc(n)
 
 
 def frontend_counter(

@@ -86,6 +86,18 @@ class ReasoningConfig:
     answer_repetition_novelty_min: float = 0.3
     """Novelty threshold for ``answer_repetition_novelty_window``."""
 
+    answer_repetition_dsml_min: float = 0.0
+    """DSPARK: novelty threshold applied from a DSML tool-call opener
+    (``<｜DSML｜tool_calls>`` / ``<｜DSML｜invoke``) to the end of the section
+    (the closer is not tracked; DeepSeek-V4 ends the turn after it); 0 (the
+    default) turns the answer detector off there and its tokens are not even
+    fed to the window. Tool-call payloads are legitimately repetitive: on
+    2026-09-02 (DeepSeek-V4-Flash, window 1024) a 2k-token code patch crossed
+    the 0.3 prose threshold and the request was cut mid-argument (the client
+    saw a truncated tool call and retried four times). Exact cycles measure
+    ~0.0, so a small value here guards against runaway inside a tool call;
+    otherwise that case is bounded by ``max_tokens`` only."""
+
     _reasoning_start_token_ids: list[int] | None = field(
         default=None, init=False, repr=False
     )
@@ -144,7 +156,11 @@ class ReasoningConfig:
             or self.answer_repetition_novelty_window < 0
         ):
             raise ValueError("ReasoningConfig: novelty windows must be >= 0")
-        for name in ("loop_break_novelty_min", "answer_repetition_novelty_min"):
+        for name in (
+            "loop_break_novelty_min",
+            "answer_repetition_novelty_min",
+            "answer_repetition_dsml_min",
+        ):
             v = getattr(self, name)
             if not 0.0 <= v <= 1.0:
                 raise ValueError(f"ReasoningConfig: {name} must be within [0, 1]")

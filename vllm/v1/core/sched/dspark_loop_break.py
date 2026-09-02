@@ -131,14 +131,34 @@ def _ends_with_proper_prefix(
     landing. Latching on this costs one step less than waiting for the whole
     marker (see the module docstring on the boundary lag).
 
-    ``min_len`` defaults to 2 because the marker tokenizes as ``<`` (a plain
-    ASCII token, id 30 on DeepSeek-V4) followed by the ``｜DSML｜`` special
-    token: a one-token prefix would latch on any bare ``<`` in prose or code
-    (verified 2026-09-02), a two-token prefix is unambiguous."""
+    ``min_len`` defaults to 2: the markers start at the ``｜DSML｜`` special
+    token (the plain ``<`` in front of it is stripped, see
+    ``_dsml_token_ids``), and a one-token prefix would latch on every other
+    DSML construct (``parameter``, the closers); two tokens are unambiguous.
+    Before 2026-09-02 (evening) the markers kept the ``<`` and the same rule
+    kept a bare ``<`` in prose or code from latching."""
     for k in range(min(len(seq) - 1, len(target)), max(1, min_len) - 1, -1):
         if target[-k:] == seq[:k]:
             return True
     return False
+
+
+def _without_leading(seq: list[int], lead: list[int]) -> list[int]:
+    """DSPARK: drop a leading plain-``<`` token from a DSML marker. The
+    opener tokenizes as ``<`` (id 30 on DeepSeek-V4) followed by the ``｜DSML｜``
+    special token, and that ``<`` merges with whatever precedes it (" <" ->
+    818, ".<" -> 32334, ")<" -> 49584, verified 2026-09-02), so a marker keyed
+    on ``<`` misses an opener that does not start a line."""
+    if len(seq) > 2 and len(lead) == 1 and seq[0] == lead[0]:
+        return seq[1:]
+    return seq
+
+
+def _reset_answer_tracker(st: dict[str, Any]) -> None:
+    """DSPARK: start a fresh answer-section novelty window."""
+    st["ans_nov"] = None
+    st["ans_below"] = 0
+    st["ans_last"] = 0
 
 
 class DsparkLoopBreak:
@@ -167,8 +187,13 @@ class DsparkLoopBreak:
         self.novelty_consecutive = max(1, int(nv.get("consecutive", 2) or 2))
         self.answer_novelty_window = max(0, int(nv.get("answer_window", 0) or 0))
         self.answer_novelty_min = float(nv.get("answer_min", 0.3))
+        # DSPARK: threshold inside a DSML tool-call block; 0 = detector off there.
+        self.answer_dsml_min = float(nv.get("answer_dsml_min", 0.0) or 0.0)
         self.num_fired_novelty = 0
         self.num_answer_repetition = 0
+        # DSPARK: DSML tool-call openers recognised (observability for the
+        # skip rules, which are otherwise silent).
+        self.num_dsml_blocks = 0
         self._pending_finish: dict[str, str] = {}
         # DSPARK: per-step event counts drained by Scheduler.make_stats into
         # SchedulerStats.dspark_events (Prometheus counters on the frontend).
@@ -252,6 +277,7 @@ class DsparkLoopBreak:
             "consecutive": getattr(rc, "loop_break_novelty_consecutive", 2) or 2,
             "answer_window": getattr(rc, "answer_repetition_novelty_window", 0) or 0,
             "answer_min": getattr(rc, "answer_repetition_novelty_min", 0.3),
+            "answer_dsml_min": getattr(rc, "answer_repetition_dsml_min", 0.0) or 0.0,
         }
         novelty_on = novelty["window"] > 0 or novelty["answer_window"] > 0
         if not loop_break_on and not section_temp_on and not novelty_on:
@@ -269,7 +295,14 @@ class DsparkLoopBreak:
                 min_count=min_count,
             )
         scope = dspark_temp0_scope()
-        dsml_ids = cls._dsml_token_ids(vllm_config, scope) if section_temp_on else None
+        # DSPARK: the DSML tool-call marker serves every consumer that gets
+        # here -- the section-temperature channel, the loop breaker (never
+        # force inside a tool-call block) and the answer detector (never score
+        # one). Until 2026-09-02 (evening) it was tokenized only under
+        # DSPARK_TOOL_TEMP0=1, so at the vendor operating point (TEMP0 unset)
+        # both detector rules were inert and a code patch inside a tool call
+        # was cut as an answer runaway.
+        dsml_ids = cls._dsml_token_ids(vllm_config, scope, section_temp_on)
         lb = cls(
             start_ids,
             end_ids,
@@ -287,13 +320,21 @@ class DsparkLoopBreak:
             logger.info(
                 "DSPARK near-repetition detectors enabled: reasoning window=%d "
                 "min=%.2f ngram=%d consecutive=%d (forces the end sequence); "
-                "answer window=%d min=%.2f (finish_reason=repetition).",
+                "answer window=%d min=%.2f (finish_reason=repetition); "
+                "tool-call blocks %s.",
                 lb.novelty_window,
                 lb.novelty_min,
                 lb.novelty_ngram,
                 lb.novelty_consecutive,
                 lb.answer_novelty_window,
                 lb.answer_novelty_min,
+                (
+                    f"min={lb.answer_dsml_min:.2f}"
+                    if lb.answer_dsml_min > 0
+                    else "skipped (answer_repetition_dsml_min=0)"
+                )
+                if lb.dsml_markers
+                else "not recognised (DSML marker not tokenized)",
             )
         if params is not None:
             logger.info(
@@ -322,12 +363,16 @@ class DsparkLoopBreak:
         return lb
 
     @staticmethod
-    def _dsml_token_ids(vllm_config: VllmConfig, scope: str) -> list[int]:
+    def _dsml_token_ids(
+        vllm_config: VllmConfig, scope: str, section_temp_on: bool = True
+    ) -> list[int]:
         """DSPARK: tokenize the DSML tool-call start marker. Under scope
         ``answer`` failure only means a think section left by opening a tool
         call without ``</think>`` keeps the reasoning temperature; under scope
         ``dsml`` the marker is the only trigger there is, so failure makes the
-        scope inert."""
+        scope inert. With the section temperature off (``section_temp_on``
+        False) the marker only serves the detectors, which then cannot tell a
+        tool-call block from prose."""
         try:
             from vllm.tokenizers import cached_tokenizer_from_config
 
@@ -343,9 +388,23 @@ class DsparkLoopBreak:
                 )
             except Exception:  # noqa: BLE001
                 inv = []
+            # DSPARK: anchor on the ``｜DSML｜`` special token (see
+            # ``_without_leading``); the two-token prefix latch stays
+            # unambiguous because ``parameter`` / the closers only share the
+            # first token.
+            lead = list(tokenizer.encode("<", add_special_tokens=False))
+            ids, inv = _without_leading(ids, lead), _without_leading(inv, lead)
             return [ids, inv] if inv else [ids]
         except Exception as exc:  # noqa: BLE001 - best effort, logged once
-            if scope == DSPARK_SCOPE_DSML:
+            if not section_temp_on:
+                logger.warning(
+                    "DSPARK detectors: could not tokenize %r (%s); the loop "
+                    "breaker and the answer-repetition detector cannot recognise "
+                    "DSML tool-call blocks and will treat them as prose.",
+                    DSPARK_DSML_TOOL_START,
+                    exc,
+                )
+            elif scope == DSPARK_SCOPE_DSML:
                 logger.warning(
                     "DSPARK_TOOL_TEMP0_SCOPE=dsml could not tokenize %r (%s), and "
                     "that marker is its only trigger, so the scope is inert: tool "
@@ -469,6 +528,11 @@ class DsparkLoopBreak:
             st["fired"] = False
             st["budget_logged"] = False
             st["dsml_seen"] = False
+            if prev_in_think:
+                # DSPARK: a new answer section; the old window may hold an
+                # in-think tool-call block and must not score the first
+                # answer tokens (review finding, 2026-09-02).
+                _reset_answer_tracker(st)
             # DSPARK: which marker closed it. Without a transition phrase the
             # two id lists are identical and every exit is a natural one;
             # with one, the natural marker is a suffix of the forced sequence,
@@ -493,6 +557,7 @@ class DsparkLoopBreak:
                 st["nov"] = None
                 st["nov_below"] = 0
                 st["nov_last"] = 0
+                _reset_answer_tracker(st)
             st["in_think"] = True
             st["section_begin"] = window_begin + last_start + len(self.start_ids)
             st["think_len"] = n - st["section_begin"]
@@ -520,6 +585,12 @@ class DsparkLoopBreak:
                 st["dsml_seen"] = True
                 st["dsml_latched"] = True
                 st["end_reason"] = "dsml"
+                # DSPARK: the block gets its own window (scored only under
+                # answer_repetition_dsml_min > 0), and the count makes the
+                # otherwise silent skip rules visible on the dashboard.
+                _reset_answer_tracker(st)
+                self.num_dsml_blocks += 1
+                self._event("dsml_block")
         st["scan_pos"] = n
         new_tokens = out[scan_pos:n]
 
@@ -536,7 +607,15 @@ class DsparkLoopBreak:
                         ngram=self.novelty_ngram, window=self.novelty_window
                     )
                 nov.push_many(new_tokens)
-        elif self.answer_novelty_window:
+        elif (
+            self.answer_novelty_window
+            and not st["in_think"]
+            and (not st["dsml_seen"] or self.answer_dsml_min > 0)
+        ):
+            # DSPARK: answer prose, or a tool-call block under the opt-in
+            # threshold. A block opened inside <think> feeds nothing: the
+            # verdict is never taken there and its tokens must not linger in
+            # the window the next answer section starts with.
             ans = st["ans_nov"]
             if ans is None:
                 ans = st["ans_nov"] = SectionNovelty(
@@ -669,6 +748,18 @@ class DsparkLoopBreak:
         ``take_answer_repetition``)."""
         if not self.answer_novelty_window or st["in_think"]:
             return False
+        # DSPARK: inside a DSML tool-call block the payload (a patch, JSON, a
+        # table) is legitimately repetitive -- on 2026-09-02 a 2k-token code
+        # patch crossed the 0.3 prose threshold at window 1024 and the request
+        # was cut mid-argument -- so the prose threshold never applies there;
+        # ``answer_repetition_dsml_min`` (default 0 = off) is the opt-in
+        # guard for that section, which lasts until the section ends (the
+        # closer is not tracked; DeepSeek-V4 ends the turn after it).
+        in_dsml = bool(st["dsml_seen"])
+        threshold = self.answer_dsml_min if in_dsml else self.answer_novelty_min
+        if threshold <= 0.0:
+            st["ans_below"] = 0
+            return False
         ans = st["ans_nov"]
         if ans is None or rid in self._pending_finish:
             return False
@@ -678,7 +769,7 @@ class DsparkLoopBreak:
         if not ans.ready:
             return False
         value = ans.novelty
-        if value < self.answer_novelty_min:
+        if value < threshold:
             st["ans_below"] += 1
         else:
             st["ans_below"] = 0
@@ -687,16 +778,18 @@ class DsparkLoopBreak:
         self.num_answer_repetition += 1
         self._event("answer_repetition")
         self._pending_finish[rid] = (
-            f"dspark_answer_repetition(novelty={value:.2f},tokens={ans.count})"
+            f"dspark_answer_repetition(novelty={value:.2f},tokens={ans.count}"
+            + (",section=dsml)" if in_dsml else ")")
         )
         logger.info(
-            "DSPARK answer repetition: request %s near-repeating after %d answer "
+            "DSPARK answer repetition: request %s near-repeating after %d %s "
             "tokens (novelty %.2f < %.2f over %d tokens); finishing with "
             "finish_reason=repetition (%d total).",
             rid,
             ans.count,
+            "tool-call block" if in_dsml else "answer",
             value,
-            self.answer_novelty_min,
+            threshold,
             self.answer_novelty_window,
             self.num_answer_repetition,
         )

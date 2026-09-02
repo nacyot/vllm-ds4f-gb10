@@ -10,7 +10,7 @@ from vllm.v1.core.sched.dspark_loop_break import DsparkLoopBreak
 THINK_START, THINK_END = 900, 901
 
 
-def _make(window=256, ans_window=256, consecutive=2, exact=False):
+def _make(window=256, ans_window=256, consecutive=2, exact=False, ans_dsml_min=0.0):
     params = None
     if exact:
         from vllm.sampling_params import RepetitionDetectionParams
@@ -32,8 +32,20 @@ def _make(window=256, ans_window=256, consecutive=2, exact=False):
             "consecutive": consecutive,
             "answer_window": ans_window,
             "answer_min": 0.3,
+            "answer_dsml_min": ans_dsml_min,
         },
     )
+
+
+DSML = [800, 801]
+
+
+def _with_dsml(lb):
+    """Give the tracker a (fake) DSML tool-call marker, as from_config does."""
+    lb.dsml_markers = [list(DSML)]
+    lb.dsml_ids = list(DSML)
+    lb._max_marker = max(lb._max_marker, len(DSML))
+    return lb
 
 
 class _Req:
@@ -138,6 +150,133 @@ def test_forget_clears_pending_finish():
     _feed(lb, req, pending, list(range(300, 600)) * 4)
     lb.forget("r")
     assert lb.take_answer_repetition("r") is None
+
+
+def test_answer_detector_skips_tool_call_block_by_default():
+    # A patch / JSON payload inside <｜DSML｜tool_calls> is repetitive by
+    # nature (2026-09-02: a real 2k-token patch scored 0.27 < 0.3 and was cut
+    # mid-argument). Default answer_repetition_dsml_min=0: never fire there.
+    lb = _with_dsml(_make())
+    req, pending = _Req(in_think=False), {}
+    _feed(lb, req, pending, [10 + i for i in range(50)] + DSML)
+    assert lb._state["r"]["dsml_seen"] is True
+    _feed(lb, req, pending, list(range(300, 600)) * 6)  # exact cycle, novelty ~0
+    assert lb.take_answer_repetition("r") is None
+    assert lb.num_answer_repetition == 0 and pending == {}
+
+
+def test_answer_detector_tool_call_threshold_is_opt_in():
+    lb = _with_dsml(_make(ans_dsml_min=0.1))
+    req, pending = _Req(in_think=False), {}
+    _feed(lb, req, pending, [10 + i for i in range(50)] + DSML)
+    _feed(lb, req, pending, list(range(300, 600)) * 6)
+    reason = lb.take_answer_repetition("r")
+    assert reason is not None and reason.endswith(",section=dsml)")
+    assert lb.num_answer_repetition == 1
+
+
+def test_answer_prose_before_tool_call_still_guarded():
+    """Non-regression guard (passes on the pre-fix code too): a prose
+    runaway before any tool call is still finished."""
+    lb = _with_dsml(_make())
+    req, pending = _Req(in_think=False), {}
+    _feed(lb, req, pending, list(range(300, 600)) * 6)  # prose runaway, no marker
+    reason = lb.take_answer_repetition("r")
+    assert reason is not None and reason.endswith(")") and "section=" not in reason
+
+
+def test_from_config_tokenizes_dsml_marker_for_detectors_without_temp0(monkeypatch):
+    # The marker used to be tokenized only under DSPARK_TOOL_TEMP0=1, which
+    # left the "never inside a tool-call block" rules inert at the vendor
+    # operating point (TEMP0 unset).
+    cfg = SimpleNamespace(
+        reasoning_config=SimpleNamespace(
+            enabled=True,
+            loop_break_max_pattern_size=0,
+            loop_break_min_count=0,
+            loop_break_min_pattern_size=0,
+            reasoning_start_token_ids=[THINK_START],
+            reasoning_end_token_ids=[THINK_END],
+            answer_repetition_novelty_window=256,
+        ),
+        model_config=None,
+    )
+    monkeypatch.delenv("DSPARK_TOOL_TEMP0", raising=False)
+    monkeypatch.delenv("DSPARK_TOOL_TEMP0_SCOPE", raising=False)
+    seen = {}
+
+    def fake(vllm_config, scope, section_temp_on=True):
+        seen["section_temp_on"] = section_temp_on
+        return [list(DSML)]
+
+    monkeypatch.setattr(DsparkLoopBreak, "_dsml_token_ids", staticmethod(fake))
+    lb = DsparkLoopBreak.from_config(cfg)
+    assert lb is not None and lb.dsml_ids == DSML and lb.answer_dsml_min == 0.0
+    assert seen == {"section_temp_on": False}
+
+
+def test_answer_window_is_not_polluted_by_an_in_think_tool_call():
+    # Tool call opened inside <think> (no </think> yet), repetitive payload,
+    # then </think> and NOVEL prose: the stale payload window must not finish
+    # the request 16 tokens into the answer (review finding, 2026-09-02).
+    lb = _with_dsml(_make())
+    req, pending = _Req(in_think=True), {}
+    payload = list(range(300, 600)) * 6
+    _feed(lb, req, pending, [10 + i for i in range(100)] + DSML + payload)
+    st = lb._state["r"]
+    assert st["in_think"] is True and st["dsml_seen"] is True
+    assert st["ans_nov"] is None  # nothing fed while the block is inside think
+    _feed(lb, req, pending, [THINK_END] + [5000 + i for i in range(600)])
+    assert lb.take_answer_repetition("r") is None and lb.num_answer_repetition == 0
+    assert pending == {} and lb.num_fired == 0  # no forced reasoning end either
+
+
+def test_answer_window_resets_after_a_tool_call_and_interleaved_thinking():
+    lb = _with_dsml(_make())
+    req, pending = _Req(in_think=False), {}
+    payload = list(range(300, 600)) * 6
+    _feed(lb, req, pending, [10 + i for i in range(50)] + DSML + payload)
+    _feed(
+        lb, req, pending, [THINK_START] + [7000 + i for i in range(100)] + [THINK_END]
+    )
+    _feed(lb, req, pending, [5000 + i for i in range(600)])
+    assert lb.take_answer_repetition("r") is None and lb.num_answer_repetition == 0
+    # a prose runaway in the new answer section is still caught
+    _feed(lb, req, pending, payload)
+    assert lb.take_answer_repetition("r") is not None
+
+
+def test_dsml_block_is_counted_once_per_section():
+    lb = _with_dsml(_make())
+    req, pending = _Req(in_think=False), {}
+    _feed(lb, req, pending, [10 + i for i in range(20)] + DSML + [11, 12, 13] + DSML)
+    assert lb.num_dsml_blocks == 1
+    assert lb.drain_events().get("dsml_block") == 1
+    _feed(lb, req, pending, [THINK_START, 5, 6, THINK_END] + DSML)
+    assert lb.num_dsml_blocks == 2 and lb.drain_events() == {"dsml_block": 1}
+
+
+def test_dsml_markers_are_anchored_on_the_special_token(monkeypatch):
+    # "<" (id 30) merges with a preceding " " / "." / ")" on DeepSeek-V4, so
+    # the markers must start at the ｜DSML｜ special token.
+    import vllm.tokenizers as tk
+
+    table = {
+        "<｜DSML｜tool_calls>": [30, 5, 6, 7, 8, 9],
+        "<｜DSML｜invoke": [30, 5, 10, 11],
+        "<": [30],
+    }
+
+    class _Tok:
+        def encode(self, s, add_special_tokens=False):
+            return list(table[s])
+
+    monkeypatch.setattr(tk, "cached_tokenizer_from_config", lambda model_config: _Tok())
+    cfg = SimpleNamespace(model_config=object())
+    assert DsparkLoopBreak._dsml_token_ids(cfg, "dsml", False) == [
+        [5, 6, 7, 8, 9],
+        [5, 10, 11],
+    ]
 
 
 def test_no_forced_end_while_dsml_block_is_written_inside_think():
