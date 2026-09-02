@@ -71,9 +71,17 @@ def vision_index_width(hf_config) -> int:
 
     128 + 384 = 512 for DeepSeek-V4-Flash-Vision-Exp (reference:
     ``width = min(seqlen, window_size + max_image_tokens)``).
+    FlashInfer SM120 decode only dispatches on DECODE_WIDTHS, so round
+    up to the next supported column (640 -> 1024 when max_n_token=512).
     """
-    return int(getattr(hf_config, "sliding_window", 0) or 0) + int(
+    raw = int(getattr(hf_config, "sliding_window", 0) or 0) + int(
         getattr(hf_config, "vision_max_n_token", 0) or 0
+    )
+    for w in DECODE_WIDTHS:
+        if w >= raw:
+            return w
+    raise ValueError(
+        f"vision index width {raw} exceeds FlashInfer DECODE_WIDTHS {DECODE_WIDTHS}"
     )
 
 
