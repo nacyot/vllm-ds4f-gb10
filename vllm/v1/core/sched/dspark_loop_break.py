@@ -170,6 +170,9 @@ class DsparkLoopBreak:
         self.num_fired_novelty = 0
         self.num_answer_repetition = 0
         self._pending_finish: dict[str, str] = {}
+        # DSPARK: per-step event counts drained by Scheduler.make_stats into
+        # SchedulerStats.dspark_events (Prometheus counters on the frontend).
+        self._events: dict[str, int] = {}
         self.start_ids = list(start_ids)
         self.end_ids = list(end_ids)
         self.natural_end_ids = list(natural_end_ids)
@@ -554,6 +557,7 @@ class DsparkLoopBreak:
             and ended_len + 8 >= budget
         ):
             self.num_budget_hits += 1
+            self._event("thinking_budget_hit")
             logger.info(
                 "DSPARK thinking budget reached: request %s ended its reasoning "
                 "section at ~%d tokens (budget %d); the end sequence was forced "
@@ -568,6 +572,7 @@ class DsparkLoopBreak:
             if budget is not None and budget > 0 and st["think_len"] >= budget:
                 st["budget_logged"] = True
                 self.num_budget_hits += 1
+                self._event("thinking_budget_hit")
                 logger.info(
                     "DSPARK thinking budget reached: request %s used %d reasoning "
                     "tokens (budget %d); the end sequence is being forced "
@@ -599,6 +604,7 @@ class DsparkLoopBreak:
             return False
         st["fired"] = True
         self.num_fired += 1
+        self._event("loop_break_exact")
         pending[rid] = think_len
         logger.info(
             "DSPARK loop breaker: request %s repeating after %d reasoning "
@@ -641,6 +647,7 @@ class DsparkLoopBreak:
         st["fired"] = True
         self.num_fired += 1
         self.num_fired_novelty += 1
+        self._event("loop_break_novelty")
         pending[rid] = think_len
         logger.info(
             "DSPARK loop breaker: request %s near-repeating after %d reasoning "
@@ -678,6 +685,7 @@ class DsparkLoopBreak:
         if st["ans_below"] < self.novelty_consecutive:
             return False
         self.num_answer_repetition += 1
+        self._event("answer_repetition")
         self._pending_finish[rid] = (
             f"dspark_answer_repetition(novelty={value:.2f},tokens={ans.count})"
         )
@@ -693,6 +701,16 @@ class DsparkLoopBreak:
             self.num_answer_repetition,
         )
         return True
+
+    def _event(self, key: str) -> None:
+        self._events[key] = self._events.get(key, 0) + 1
+
+    def drain_events(self) -> dict[str, int]:
+        """Return and reset the per-step event counts (metrics)."""
+        if not self._events:
+            return {}
+        ev, self._events = self._events, {}
+        return ev
 
     def take_answer_repetition(self, request_id: str) -> str | None:
         """Pop the answer-repetition verdict for ``request_id`` (stop_reason)."""
@@ -751,6 +769,7 @@ class DsparkLoopBreak:
         if not st["temp_logged"]:
             st["temp_logged"] = True
             self.num_answer_temp_switches += 1
+            self._event("section_temp_switch")
             # The DSML marker leaves think_len live; a closed section parked
             # its length in end_think_len before resetting.
             think_len = st["think_len"] if st["in_think"] else st["end_think_len"]

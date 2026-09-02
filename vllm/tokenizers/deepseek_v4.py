@@ -35,6 +35,16 @@ def dspark_cap_tool_effort(
     if cap not in _DSPARK_EFFORT_RANK:
         return effort
     if _DSPARK_EFFORT_RANK.get(effort, 0) > _DSPARK_EFFORT_RANK[cap]:
+        try:
+            from vllm.v1.metrics.dspark import frontend_counter
+
+            frontend_counter(
+                "vllm:dspark_tool_effort_cap",
+                "Tool-turn requests whose reasoning_effort preamble was capped.",
+                ["from_effort", "to_effort"],
+            ).labels(effort, cap).inc()
+        except Exception:  # noqa: BLE001 - metrics never block rendering
+            pass
         logger.info_once(
             "DSPARK_TOOL_EFFORT_CAP=%s: reasoning_effort %s on a tool turn is "
             "rendered as %s (preamble capped).",

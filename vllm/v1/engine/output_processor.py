@@ -853,6 +853,16 @@ class OutputProcessor:
                         finish_reason = FinishReason.STOP
                         stop_reason = "dspark_dsml_leak_guard"
                         self._dspark_leak_guard_hits += 1
+                        try:
+                            from vllm.v1.metrics.dspark import frontend_counter
+
+                            frontend_counter(
+                                "vllm:dspark_dsml_leak_guard_stops",
+                                "Requests stopped by the DSML leak guard, by trigger.",
+                                ["trigger"],
+                            ).labels(_leak).inc()
+                        except Exception:  # noqa: BLE001 - metrics never block
+                            pass
                         logger.info(
                             "DSPARK DSML leak guard stopped request %s (%s) after "
                             "%d output tokens (hits %d total).",

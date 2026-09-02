@@ -483,6 +483,10 @@ class PrometheusStatLogger(AggregateStatLoggerBase):
         self.kv_connector_prom = self._kv_connector_cls(
             vllm_config, labelnames, per_engine_labelvalues
         )
+        # DSPARK: scheduler-side detector event counters.
+        from vllm.v1.metrics.dspark import DsparkEventsProm
+
+        self.dspark_events_prom = DsparkEventsProm(labelnames, per_engine_labelvalues)
         self.perf_metrics_prom = self._perf_metrics_cls(
             vllm_config, labelnames, per_engine_labelvalues
         )
@@ -1141,6 +1145,10 @@ class PrometheusStatLogger(AggregateStatLoggerBase):
                 self.spec_decoding_prom.observe(
                     scheduler_stats.spec_decoding_stats, engine_idx
                 )
+
+            dspark_events = getattr(scheduler_stats, "dspark_events", None)
+            if dspark_events:
+                self.dspark_events_prom.observe(dspark_events, engine_idx)
 
             if scheduler_stats.kv_connector_stats is not None:
                 self.kv_connector_prom.observe(
