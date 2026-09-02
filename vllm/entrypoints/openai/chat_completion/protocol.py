@@ -670,6 +670,24 @@ class ChatCompletionRequest(OpenAIBaseModel):
             self.response_format,
         )
 
+    def _dspark_thinking_enabled(self) -> bool:
+        """DSPARK: best-effort read of this request's thinking switch, for
+        DSPARK_TOOL_TEMP0_SCOPE=answer.
+
+        Only what the request itself says is visible here; the server's own
+        default chat_template_kwargs are applied later, when the prompt is
+        rendered. An unstated switch therefore means "assume thinking is on"
+        and let the scheduler tracker decide: a prompt that does not end
+        inside a reasoning section is already in the answer, and the tracker
+        emits the answer temperature on the request's first step."""
+        kwargs = self.chat_template_kwargs or {}
+        for key in ("thinking", "enable_thinking"):
+            if key in kwargs:
+                return bool(kwargs[key])
+        if self.reasoning_effort is not None:
+            return self.reasoning_effort != "none"
+        return True
+
     def to_sampling_params(
         self,
         max_tokens: int,
@@ -723,9 +741,54 @@ class ChatCompletionRequest(OpenAIBaseModel):
             extra_args["ec_transfer_params"] = self.ec_transfer_params
         # DSPARK: force temp 0 on tool turns so DSML structure tokens do not
         # break at temp>0 (env DSPARK_TOOL_TEMP0=1; default off).
-
+        #
+        # DSPARK_TOOL_TEMP0_SCOPE picks how far that zero reaches. The only
+        # thing temperature 0 buys is DSML structure-token robustness inside
+        # the tool-call block; everywhere else it costs, because greedy
+        # decoding loops. Measured on a 60k-token agent turn with the whole
+        # request at 0: the reasoning ended after ~3k tokens and the *answer
+        # prose* then ran to max_tokens with 8-gram duplication 0.70, the same
+        # lines repeated 47-108 times, finish_reason=length.
+        #   "dsml"    (default) reasoning and answer prose keep the request's
+        #             own temperature; the switch to 0 fires only when the
+        #             <｜DSML｜tool_calls> marker appears, wherever it appears.
+        #   "answer"  temperature 0 from the end of the reasoning section
+        #             onward (answer prose included).
+        #   "request" pre-2026-09 behaviour, temperature 0 for the whole
+        #             request. This is the full rollback.
+        # The split itself is carried out by the scheduler-side tracker in
+        # vllm/v1/core/sched/dspark_loop_break.py, which reads these extra_args
+        # keys; anything unrecognised falls back to "request".
+        # DSPARK: DeepSeek's recommended agentic operating point is
+        # temperature 1.0 / top_p 0.95 (V4-Flash model cards); DSPARK_TOOL_TOP_P
+        # applies that top_p as the default for tool-carrying requests that
+        # did not send one (unset = leave top_p alone).
+        if getattr(self, "tools", None) and self.top_p is None:
+            try:
+                tool_top_p = float(os.environ.get("DSPARK_TOOL_TOP_P", "") or "nan")
+            except ValueError:
+                tool_top_p = float("nan")
+            if tool_top_p == tool_top_p and 0.0 < tool_top_p <= 1.0:
+                top_p = tool_top_p
         if os.environ.get("DSPARK_TOOL_TEMP0") == "1" and getattr(self, "tools", None):
-            temperature = 0.0
+            scope = (
+                (os.environ.get("DSPARK_TOOL_TEMP0_SCOPE") or "dsml").strip().lower()
+            )
+            # Scope "answer" is anchored on the reasoning section, so it needs
+            # thinking to be on; scope "dsml" triggers on the marker alone and
+            # does not care.
+            split = scope == "dsml" or (
+                scope == "answer" and self._dspark_thinking_enabled()
+            )
+            if split:
+                # Keep the resolved temperature (client value, else the model
+                # default); the tracker switches the request to 0.0 when this
+                # scope's trigger fires.
+                extra_args["dspark_answer_temperature"] = 0.0
+                extra_args["dspark_reasoning_temperature"] = float(temperature)
+                extra_args["dspark_temp0_scope"] = scope
+            else:
+                temperature = 0.0
         return SamplingParams.from_optional(
             n=self.n,
             presence_penalty=self.presence_penalty,

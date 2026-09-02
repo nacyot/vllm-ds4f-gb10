@@ -1,15 +1,49 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 import copy
+import os
 from typing import Any
 
 from transformers import TokenizersBackend
 
 from vllm.entrypoints.chat_utils import ChatCompletionMessageParam
+from vllm.logger import init_logger
 
 from .deepseek_v4_encoding import encode_messages
 from .hf import HfTokenizer, get_cached_tokenizer
 from .protocol import TokenizerLike
+
+logger = init_logger(__name__)
+
+# DSPARK: DSPARK_TOOL_EFFORT_CAP=low|high caps the reasoning-effort preamble on
+# requests that carry tools. Rationale (2026-09-02): the official "high" text
+# ("write out your entire deliberation process") makes long agent contexts
+# reason for 20k-33k tokens per turn, and MiaAI-Lab issue #37 saw high+tools
+# fail 3/3 (leaked DSML, no tool_calls) until the preamble was dropped on tool
+# turns. Default unset = official behaviour (no cap).
+_DSPARK_EFFORT_RANK = {"low": 0, "high": 1, "max": 2}
+
+
+def dspark_cap_tool_effort(
+    effort: str | None, has_tools: bool, thinking: bool
+) -> str | None:
+    """Return ``effort`` clamped to DSPARK_TOOL_EFFORT_CAP when the request
+    carries tools and thinking is on; unchanged otherwise."""
+    if effort is None or not has_tools or not thinking:
+        return effort
+    cap = (os.environ.get("DSPARK_TOOL_EFFORT_CAP") or "").strip().lower()
+    if cap not in _DSPARK_EFFORT_RANK:
+        return effort
+    if _DSPARK_EFFORT_RANK.get(effort, 0) > _DSPARK_EFFORT_RANK[cap]:
+        logger.info_once(
+            "DSPARK_TOOL_EFFORT_CAP=%s: reasoning_effort %s on a tool turn is "
+            "rendered as %s (preamble capped).",
+            cap,
+            effort,
+            cap,
+        )
+        return cap
+    return effort
 
 
 def get_deepseek_v4_tokenizer(tokenizer: HfTokenizer) -> HfTokenizer:
@@ -52,6 +86,10 @@ def get_deepseek_v4_tokenizer(tokenizer: HfTokenizer) -> HfTokenizer:
                 reasoning_effort = "low"
             else:
                 reasoning_effort = "high"
+            # DSPARK: cap the effort preamble on tool-bearing turns.
+            reasoning_effort = dspark_cap_tool_effort(
+                reasoning_effort, bool(tools), thinking_mode == "thinking"
+            )
 
             encode_config = dict(
                 thinking_mode=thinking_mode,

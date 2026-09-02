@@ -217,6 +217,9 @@ class Scheduler(SchedulerInterface):
 
         self._dspark_loop_break = DsparkLoopBreak.from_config(vllm_config)
         self._dspark_pending_force_end: dict[str, int] = {}
+        # DSPARK tool-turn section temperature (DSPARK_TOOL_TEMP0_SCOPE):
+        # {request id: temperature} for the next SchedulerOutput.
+        self._dspark_pending_section_temp: dict[str, float] = {}
 
         # The request IDs that are finished in between the previous and the
         # current steps. This is used to notify the workers about the finished
@@ -1388,9 +1391,12 @@ class Scheduler(SchedulerInterface):
             num_spec_tokens_to_schedule=num_spec_tokens_to_schedule,
             ec_manager_metadata=self.encoder_cache_manager.get_manager_metadata(),
             dspark_force_reasoning_end=(self._dspark_pending_force_end or None),
+            dspark_section_temperature=(self._dspark_pending_section_temp or None),
         )
         if self._dspark_pending_force_end:
             self._dspark_pending_force_end = {}
+        if self._dspark_pending_section_temp:
+            self._dspark_pending_section_temp = {}
 
         # NOTE(Kuntai): this function is designed for multiple purposes:
         # 1. Plan the KV cache store
@@ -2311,7 +2317,19 @@ class Scheduler(SchedulerInterface):
         pending_force_end = getattr(self, "_dspark_pending_force_end", None)
         if new_token_ids and not stopped and loop_break is not None:
             assert pending_force_end is not None
-            loop_break.observe(request, pending_force_end)
+            # DSPARK: the same pass records the tool turn's section temperature.
+            loop_break.observe(
+                request,
+                pending_force_end,
+                getattr(self, "_dspark_pending_section_temp", None),
+            )
+            # DSPARK: answer-section near-repetition finishes the request
+            # (finish_reason=repetition, stop_reason names the detector).
+            reason = loop_break.take_answer_repetition(request.request_id)
+            if reason is not None:
+                request.status = RequestStatus.FINISHED_REPETITION
+                request.stop_reason = reason
+                stopped = True
         return new_token_ids, stopped
 
     def _free_encoder_inputs(self, request: Request) -> None:

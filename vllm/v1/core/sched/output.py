@@ -274,6 +274,16 @@ class SchedulerOutput:
     # end sequence for them (thinking budget := that length).
     dspark_force_reasoning_end: dict[str, int] | None = None
 
+    # DSPARK tool-turn section temperature (DSPARK_TOOL_TEMP0_SCOPE):
+    # {request id: temperature} for requests whose scope's trigger has fired --
+    # the DSML tool-call marker under the default scope "dsml", the end of the
+    # reasoning section under "answer". The worker writes it into the sampler's
+    # per-request temperature so the tool-call structure tokens are
+    # deterministic while everything before them kept the request's own
+    # temperature. Re-sent every step so a preemption + resume (which restores
+    # sampling_params.temperature) heals on the next step.
+    dspark_section_temperature: dict[str, float] | None = None
+
     @classmethod
     def make_empty(cls) -> "SchedulerOutput":
         return cls(

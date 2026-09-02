@@ -921,6 +921,42 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         if hit:
             self.sampler.apply_staged_writes()
 
+    def _dspark_apply_section_temperature(
+        self, scheduler_output: SchedulerOutput
+    ) -> None:
+        """DSPARK tool-turn section temperature (DSPARK_TOOL_TEMP0_SCOPE):
+        the scheduler says these requests have hit their scope's trigger -- the
+        DSML tool-call marker under the default scope "dsml", the end of the
+        reasoning section under "answer" -- so the rest of the turn is sampled
+        at the temperature it names (0 today), while everything before it kept
+        the request's own temperature.
+
+        The write lands in the sampler's host-side temperature array; the
+        ``apply_staged_writes()`` below re-binds the UVA view for this step, so
+        both the verifier and the drafter (which is handed
+        ``sampling_states.temperature.gpu`` later in the same step) see it
+        immediately. The scheduler re-sends the entry every step, which heals
+        a preemption + resume (``add_request`` restores
+        ``sampling_params.temperature``) on the following step."""
+        updates = getattr(scheduler_output, "dspark_section_temperature", None)
+        if not updates or self.sampler is None:
+            return
+        temperature = self.sampler.sampling_states.temperature
+        hit = 0
+        for req_id, value in updates.items():
+            req_idx = self.req_states.req_id_to_index.get(req_id)
+            if req_idx is None:
+                continue
+            # Compare after the store so the check happens in the array's own
+            # dtype: the scheduler re-sends every step and an unchanged value
+            # must not cost a UVA rebind.
+            previous = temperature.np[req_idx]
+            temperature.np[req_idx] = float(value)
+            if temperature.np[req_idx] != previous:
+                hit += 1
+        if hit:
+            self.sampler.apply_staged_writes()
+
     def update_requests(self, scheduler_output: SchedulerOutput) -> None:
         # Add new blocks and update num_computed_tokens for the existing requests.
         reqs = scheduler_output.scheduled_cached_reqs
@@ -1250,6 +1286,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             self.add_requests(scheduler_output)
             self.update_requests(scheduler_output)
             self._dspark_apply_force_reasoning_end(scheduler_output)
+            self._dspark_apply_section_temperature(scheduler_output)
             self.block_tables.apply_staged_writes()
             if scheduler_output.total_num_scheduled_tokens == 0:
                 # No need to run the model.

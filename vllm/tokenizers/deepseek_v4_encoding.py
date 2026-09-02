@@ -13,6 +13,7 @@ calling, thinking mode, and quick instruction task support.
 from typing import Any, Dict, List, Union, Optional
 import copy
 import json
+import os
 
 # ============================================================
 # Special Tokens
@@ -65,19 +66,36 @@ tool_output_template: str = (
     "<tool_result>{content}</tool_result>"
 )
 
-REASONING_EFFORT_PROMPTS: Dict[str, str] = {
-    "low": "",
-    "high": (
-        "Reasoning Effort: Absolute maximum with no shortcuts permitted.\n"
-        "You MUST be very thorough in your thinking and comprehensively decompose the problem to resolve the root cause, rigorously stress-testing your logic against all potential paths, edge cases, and adversarial scenarios.\n"
-        "Explicitly write out your entire deliberation process, documenting every intermediate step, considered alternative, and rejected hypothesis to ensure absolutely no assumption is left unchecked.\n\n"
-    ),
-    "max": (
-        "Reasoning Effort: Beyond maximum — exhaustive, relentless, and uncompromising.\n"
-        "You MUST reason with the utmost depth and rigor, leaving absolutely nothing to chance: exhaustively decompose the problem into its most fundamental components, trace every causal chain to its root, and resolve the underlying cause rather than any surface symptom.\n"
-        "Do not stop reasoning until you have independently verified the solution from multiple angles and are certain that no assumption remains unchecked and no error remains undiscovered.\n\n"
-    ),
+# Reasoning effort levels (DeepSeek's official encoding, shipped with the
+# checkpoints as encoding/encoding_dsv4.py and mirrored by upstream vLLM):
+# in thinking mode the prompt for the selected level is prepended at the very
+# beginning of the conversation; "low" is the encoder default and adds nothing.
+REASONING_EFFORT_HIGH_TEXT = (
+    "Reasoning Effort: Absolute maximum with no shortcuts permitted.\n"
+    "You MUST be very thorough in your thinking and comprehensively decompose the problem to resolve the root cause, rigorously stress-testing your logic against all potential paths, edge cases, and adversarial scenarios.\n"
+    "Explicitly write out your entire deliberation process, documenting every intermediate step, considered alternative, and rejected hypothesis to ensure absolutely no assumption is left unchecked.\n\n"
+)
+REASONING_EFFORT_MAX_TEXT = (
+    "Reasoning Effort: Beyond maximum — exhaustive, relentless, and uncompromising.\n"
+    "You MUST reason with the utmost depth and rigor, leaving absolutely nothing to chance: exhaustively decompose the problem into its most fundamental components, trace every causal chain to its root, and resolve the underlying cause rather than any surface symptom.\n"
+    "Do not stop reasoning until you have independently verified the solution from multiple angles and are certain that no assumption remains unchecked and no error remains undiscovered.\n\n"
+)
+
+# DSPARK: selectable tables. "official" (default) is the table shipped with
+# the 0731 / Pro-0813 / Vision-Exp checkpoints. "preview" is the June preview
+# lineage (DeepSeek-V4-Flash preview, upstream vLLM before PR #50580): a
+# preamble only for "max", using what is now the "high" text. A/B use only.
+# Note (2026-09-02): the "high" preamble asks for the entire deliberation to
+# be written out; on long agent contexts that is 20k-33k reasoning tokens per
+# turn. DSPARK_TOOL_EFFORT_CAP (see deepseek_v4.py) caps it on tool turns.
+_REASONING_EFFORT_TABLES: Dict[str, Dict[str, str]] = {
+    "official": {"low": "", "high": REASONING_EFFORT_HIGH_TEXT, "max": REASONING_EFFORT_MAX_TEXT},
+    "preview": {"low": "", "high": "", "max": REASONING_EFFORT_HIGH_TEXT},
 }
+REASONING_EFFORT_TIERS = os.environ.get("DSPARK_EFFORT_TIERS", "official").strip() or "official"
+if REASONING_EFFORT_TIERS not in _REASONING_EFFORT_TABLES:
+    REASONING_EFFORT_TIERS = "official"
+REASONING_EFFORT_PROMPTS: Dict[str, str] = _REASONING_EFFORT_TABLES[REASONING_EFFORT_TIERS]
 DEFAULT_REASONING_EFFORT = "low"
 
 TOOLS_TEMPLATE = """## Tools

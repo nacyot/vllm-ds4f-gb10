@@ -11,6 +11,7 @@ from typing import Any, cast
 import numpy as np
 import torch
 
+from vllm.logger import init_logger
 from vllm.lora.request import LoRARequest
 from vllm.outputs import (
     STREAM_FINISHED,
@@ -39,12 +40,77 @@ from vllm.v1.metrics.stats import (
     SchedulerStats,
 )
 
+logger = init_logger(__name__)
+
 # [dspark-dsml-leak-guard-0271] DSML 누출 가드 (기본 꺼짐).
 _DSPARK_DSML_LEAK_GUARD = os.environ.get("DSPARK_DSML_LEAK_GUARD", "").strip() == "1"
 # 파서 미복구 대체 방언 토큰: <dsml: (128840), </dsml: (128841). 출현 = 누출.
 _DSPARK_DSML_DIALECT_TOKEN_IDS = frozenset({128840, 128841})
 # 마커(｜DSML｜) 탈락 닫기 태그(유효 close 는 </｜DSML｜...> 라 부분열 불일치 → 오탐 0).
 _DSPARK_DSML_BARE_CLOSERS = ("</invoke>", "</parameter>", "</result>")
+# DSPARK: the guard is scoped to the answer section by default. Inside a
+# reasoning (<think>) section the model legitimately quotes DSML syntax (e.g.
+# an agent reading this very code), and a stop there silently discards the
+# whole turn (observed 2026-09-02). DSPARK_DSML_LEAK_GUARD_SCOPE=request
+# restores the old whole-request behaviour.
+_DSPARK_DSML_LEAK_GUARD_SCOPE = (
+    os.environ.get("DSPARK_DSML_LEAK_GUARD_SCOPE", "answer").strip() or "answer"
+)
+_DSPARK_THINK_START = "<think>"
+_DSPARK_THINK_END = "</think>"
+# DSPARK: at long context the model may open a tool call without </think>
+# (vLLM #48931); the reasoning parser treats the opener as an implicit end
+# and so does the guard, otherwise it would stay disarmed for the whole turn.
+_DSPARK_DSML_TOOL_START = "<｜DSML｜tool_calls>"
+_DSPARK_DSML_DIALECT_STRS = ("<dsml:", "</dsml:")
+
+
+def _dspark_dialect_token_ids(tokenizer) -> frozenset[int]:
+    """Resolve the DSML dialect tokens with the live tokenizer; fall back to
+    the DeepSeek-V4 ids when it cannot be asked."""
+    if tokenizer is None:
+        return _DSPARK_DSML_DIALECT_TOKEN_IDS
+    ids: set[int] = set()
+    for text in _DSPARK_DSML_DIALECT_STRS:
+        try:
+            enc = tokenizer.encode(text, add_special_tokens=False)
+        except Exception:  # noqa: BLE001
+            return _DSPARK_DSML_DIALECT_TOKEN_IDS
+        if len(enc) == 1:
+            ids.add(int(enc[0]))
+    return frozenset(ids) if ids else _DSPARK_DSML_DIALECT_TOKEN_IDS
+
+
+def _dspark_think_token_ids(
+    tokenizer,
+) -> tuple[list[int], list[int], list[int]]:
+    """Token ids of the DeepSeek think markers and of the DSML tool-call
+    opener ([] if unknown)."""
+    if tokenizer is None:
+        return [], [], []
+    try:
+        start = tokenizer.encode(_DSPARK_THINK_START, add_special_tokens=False)
+        end = tokenizer.encode(_DSPARK_THINK_END, add_special_tokens=False)
+    except Exception:  # noqa: BLE001 - best effort, guard falls back to text
+        return [], [], []
+    if not (1 <= len(start) <= 3 and 1 <= len(end) <= 3):
+        return [], [], []
+    try:
+        dsml = list(tokenizer.encode(_DSPARK_DSML_TOOL_START, add_special_tokens=False))
+    except Exception:  # noqa: BLE001
+        dsml = []
+    return list(start), list(end), dsml
+
+
+def _dspark_last_index(target: list[int], seq: list[int]) -> int:
+    if not seq:
+        return -1
+    n = len(seq)
+    for i in range(len(target) - n, -1, -1):
+        if target[i : i + n] == seq:
+            return i
+    return -1
+
 
 # shared empty CPU tensor used as a placeholder pooling output
 EMPTY_CPU_TENSOR = torch.empty(0, device="cpu")
@@ -173,6 +239,10 @@ class RequestState:
         )
         self.logprobs_processor = logprobs_processor
         self.detokenizer = detokenizer
+        # DSPARK: True while the output is still inside a <think> section
+        # (leak guard scope); maintained by OutputProcessor.process_outputs.
+        self.dspark_in_reasoning = False
+        self.dspark_answer_text_start = 0
         self.max_tokens_param = max_tokens_param
         self.top_p = top_p
         self.n = n
@@ -448,6 +518,22 @@ class OutputProcessor:
         self.log_stats = log_stats
         self.tokenizer = tokenizer
         self.stream_interval = stream_interval
+        # DSPARK: think marker ids for the DSML leak guard scope.
+        (
+            self._dspark_think_start_ids,
+            self._dspark_think_end_ids,
+            self._dspark_dsml_start_ids,
+        ) = (
+            _dspark_think_token_ids(tokenizer)
+            if _DSPARK_DSML_LEAK_GUARD
+            else ([], [], [])
+        )
+        self._dspark_dialect_ids = (
+            _dspark_dialect_token_ids(tokenizer)
+            if _DSPARK_DSML_LEAK_GUARD
+            else _DSPARK_DSML_DIALECT_TOKEN_IDS
+        )
+        self._dspark_leak_guard_hits = 0
         self.request_states: dict[str, RequestState] = {}
         self.parent_requests: dict[str, ParentRequest] = {}
         self.external_req_ids: defaultdict[str, list[str]] = defaultdict(list)
@@ -530,6 +616,92 @@ class OutputProcessor:
                 self.parent_requests.pop(request_id, None)
         return request_ids_to_abort
 
+    def _dspark_leak_guard_check(
+        self, req_state: RequestState, new_token_ids: list[int]
+    ) -> str | None:
+        """DSML leak guard (env DSPARK_DSML_LEAK_GUARD=1). Returns a short
+        reason when the request must be stopped, else None.
+
+        Scope (DSPARK_DSML_LEAK_GUARD_SCOPE, default "answer"): while the
+        output is still inside a <think> section nothing is checked; the
+        section is left when a </think> marker shows up (token ids, or text
+        as a fallback when the ids are unknown) and only text produced after
+        the marker is inspected from then on."""
+        det = req_state.detokenizer
+        assert det is not None
+        ids_to_check: list[int] = list(new_token_ids)
+        if req_state.dspark_in_reasoning:
+            end_ids = self._dspark_think_end_ids
+            dsml_ids = self._dspark_dsml_start_ids
+            left = False
+            n_new = len(new_token_ids)
+            if end_ids:
+                # </think>: the answer starts after the marker
+                window = list(det.output_token_ids[-(n_new + len(end_ids)) :])
+                pos = _dspark_last_index(window, end_ids)
+                if pos >= 0:
+                    left = True
+                    after = pos + len(end_ids) - (len(window) - n_new)
+                    ids_to_check = list(new_token_ids[max(0, after) :])
+                    cut = det.output_text.rfind(_DSPARK_THINK_END)
+                    req_state.dspark_answer_text_start = (
+                        cut + len(_DSPARK_THINK_END)
+                        if cut >= 0
+                        else len(det.output_text)
+                    )
+            if not left and dsml_ids:
+                # tool-call opener without </think> (implicit end): the block
+                # itself is inspected, so the answer starts AT the marker
+                window = list(det.output_token_ids[-(n_new + len(dsml_ids)) :])
+                pos = _dspark_last_index(window, dsml_ids)
+                if pos >= 0:
+                    left = True
+                    after = pos - (len(window) - n_new)
+                    ids_to_check = list(new_token_ids[max(0, after) :])
+                    cut = det.output_text.rfind(_DSPARK_DSML_TOOL_START)
+                    req_state.dspark_answer_text_start = (
+                        cut if cut >= 0 else len(det.output_text)
+                    )
+            if not left and not end_ids:
+                tail = det.output_text[-64:]
+                if _DSPARK_THINK_END in tail:
+                    left = True
+                    ids_to_check = []
+                    cut = det.output_text.rfind(_DSPARK_THINK_END)
+                    req_state.dspark_answer_text_start = cut + len(_DSPARK_THINK_END)
+                elif _DSPARK_DSML_TOOL_START in tail:
+                    left = True
+                    cut = det.output_text.rfind(_DSPARK_DSML_TOOL_START)
+                    req_state.dspark_answer_text_start = cut
+            if not left:
+                return None
+            req_state.dspark_in_reasoning = False
+        if any(t in self._dspark_dialect_ids for t in ids_to_check):
+            return "dsml_dialect_token"
+        text = det.output_text
+        start = max(getattr(req_state, "dspark_answer_text_start", 0), len(text) - 64)
+        tail = text[start:]
+        for closer in _DSPARK_DSML_BARE_CLOSERS:
+            if closer in tail:
+                return f"bare_closer:{closer}"
+        return None
+
+    def _dspark_prompt_in_think(
+        self, prompt_token_ids: list[int] | None, prompt: str | None
+    ) -> bool:
+        """DeepSeek V4 chat templates open <think> at the end of the prompt
+        when thinking is on: the output then starts inside a reasoning
+        section. Token ids first, text as a fallback."""
+        if prompt_token_ids and self._dspark_think_start_ids:
+            tail = list(prompt_token_ids[-64:])
+            ls = _dspark_last_index(tail, self._dspark_think_start_ids)
+            le = _dspark_last_index(tail, self._dspark_think_end_ids)
+            return ls > le
+        if prompt:
+            tail = prompt[-128:]
+            return tail.rfind(_DSPARK_THINK_START) > tail.rfind(_DSPARK_THINK_END)
+        return False
+
     def add_request(
         self,
         request: EngineCoreRequest,
@@ -555,6 +727,10 @@ class OutputProcessor:
             stream_interval=self.stream_interval,
         )
         self.request_states[request_id] = req_state
+        if _DSPARK_DSML_LEAK_GUARD and _DSPARK_DSML_LEAK_GUARD_SCOPE != "request":
+            req_state.dspark_in_reasoning = self._dspark_prompt_in_think(
+                request.prompt_token_ids, prompt
+            )
         if parent_req:
             self.parent_requests[parent_req.request_id] = parent_req
 
@@ -672,15 +848,19 @@ class OutputProcessor:
                 # 성립 없이 표면화되면(미복구 방언 or 마커탈락 닫기 태그) 요청을
                 # stop 처리 → 생 DSML 히스토리 오염 차단.
                 if _DSPARK_DSML_LEAK_GUARD and finish_reason is None:
-                    _leak = any(
-                        t in _DSPARK_DSML_DIALECT_TOKEN_IDS for t in new_token_ids
-                    )
-                    if not _leak:
-                        _tail = req_state.detokenizer.output_text[-64:]
-                        _leak = any(_c in _tail for _c in _DSPARK_DSML_BARE_CLOSERS)
+                    _leak = self._dspark_leak_guard_check(req_state, new_token_ids)
                     if _leak:
                         finish_reason = FinishReason.STOP
                         stop_reason = "dspark_dsml_leak_guard"
+                        self._dspark_leak_guard_hits += 1
+                        logger.info(
+                            "DSPARK DSML leak guard stopped request %s (%s) after "
+                            "%d output tokens (hits %d total).",
+                            req_id,
+                            _leak,
+                            len(req_state.detokenizer.output_token_ids),
+                            self._dspark_leak_guard_hits,
+                        )
 
                 # 3) Compute sample and prompt logprobs for request,
                 # if required.

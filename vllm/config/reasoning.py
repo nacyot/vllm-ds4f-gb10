@@ -54,6 +54,38 @@ class ReasoningConfig:
     loop_break_check_interval: int = 16
     """Check for loops every this many newly accepted reasoning tokens."""
 
+    loop_break_novelty_window: int = 0
+    """DSPARK near-repetition detector (0 = off). Track the fraction of NEW
+    ``loop_break_novelty_ngram``-grams among the last this-many n-grams of the
+    current reasoning section; when it stays below
+    ``loop_break_novelty_min`` for ``loop_break_novelty_consecutive`` checks
+    (spaced by ``loop_break_check_interval``) the reasoning end sequence is
+    forced, exactly like an exact-cycle hit. Catches paraphrase loops and
+    cycles longer than ``loop_break_max_pattern_size``. Calibration
+    (DeepSeek-V4-Flash, 2026-09-02): healthy 15k-33k-token reasoning never
+    dropped below 0.65 at window 1024; runaway output fell to 0.0."""
+
+    loop_break_novelty_min: float = 0.4
+    """Novelty threshold for ``loop_break_novelty_window``."""
+
+    loop_break_novelty_ngram: int = 8
+    """n-gram size for ``loop_break_novelty_window``."""
+
+    loop_break_novelty_consecutive: int = 2
+    """Consecutive sub-threshold checks required before firing."""
+
+    answer_repetition_novelty_window: int = 0
+    """DSPARK answer-section runaway guard (0 = off). Same statistic over the
+    tokens generated AFTER the reasoning section (or over the whole output
+    when the request never reasons); when it stays below
+    ``answer_repetition_novelty_min`` for ``loop_break_novelty_consecutive``
+    checks the request is finished with ``finish_reason=repetition``
+    (stop_reason ``dspark_answer_repetition``). Greedy tool turns were
+    observed to loop in answer prose until max_tokens."""
+
+    answer_repetition_novelty_min: float = 0.3
+    """Novelty threshold for ``answer_repetition_novelty_window``."""
+
     _reasoning_start_token_ids: list[int] | None = field(
         default=None, init=False, repr=False
     )
@@ -107,6 +139,20 @@ class ReasoningConfig:
                     "ReasoningConfig: loop_break_min_pattern_size must be <= "
                     "loop_break_max_pattern_size"
                 )
+        if (
+            self.loop_break_novelty_window < 0
+            or self.answer_repetition_novelty_window < 0
+        ):
+            raise ValueError("ReasoningConfig: novelty windows must be >= 0")
+        for name in ("loop_break_novelty_min", "answer_repetition_novelty_min"):
+            v = getattr(self, name)
+            if not 0.0 <= v <= 1.0:
+                raise ValueError(f"ReasoningConfig: {name} must be within [0, 1]")
+        if self.loop_break_novelty_ngram < 1 or self.loop_break_novelty_consecutive < 1:
+            raise ValueError(
+                "ReasoningConfig: loop_break_novelty_ngram and "
+                "loop_break_novelty_consecutive must be >= 1"
+            )
 
     @property
     def reasoning_end_token_ids(self) -> list[int] | None:
