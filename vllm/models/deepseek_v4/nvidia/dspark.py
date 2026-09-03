@@ -713,6 +713,51 @@ class DeepSeekV4DSparkLayer(nn.Module):
         self.ffn.finalize_mega_moe_weights()
 
 
+def _dspark_accepts_checkpoint_name(name: str) -> bool:
+    # Mirror of load_weights' map_name acceptance: everything else is dropped.
+    return name.startswith("mtp.") or name in ("embed.weight", "head.weight")
+
+
+def _dspark_checkpoint_files(vllm_config: VllmConfig) -> list[str] | None:
+    """Exact shard filenames holding the tensors this draft loads.
+
+    The default loader opens every shard and materializes every tensor before
+    load_weights drops the names it does not want, so a folded draft re-reads
+    the whole target checkpoint. Read model.safetensors.index.json once and
+    hand the loader only the shards that contain accepted tensors. The tensors
+    read, and their values, are unchanged. None keeps the default behavior
+    (no local index, or DSPARK_DRAFT_PRUNE=0).
+    """
+    import json
+    import os
+
+    if os.environ.get("DSPARK_DRAFT_PRUNE", "1") != "1":
+        return None
+    spec = vllm_config.speculative_config
+    model_dir = getattr(getattr(spec, "draft_model_config", None), "model", None)
+    if not isinstance(model_dir, str) or not os.path.isdir(model_dir):
+        return None
+    index_path = os.path.join(model_dir, "model.safetensors.index.json")
+    if not os.path.isfile(index_path):
+        return None
+    try:
+        with open(index_path) as f:
+            weight_map = json.load(f)["weight_map"]
+    except (OSError, ValueError, KeyError):
+        return None
+    files = sorted(
+        {fn for name, fn in weight_map.items() if _dspark_accepts_checkpoint_name(name)}
+    )
+    if not files:
+        return None
+    logger.info(
+        "DSpark draft loader: restricting the checkpoint scan to %d of %d shards",
+        len(files),
+        len(set(weight_map.values())),
+    )
+    return files
+
+
 class DSparkDeepseekV4ForCausalLM(nn.Module):
     """DSpark draft model for fixed-block speculative decoding."""
 
@@ -731,6 +776,8 @@ class DSparkDeepseekV4ForCausalLM(nn.Module):
         assert vllm_config.speculative_config is not None
         config = vllm_config.speculative_config.draft_model_config.hf_config
         self.config = config
+        # Read by DefaultModelLoader.get_all_weights (exact filenames, unioned).
+        self.allow_patterns_overrides = _dspark_checkpoint_files(vllm_config)
         # Vision checkpoints feed image positions as out-of-vocabulary sentinel
         # ids (vocab_size + 0..4). The draft embeds ids itself (embed_tokens,
         # markov_w1), so they must be masked to 0 before every gather; the raw

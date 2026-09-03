@@ -19,6 +19,7 @@ instead of embedding feature-specific logic directly.
 
 import functools
 import gc
+import os
 import time
 from copy import deepcopy
 from typing import Any, NamedTuple
@@ -714,17 +715,40 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                     self.mm_registry,
                     enable_cache=False,
                 )
+                _trace = os.environ.get("DSPARK_BOOT_TRACE") == "1"
+                _t0 = time.perf_counter()
                 dummy_mm_inputs = get_dummy_encoder_profile_inputs(
                     self.mm_registry,
                     mm_budget,
                 )
+                if _trace:
+                    logger.info(
+                        "BOOT_TRACE stage=profile_mm_dummy_inputs items=%d %.2fs",
+                        len(dummy_mm_inputs), time.perf_counter() - _t0,
+                    )
+                    torch.accelerator.synchronize()
+                    _t0 = time.perf_counter()
                 self.model_state.encoder_runner.profile_encoder_cache(
                     dummy_mm_inputs, mm_budget
                 )
+                if _trace:
+                    torch.accelerator.synchronize()
+                    logger.info(
+                        "BOOT_TRACE stage=profile_mm_encoder_forward %.2fs",
+                        time.perf_counter() - _t0,
+                    )
 
+        _trace = os.environ.get("DSPARK_BOOT_TRACE") == "1"
+        _t0 = time.perf_counter()
         hidden_states, sample_hidden_states = self._dummy_run(
             self.max_num_tokens, skip_attn=True, is_profile=True
         )
+        if _trace:
+            torch.accelerator.synchronize()
+            logger.info(
+                "BOOT_TRACE stage=profile_lm_dummy_run tokens=%d %.2fs",
+                self.max_num_tokens, time.perf_counter() - _t0,
+            )
 
         # Only run sampler/pooler on last PP rank (non-last ranks return None).
         if self.is_last_pp_rank:

@@ -87,6 +87,54 @@ from .utils import request_memory
 
 logger = init_logger(__name__)
 
+
+def _boot_trace_begin() -> float | None:
+    """Start of a startup stage timer (only when DSPARK_BOOT_TRACE=1)."""
+    if os.environ.get("DSPARK_BOOT_TRACE") != "1":
+        return None
+    torch.accelerator.synchronize()
+    return time.perf_counter()
+
+
+def _boot_trace_end(t0: float | None, stage: str, rank: int) -> None:
+    if t0 is None:
+        return
+    torch.accelerator.synchronize()
+    logger.info("BOOT_TRACE stage=%s rank=%d %.2fs", stage, rank, time.perf_counter() - t0)
+
+
+def _maybe_write_state_digest(worker: "Worker") -> None:
+    prefix = os.environ.get("DSPARK_STATE_DIGEST")
+    if not prefix:
+        return
+    import hashlib
+
+    t0 = time.perf_counter()
+    path = f"{prefix}-rank{worker.rank}.txt"
+    total = hashlib.sha256()
+    n = 0
+    with open(path, "w") as f:
+        for tag, model in (
+            ("target", worker.model_runner.get_model()),
+            ("draft", worker.model_runner.get_draft_model()),
+        ):
+            if model is None:
+                continue
+            for name, t in model.state_dict().items():
+                if not isinstance(t, torch.Tensor) or t.numel() == 0:
+                    continue
+                buf = t.detach().reshape(-1).contiguous().view(torch.uint8).cpu().numpy().tobytes()
+                h = hashlib.sha256(buf).hexdigest()
+                line = f"{tag} {name} {tuple(t.shape)} {t.dtype} {h}\n"
+                f.write(line)
+                total.update(line.encode())
+                n += 1
+        f.write(f"TOTAL tensors={n} sha256={total.hexdigest()}\n")
+    logger.info(
+        "BOOT_TRACE state digest rank=%d tensors=%d sha256=%s written to %s in %.1fs",
+        worker.rank, n, total.hexdigest()[:16], path, time.perf_counter() - t0,
+    )
+
 if TYPE_CHECKING:
     from vllm.device_allocator.sleep_mode_backend import SleepModeBackend
     from vllm.model_executor.model_loader.tensorizer import TensorizerConfig
@@ -710,11 +758,15 @@ class Worker(WorkerBase):
 
         # Warmup and tune the kernels used during model execution before
         # cuda graph capture.
+        _bt = _boot_trace_begin()
         kernel_warmup(self)
+        _boot_trace_end(_bt, "kernel_warmup", self.rank)
 
         cuda_graph_memory_bytes = 0
         if not self.model_config.enforce_eager:
+            _bt = _boot_trace_begin()
             cuda_graph_memory_bytes = self.model_runner.capture_model()
+            _boot_trace_end(_bt, "capture_model", self.rank)
 
         # Compare actual vs estimated CUDA graph memory (if we did profiling)
         if (
@@ -792,7 +844,9 @@ class Worker(WorkerBase):
 
         if self.use_v2_model_runner:
             # V2: Run full execute_model + sample_tokens to JIT compile triton kernels.
+            _bt = _boot_trace_begin()
             warmup_kernels(self.model_runner, self.execute_model, self.sample_tokens)
+            _boot_trace_end(_bt, "v2_post_capture_warmup_kernels", self.rank)
         elif get_pp_group().is_last_rank:
             # V1: Warm up sampler and preallocate memory buffer for logits and other
             # sampling related tensors of max possible shape to avoid memory
@@ -828,6 +882,11 @@ class Worker(WorkerBase):
             )
 
             trigger_inductor_lazy_init(self.device)
+
+        # Validation boots only: per-tensor digest of the loaded target and
+        # draft weights (DSPARK_STATE_DIGEST=<path prefix>), to prove a loader
+        # change left every value untouched.
+        _maybe_write_state_digest(self)
 
         # All warmup is done — start monitoring for unexpected JIT
         # compilations that would cause latency spikes during inference.

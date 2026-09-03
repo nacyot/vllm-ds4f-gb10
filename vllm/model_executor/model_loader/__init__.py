@@ -127,6 +127,72 @@ def get_model_loader(load_config: LoadConfig) -> BaseModelLoader:
     return _LOAD_FORMAT_TO_MODEL_LOADER[load_format](load_config)
 
 
+def _instanttensor_draft_load_config(
+    vllm_config: VllmConfig,
+    model_config: ModelConfig,
+    load_config: LoadConfig | None,
+) -> LoadConfig:
+    """Resolve the loader for one model without changing the target loader.
+
+    Port of eugr/spark-vllm-docker mods/instanttensor-hybrid-draft-loader v1:
+    a speculative draft folded into the target checkpoint needs a small subset
+    of its tensors, so a second InstantTensor GPU-streaming pass over the whole
+    checkpoint is pure waste (and on unified memory an OOM risk). Load such a
+    draft with lazy safetensors instead. INSTANTTENSOR_DRAFT_LOADER: auto
+    (default: only when draft and target share model path and revision),
+    safetensors (every draft), instanttensor (disable).
+    """
+    import os
+
+    from vllm.config import replace
+
+    mode = os.environ.get("INSTANTTENSOR_DRAFT_LOADER", "auto").strip().lower()
+    allowed_modes = ("auto", "safetensors", "instanttensor")
+    if mode not in allowed_modes:
+        raise ValueError(
+            "INSTANTTENSOR_DRAFT_LOADER must be one of "
+            f"{', '.join(allowed_modes)}; got {mode!r}"
+        )
+
+    effective = load_config or vllm_config.load_config
+    load_format = getattr(effective.load_format, "value", effective.load_format)
+    if mode == "instanttensor" or str(load_format).lower() != "instanttensor":
+        return effective
+
+    speculative_config = getattr(vllm_config, "speculative_config", None)
+    draft_model_config = getattr(speculative_config, "draft_model_config", None)
+    if draft_model_config is None or model_config is not draft_model_config:
+        return effective
+
+    if mode == "auto":
+        target_model_config = (
+            getattr(speculative_config, "target_model_config", None)
+            or vllm_config.model_config
+        )
+        draft_source = (
+            getattr(draft_model_config, "model", None),
+            getattr(draft_model_config, "revision", None),
+        )
+        target_source = (
+            getattr(target_model_config, "model", None),
+            getattr(target_model_config, "revision", None),
+        )
+        if draft_source != target_source:
+            return effective
+
+    logger.info_once(
+        "Hybrid draft loading: using lazy safetensors for speculative draft "
+        "weights while preserving InstantTensor for the target model "
+        "(INSTANTTENSOR_DRAFT_LOADER=%s).",
+        mode,
+    )
+    return replace(
+        effective,
+        load_format="safetensors",
+        safetensors_load_strategy="lazy",
+    )
+
+
 def get_model(
     *,
     vllm_config: VllmConfig,
@@ -134,9 +200,12 @@ def get_model(
     prefix: str = "",
     load_config: LoadConfig | None = None,
 ) -> nn.Module:
-    loader = get_model_loader(load_config or vllm_config.load_config)
     if model_config is None:
         model_config = vllm_config.model_config
+    resolved_load_config = _instanttensor_draft_load_config(
+        vllm_config, model_config, load_config
+    )
+    loader = get_model_loader(resolved_load_config)
     return loader.load_model(
         vllm_config=vllm_config, model_config=model_config, prefix=prefix
     )

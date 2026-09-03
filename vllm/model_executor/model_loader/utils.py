@@ -3,6 +3,8 @@
 """Utilities for selecting and loading models."""
 
 import inspect
+import os
+import time
 import warnings
 from contextlib import contextmanager
 from dataclasses import dataclass, field
@@ -97,12 +99,57 @@ def initialize_model(
     return model
 
 
+_BOOT_TRACE_VM_KEYS = ("pgscan_direct", "pgsteal_direct", "allocstall_normal",
+                       "compact_stall", "compact_fail", "pgmajfault")
+
+
+def _boot_trace_enabled() -> bool:
+    return os.environ.get("DSPARK_BOOT_TRACE") == "1"
+
+
+def _boot_trace_counters() -> dict[str, int]:
+    out: dict[str, int] = {}
+    try:
+        with open("/proc/vmstat") as f:
+            for line in f:
+                k, _, v = line.partition(" ")
+                if k in _BOOT_TRACE_VM_KEYS:
+                    out[k] = int(v)
+        with open("/proc/meminfo") as f:
+            for line in f:
+                if line.startswith("MemAvailable:"):
+                    out["memavail_mb"] = int(line.split()[1]) // 1024
+                    break
+        with open("/proc/pressure/memory") as f:
+            for line in f:
+                if line.startswith("full"):
+                    out["psi_full_total_ms"] = int(line.rsplit("=", 1)[1]) // 1000
+    except OSError:
+        pass
+    return out
+
+
+def _boot_trace_delta(before: dict[str, int], after: dict[str, int]) -> str:
+    return " ".join(
+        f"{k}={after[k] - before[k]:+d}" if k != "memavail_mb" else f"memavail_mb={after[k]}"
+        for k in after
+        if k in before
+    )
+
+
 def process_weights_after_loading(
     model: nn.Module, model_config: ModelConfig, target_device: torch.device
 ) -> None:
-    for _, module in model.named_modules():
+    trace = _boot_trace_enabled()
+    trace_t0 = time.perf_counter() if trace else 0.0
+    trace_vm0 = _boot_trace_counters() if trace else {}
+    trace_slow = 0
+    for _name, module in model.named_modules():
         quant_method = getattr(module, "quant_method", None)
         if isinstance(quant_method, QuantizeMethodBase):
+            if trace:
+                layer_t0 = time.perf_counter()
+                layer_vm0 = _boot_trace_counters()
             # When quant methods need to process weights after loading
             # (for repacking, quantizing, etc), they expect parameters
             # to be on the global target device. This scope is for the
@@ -119,7 +166,35 @@ def process_weights_after_loading(
                 module.update_param_tp_status()
             # Repacking transients above can leave large amounts of memory in
             # the caching allocator, which starves the OS on UMA devices.
-            release_device_memory_under_pressure(target_device)
+            released = release_device_memory_under_pressure(target_device)
+            if trace:
+                layer_dt = time.perf_counter() - layer_t0
+                if layer_dt >= 0.25 or released:
+                    trace_slow += 1
+                    logger.info(
+                        "BOOT_TRACE pwal layer=%s %.3fs released=%s %s",
+                        _name,
+                        layer_dt,
+                        released,
+                        _boot_trace_delta(layer_vm0, _boot_trace_counters()),
+                    )
+
+    if trace:
+        try:
+            from vllm.model_executor.layers.fused_moe.experts.b12x_fast_repack import (
+                log_stats as _fast_repack_stats,
+            )
+
+            _fast_repack_stats()
+        except ImportError:
+            pass
+        logger.info(
+            "BOOT_TRACE pwal quant-modules total %.2fs slow_or_released=%d %s",
+            time.perf_counter() - trace_t0,
+            trace_slow,
+            _boot_trace_delta(trace_vm0, _boot_trace_counters()),
+        )
+        trace_t0 = time.perf_counter()
 
     # Initialize post-load attention weights for any attention layer and MM
     # encoder. NOTE: Happens after other modules so we can easily decompress

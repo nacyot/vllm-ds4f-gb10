@@ -656,6 +656,11 @@ class B12xExperts(mk.FusedMoEExpertsModular):
         )
 
         unit_scale = self._unit_expert_scale(w1.device, int(w1.shape[0]))
+        # Batched (chunk-of-experts) repack helpers; bit-identical, launch-bound
+        # per-expert loops otherwise cost ~45 s per rank at boot.
+        from .b12x_fast_repack import install as _install_fast_repack
+
+        _install_fast_repack()
         prepared = _prepare_b12x_fp4_moe_weights(
             source_format=self._source_format(),
             w13_layout=self._w13_layout(),

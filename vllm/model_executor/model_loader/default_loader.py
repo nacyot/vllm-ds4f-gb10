@@ -212,7 +212,14 @@ class DefaultModelLoader(BaseModelLoader):
             if len(hf_weights_files) > 0:
                 if pattern.endswith(".safetensors"):
                     use_safetensors = True
-                break
+                # A list of exact filenames (no glob metacharacters) is a union,
+                # e.g. a folded draft model restricting the scan to the shards
+                # holding its tensors. Glob patterns keep the first-match
+                # fallback ladder.
+                if allow_patterns_overrides is None or any(
+                    ch in pattern for ch in "*?["
+                ):
+                    break
 
         if use_safetensors:
             # For models like Mistral-7B-Instruct-v0.3
@@ -228,9 +235,18 @@ class DefaultModelLoader(BaseModelLoader):
                     subfolder=subfolder,
                     revision=revision,
                 )
-            hf_weights_files = filter_duplicate_safetensors_files(
-                hf_weights_files, hf_folder, index_file
+            exact_overrides = allow_patterns_overrides is not None and not any(
+                any(ch in pattern for ch in "*?[") for pattern in allow_patterns_overrides
             )
+            if exact_overrides:
+                # The caller picked exact shard names out of the index (e.g. a
+                # folded draft model); the index-vs-files completeness check
+                # would reject the intentional subset.
+                hf_weights_files = sorted(set(hf_weights_files))
+            else:
+                hf_weights_files = filter_duplicate_safetensors_files(
+                    hf_weights_files, hf_folder, index_file
+                )
         else:
             hf_weights_files = filter_files_not_needed_for_inference(hf_weights_files)
 
