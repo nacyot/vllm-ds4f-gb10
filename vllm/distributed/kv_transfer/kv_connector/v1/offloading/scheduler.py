@@ -1022,10 +1022,8 @@ class OffloadingConnectorScheduler:
                         # groups never query an extra chunk and keep the
                         # unconditional pop.
                         _extra_chunk_queried = query_max > max_hit_size_tokens
-                        if sliding_window_size_in_chunks is None:
-                            num_hit_chunks -= 1
-                        elif _extra_chunk_queried and num_hit_chunks >= len(
-                            offload_keys
+                        if sliding_window_size_in_chunks is None or (
+                            _extra_chunk_queried and num_hit_chunks >= len(offload_keys)
                         ):
                             num_hit_chunks -= 1
                         eagle_verified.add(group_idx)
