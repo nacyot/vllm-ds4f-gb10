@@ -2426,10 +2426,11 @@ class TestEagle:
     def test_sw_lookup_requires_extra_window_block(self, request_runner):
         """SW eagle with W=2 and only 2 keys (both hit) uses prefix fallback.
 
-        Since required_window = W+1 = 3 but only 2 keys are available
-        (inflation is capped by len(offload_keys)), _sliding_window_lookup
-        can never find a window of 3. It falls back to prefix count (2).
-        Pop: 2-1=1 → max_hit = 4. Result: 4 tokens (degraded from full hit).
+        required_window = W+1 = 3 but only 2 keys exist (inflation is capped
+        by len(offload_keys)), so _sliding_window_lookup falls back to the
+        prefix count (2). The extra chunk was never queried, so nothing is
+        popped (a stored chunk is never the volatile draft tail;
+        2026-09-07): 2 chunks = 8 tokens.
         """
         block_size = 4
         sw_blocks = 2
@@ -2461,11 +2462,21 @@ class TestEagle:
         req_status = self._make_req_status(
             sched, num_tokens=9, offload_keys_per_group=[[1, 2]]
         )
-        # Prefix fallback returns 2, pop to 1 → 1*4 = 4 tokens
-        assert sched._lookup(req_status) == 4
+        # Prefix fallback returns 2, no pop at the end of the keys → 2*4 = 8
+        assert sched._lookup(req_status) == 8
 
     def test_sw_lookup_w_plus_one_hits_returns_w_blocks(self, request_runner):
-        """SW eagle with W=2, 3 contiguous hits → pop to 2 → returns 2*bs."""
+        """SW eagle with W=2, 3 contiguous hits at the end of the keys.
+
+        The request ends less than one chunk past the last stored boundary,
+        so query_max is clamped to the key range and the extra draft chunk
+        is never queried. The confirmed run [1,2,3] is the anchor-now w+e
+        snapshot written at completion, not a volatile tail: no pop, 3
+        chunks = 12 tokens. Before 2026-09-07 this popped to 8, one window
+        chunk below the prompt anchor where the non-eagle window groups keep
+        no snapshot, so every cold restore of such a session collapsed to a
+        full recompute (seen on the 2x TP=2 pairs and twice in production).
+        """
         block_size = 4
         sw_blocks = 2
         groups = [
@@ -2495,11 +2506,11 @@ class TestEagle:
         sched = runner.connector_scheduler
         # num_tokens=13 → max_hit=13-1=12, query_max=min(12+4,12)=12
         # num_blocks=cdiv(12,4)=3, keys=[1,2,3], required_window=3
-        # SW finds window of 3, pop to 2 → 2*4=8
+        # SW finds window of 3; extra chunk never queried → no pop → 3*4=12
         req_status = self._make_req_status(
             sched, num_tokens=13, offload_keys_per_group=[[1, 2, 3]]
         )
-        assert sched._lookup(req_status) == 8
+        assert sched._lookup(req_status) == 12
 
     def test_eagle_verified_prevents_double_pop(self, request_runner):
         """Once an eagle group has popped, it doesn't pop again on re-iteration.

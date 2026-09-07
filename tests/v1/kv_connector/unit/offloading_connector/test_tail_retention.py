@@ -11,6 +11,9 @@
   chunk was queried but missed, the hit run already ends at the boundary and
   must not be popped again (otherwise the boundary walks down 4096 tokens per
   reconciliation pass until full recompute).
+* EAGLE end-of-keys (2026-09-07): when the request ends before the extra
+  chunk exists, nothing is queried past the boundary and nothing is popped;
+  a stored chunk is never the volatile draft tail.
 """
 
 from unittest.mock import MagicMock
