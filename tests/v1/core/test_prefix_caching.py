@@ -4311,3 +4311,71 @@ def test_swa_shared_prefix_reuse_under_zero_retention(monkeypatch):
     assert last_req_hit(retention=0, pin=False) == 0
     # retention=0 with the pin keeps the junction window -> reuse restored.
     assert last_req_hit(retention=0, pin=True) == 4 * block_size
+
+
+def test_eagle_sliding_window_tail_within_one_block_hits_last_boundary():
+    """Hybrid full-attention + sliding-window model with the sliding-window
+    group as the EAGLE/DSpark group (different page sizes, so hits are
+    aligned to the full-attention block).
+
+    The EAGLE rule matches one sliding-window block past the aligned boundary
+    and drops it. When a request ends within one sliding-window block of its
+    last aligned boundary, that peek block lies past ``num_tokens - 1`` and
+    can never be scanned; the hit used to collapse to 0 and an exact re-send
+    of the prompt re-prefilled everything. The plain window run ending at the
+    boundary must be taken instead (2026-09-07)."""
+    full_block = 16
+    swa_block = 4
+    config = KVCacheConfig(
+        num_blocks=64,
+        kv_cache_tensors=[],
+        kv_cache_groups=[
+            KVCacheGroupSpec(
+                ["full"],
+                FullAttentionSpec(
+                    block_size=full_block,
+                    num_kv_heads=1,
+                    head_size=1,
+                    dtype=torch.float32,
+                ),
+            ),
+            KVCacheGroupSpec(
+                ["swa"],
+                SlidingWindowSpec(
+                    block_size=swa_block,
+                    num_kv_heads=1,
+                    head_size=1,
+                    dtype=torch.float32,
+                    sliding_window=2 * swa_block,
+                ),
+                is_eagle_group=True,
+            ),
+        ],
+    )
+    manager = make_kv_cache_manager(
+        config,
+        max_model_len=8192,
+        enable_caching=True,
+        use_eagle=True,
+        hash_block_size=swa_block,
+    )
+    for tail in (1, swa_block, swa_block + 1):
+        token_ids = list(range(full_block + tail))
+        req = make_request(f"prime_{tail}", token_ids, swa_block, sha256)
+        computed_blocks, num_computed, _ = manager.get_computed_blocks(req)
+        manager.allocate_slots(req, len(token_ids), num_computed, computed_blocks)
+        manager.free(req)
+
+        req2 = make_request(f"resend_{tail}", token_ids, swa_block, sha256)
+        computed_blocks, num_computed, _ = manager.get_computed_blocks(req2)
+        # The full-attention boundary at 16 is reachable for every tail; the
+        # peek block (tokens 16..19) is scannable only when tail > swa_block,
+        # and either way the hit lands on the boundary.
+        assert num_computed == full_block, (tail, num_computed)
+        assert len(computed_blocks.blocks[0]) == 1
+        swa_blocks = computed_blocks.blocks[1]
+        assert len(swa_blocks) == full_block // swa_block
+        assert all(b.is_null for b in swa_blocks[:2]) and not any(
+            b.is_null for b in swa_blocks[2:]
+        )
+        manager.free(req2)

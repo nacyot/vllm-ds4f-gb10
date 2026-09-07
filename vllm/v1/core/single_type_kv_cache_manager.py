@@ -932,6 +932,39 @@ class SlidingWindowManager(SingleTypeKVCacheManager):
             alignment_tokens=alignment_tokens,
         )
 
+        block_size = kv_cache_spec.block_size
+        max_num_blocks = max_length // block_size
+        if drop_eagle_block and block_size != alignment_tokens:
+            # EAGLE/DSpark matches one peek block past the aligned boundary and
+            # drops it. When the request ends within one block of its last
+            # aligned boundary the peek block lies beyond ``max_length`` and
+            # can never be scanned, and under sparse retention the earlier
+            # boundaries hold no window run either, so the hit collapsed to 0
+            # (an exact re-send of a prompt whose tail past the last 256-token
+            # boundary was <= 64 tokens re-prefilled everything, 2026-09-07).
+            # Nothing past the boundary can be recomputed-from anyway, so take
+            # the plain window run ending at that boundary and skip the drop.
+            last_boundary = max_length // alignment_tokens * alignment_tokens
+            if last_boundary > 0 and last_boundary + block_size > max_length:
+                end = last_boundary // block_size
+                need = cls._contiguous_blocks_for_hit(
+                    kv_cache_spec.sliding_window, block_size, use_eagle=False
+                )
+                start = end - need
+                if start >= 0:
+                    run = [
+                        block_pool.get_cached_block(block_hashes[i], kv_cache_group_ids)
+                        for i in range(start, end)
+                    ]
+                    if all(run):
+                        computed_blocks = tuple(
+                            [block_pool.null_block] * end
+                            for _ in range(len(kv_cache_group_ids))
+                        )
+                        for i, cached_block in zip(range(start, end), run):
+                            for computed, cached in zip(computed_blocks, cached_block):
+                                computed[i] = cached
+                        return computed_blocks, last_boundary
         # The number of contiguous blocks needed for a prefix cache hit.
         sliding_window_contiguous_blocks = cls._contiguous_blocks_for_hit(
             kv_cache_spec.sliding_window, kv_cache_spec.block_size, drop_eagle_block
@@ -942,12 +975,10 @@ class SlidingWindowManager(SingleTypeKVCacheManager):
         # O(max_num_blocks / sliding_window_contiguous_blocks +
         # sliding_window_contiguous_blocks),
         # which is good for low cache hit rate scenarios.
-        max_num_blocks = max_length // kv_cache_spec.block_size
         computed_blocks: tuple[list[KVCacheBlock], ...] = tuple(
             [block_pool.null_block] * max_num_blocks
             for _ in range(len(kv_cache_group_ids))
         )
-        block_size = kv_cache_spec.block_size
         num_contiguous_blocks = 0
         match_found = False
         # Search from right to left and early stop when a match is found.
