@@ -131,9 +131,13 @@ def resolve_layer_compress_ratio(config, layer_id: int) -> tuple[int, bool]:
     uncompressed KV and plain (unscaled) rope. The operational ratio stays
     clamped to >= 1 (KV-cache specs treat 1 as "no compression" and divide by
     it); a raw 0 only selects unscaled rope for that layer.
+
+    A raw 0 on a target layer is a pure sliding-window layer (layers 0 and 1
+    on DeepSeek-V4-Flash). The reference ``inference/model.py`` disables YaRN
+    there and uses the base ``rope_theta``; only compressor (CSA/HCA) layers
+    are YaRN-scaled (vLLM #54815). Before this the target SWA layers were
+    built with the YaRN factor while the draft blocks were not.
     """
-    if layer_id < config.num_hidden_layers:
-        return max(1, config.compress_ratios[layer_id]), False
     if layer_id < len(config.compress_ratios):
         raw_compress_ratio = config.compress_ratios[layer_id]
         return max(1, raw_compress_ratio), raw_compress_ratio == 0
