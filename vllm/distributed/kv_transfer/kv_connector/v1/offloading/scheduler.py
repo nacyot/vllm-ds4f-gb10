@@ -1008,10 +1008,23 @@ class OffloadingConnectorScheduler:
                         # groups downward on every reconciliation pass
                         # (walkdown to full recompute). At the natural
                         # end-of-request the extra chunk is never queried
-                        # (query_max is clamped to the key range), so the
-                        # unconditional pop semantics are preserved there.
+                        # (query_max is clamped to the key range). Popping
+                        # there too was wrong: a stored chunk is never the
+                        # volatile draft tail (the store side excludes it,
+                        # and anchor-now writes the w+e run at completion),
+                        # and the pop landed one window chunk below the
+                        # prompt anchor where the non-eagle window groups
+                        # keep nothing, so every cold restore of a session
+                        # shorter than anchor + one window chunk collapsed
+                        # to 0 hits and a full recompute (2026-09-07). For
+                        # sliding-window eagle groups pop only when the extra
+                        # chunk was queried and hit; full-attention eagle
+                        # groups never query an extra chunk and keep the
+                        # unconditional pop.
                         _extra_chunk_queried = query_max > max_hit_size_tokens
-                        if not _extra_chunk_queried or num_hit_chunks >= len(
+                        if sliding_window_size_in_chunks is None:
+                            num_hit_chunks -= 1
+                        elif _extra_chunk_queried and num_hit_chunks >= len(
                             offload_keys
                         ):
                             num_hit_chunks -= 1
