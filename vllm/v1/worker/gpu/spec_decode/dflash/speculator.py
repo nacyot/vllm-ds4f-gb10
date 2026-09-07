@@ -307,6 +307,16 @@ class DFlashSpeculator(DraftModelSpeculator):
             query_start_loc_np=query_start_loc_np,
         )
 
+    def reset_context_rows(self, req_indices: list[int]) -> None:
+        """New requests took these persistent request rows. DSpark keeps a
+        per-row ring of target-hidden-state KV; mark the rows empty so slots
+        the request never wrote (prefix-cache hit, restore, previous occupant)
+        are masked by the draft attention."""
+        reset = getattr(self.model, "reset_context_rows", None)
+        if reset is None or not req_indices:
+            return
+        reset(torch.tensor(req_indices, dtype=torch.int64, device=self.device))
+
     @torch.inference_mode()
     def propose(
         self,

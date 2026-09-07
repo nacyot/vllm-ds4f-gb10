@@ -138,6 +138,7 @@ def _dspark_context_kv_store_kernel(
     row_map_ptr,
     query_start_loc_ptr,
     rejected_ptr,
+    min_pos_ptr,
     kv_weight_ptr,
     cos_sin_ptr,
     eps: tl.constexpr,
@@ -181,6 +182,10 @@ def _dspark_context_kv_store_kernel(
 
     pos = tl.load(positions_ptr + token_pid).to(tl.int64)
     slot = pos % window_size
+    # Lowest position this request has written into its ring row; the draft
+    # attention masks slots below it (they belong to a previous occupant or
+    # to prefix tokens this request never computed).
+    tl.atomic_min(min_pos_ptr + req_row, pos.to(tl.int32), mask=should_store)
     rope_offsets = offs - nope_dim
     pair_idx = rope_offsets // 2
     pair_base = nope_dim + pair_idx * 2
@@ -228,8 +233,12 @@ def dspark_context_kv_store(
     cos_sin_cache: torch.Tensor,
     eps: float,
     row_map: torch.Tensor | None = None,
+    min_pos: torch.Tensor | None = None,
 ) -> None:
-    """Fuse DSpark context KV RMSNorm+RoPE and circular cache scatter."""
+    """Fuse DSpark context KV RMSNorm+RoPE and circular cache scatter.
+
+    ``min_pos`` ([rows] int32) receives the lowest position stored per ring
+    row (atomic min); pass the model's persistent buffer."""
     if kv.dim() != 2:
         raise ValueError(f"kv must be [tokens, dim], got {kv.shape}")
     if cache.dim() != 3:
@@ -251,6 +260,13 @@ def dspark_context_kv_store(
         _row_map = torch.arange(batch_size, device=kv.device, dtype=torch.int64)
     else:
         _row_map = row_map
+    if min_pos is None:
+        min_pos = torch.full(
+            (cache.shape[0],),
+            torch.iinfo(torch.int32).max,
+            dtype=torch.int32,
+            device=kv.device,
+        )
     block_d = triton.next_power_of_2(head_dim)
     rejected = (
         num_rejected_tokens if num_rejected_tokens is not None else query_start_loc
@@ -262,6 +278,7 @@ def dspark_context_kv_store(
         _row_map.contiguous(),
         query_start_loc.contiguous(),
         rejected.contiguous(),
+        min_pos,
         kv_weight,
         cos_sin_cache,
         eps=eps,
@@ -284,6 +301,7 @@ def _dspark_attention_kernel(
     main_kv_ptr,
     draft_kv_ptr,
     main_pos_ptr,
+    min_pos_ptr,
     sink_ptr,
     out_ptr,
     scale: tl.constexpr,
@@ -326,8 +344,8 @@ def _dspark_attention_kernel(
 
     sink = tl.load(sink_ptr + head_of_row, mask=m_valid, other=0.0).to(tl.float32)
 
-    valid_main_end = tl.load(main_pos_ptr + batch_idx)
-    valid_main_end = tl.minimum(valid_main_end, window_size - 1)
+    main_pos = tl.load(main_pos_ptr + batch_idx).to(tl.int64)
+    min_pos = tl.load(min_pos_ptr + batch_idx).to(tl.int64)
 
     # sink folded in as a keyless logit: init running max=sink, denom=1, acc=0
     m_i = sink
@@ -339,7 +357,15 @@ def _dspark_attention_kernel(
         offs_n = start + tl.arange(0, BLOCK_N)
         main_mask = offs_n < window_size
         draft_off = offs_n - window_size
-        valid_n = tl.where(main_mask, offs_n <= valid_main_end, draft_off < block_size)
+        # Ring slot s holds position main_pos - ((main_pos - s) mod window).
+        # It is attendable only if that position exists and this request
+        # wrote it (>= min_pos): slots below a prefix-cache hit or left by a
+        # previous occupant of the row are masked.
+        dist = (main_pos - offs_n.to(tl.int64)) % window_size
+        dist = tl.where(dist < 0, dist + window_size, dist)
+        slot_pos = main_pos - dist
+        main_valid = (slot_pos >= 0) & (slot_pos >= min_pos)
+        valid_n = tl.where(main_mask, main_valid, draft_off < block_size)
 
         main_ptrs = (
             main_kv_ptr
@@ -377,8 +403,12 @@ def dspark_triton_attention(
     main_positions: torch.Tensor,
     attn_sink: torch.Tensor,
     scale: float,
+    min_pos: torch.Tensor | None = None,
 ) -> torch.Tensor:
-    """Small-shape fused DSpark attention over circular main KV + draft KV."""
+    """Small-shape fused DSpark attention over circular main KV + draft KV.
+
+    ``min_pos`` ([batch] int32): lowest position each row's request stored
+    into its ring; ``None`` treats every position >= 0 as stored."""
     if q.dim() != 4:
         raise ValueError(f"q must be [batch, block, heads, dim], got {q.shape}")
     batch_size, block_size, n_heads, head_dim = q.shape
@@ -392,11 +422,14 @@ def dspark_triton_attention(
     block_m, block_n = 32, 32
     rows_per_batch = block_size * n_heads
     grid = (batch_size, triton.cdiv(rows_per_batch, block_m))
+    if min_pos is None:
+        min_pos = torch.zeros(batch_size, dtype=torch.int32, device=q.device)
     _dspark_attention_kernel[grid](
         q,
         main_kv,
         draft_kv,
         main_positions,
+        min_pos,
         attn_sink,
         out,
         scale=scale,

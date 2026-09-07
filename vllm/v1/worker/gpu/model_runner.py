@@ -868,6 +868,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                 self.postprocess_sampled(**outputs)
 
     def add_requests(self, scheduler_output: SchedulerOutput) -> None:
+        new_req_indices: list[int] = []
         for new_req_data in scheduler_output.scheduled_new_reqs:
             assert new_req_data.prompt_token_ids is not None
             assert new_req_data.prefill_token_ids is not None
@@ -888,6 +889,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                 max_tokens=sampling_params.max_tokens if sampling_params else 1,  # type: ignore[arg-type]
             )
             req_index = self.req_states.req_id_to_index[req_id]
+            new_req_indices.append(req_index)
 
             if self.pooling_runner is not None:
                 assert new_req_data.pooling_params is not None
@@ -917,6 +919,10 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                     req_id, req_index, new_req_data.sampling_params
                 )
 
+        if new_req_indices and self.speculator is not None:
+            reset_rows = getattr(self.speculator, "reset_context_rows", None)
+            if reset_rows is not None:
+                reset_rows(new_req_indices)
         if scheduler_output.scheduled_new_reqs:
             self.req_states.apply_staged_writes()
             self.model_state.apply_staged_writes()

@@ -144,6 +144,10 @@ def _apply_rope_gptj_last(
 _DSPARK_USE_SEQUENCE_PARALLEL = False
 
 
+# Sentinel for _ctx_min_pos: no position stored in this ring row yet.
+_CTX_POS_EMPTY = torch.iinfo(torch.int32).max
+
+
 class DeepSeekV4DSparkLayer(nn.Module):
     def __init__(
         self,
@@ -228,6 +232,17 @@ class DeepSeekV4DSparkLayer(nn.Module):
         self.register_buffer(
             "_ctx_row_map",
             torch.arange(max_batch, dtype=torch.int64),
+            persistent=False,
+        )
+        # Lowest position each row's request has stored into the ring
+        # (int32, atomic-min'd by store_main_kv, reset to "empty" when a new
+        # request takes the row). The draft attention masks ring slots whose
+        # position is below it: after a prefix-cache hit or a restore the
+        # target recomputes only the tail, and the untouched slots hold a
+        # previous occupant's KV.
+        self.register_buffer(
+            "_ctx_min_pos",
+            torch.full((max_batch,), _CTX_POS_EMPTY, dtype=torch.int32),
             persistent=False,
         )
         self.use_materialized_attention = _spec_bool(
@@ -410,6 +425,7 @@ class DeepSeekV4DSparkLayer(nn.Module):
                 self.attn.rotary_emb.cos_sin_cache,
                 self.attn.eps,
                 row_map=self._ctx_row_map,
+                min_pos=self._ctx_min_pos,
             )
             return
 
@@ -426,9 +442,17 @@ class DeepSeekV4DSparkLayer(nn.Module):
                 continue
             req_positions = main_positions[start:end].long()
             slots = torch.remainder(req_positions, window)
-            self._main_kv_cache[self._ctx_row_map[req_idx], slots] = main_kv[
-                start:end
-            ].to(self._main_kv_cache.dtype)
+            row = self._ctx_row_map[req_idx]
+            self._main_kv_cache[row, slots] = main_kv[start:end].to(
+                self._main_kv_cache.dtype
+            )
+            self._ctx_min_pos[row] = torch.minimum(
+                self._ctx_min_pos[row], req_positions.min().to(torch.int32)
+            )
+
+    def reset_context_rows(self, rows: torch.Tensor) -> None:
+        """Mark ring rows empty: called when new requests take these rows."""
+        self._ctx_min_pos.index_fill_(0, rows, _CTX_POS_EMPTY)
 
     def _project_draft_q_kv(
         self,
@@ -488,6 +512,9 @@ class DeepSeekV4DSparkLayer(nn.Module):
                 main_positions.long(),
                 self.attn.attn_sink[: self.attn.n_local_heads],
                 float(self.attn.scale),
+                min_pos=self._ctx_min_pos.index_select(
+                    0, self._ctx_row_map[:batch_size]
+                ),
             ).reshape(
                 batch_size * block_size,
                 self.attn.n_local_heads,
@@ -497,16 +524,20 @@ class DeepSeekV4DSparkLayer(nn.Module):
             kv = torch.cat([cache_kv, draft_kv], dim=1)
 
             cache_arange = torch.arange(
-                self.window_size,
-                device=positions.device,
-                dtype=main_positions.dtype,
+                self.window_size, device=positions.device, dtype=torch.int64
             )
-            valid_cache = cache_arange.unsqueeze(0) <= torch.minimum(
-                main_positions.long().unsqueeze(1),
-                torch.full_like(
-                    main_positions.long().unsqueeze(1), self.window_size - 1
-                ),
+            # Ring slot s holds position p - ((p - s) mod window); attendable
+            # only if it exists and this request wrote it (>= _ctx_min_pos).
+            mp = main_positions.long().unsqueeze(1)
+            slot_pos = mp - torch.remainder(
+                mp - cache_arange.unsqueeze(0), self.window_size
             )
+            min_pos = (
+                self._ctx_min_pos.index_select(0, self._ctx_row_map[:batch_size])
+                .long()
+                .unsqueeze(1)
+            )
+            valid_cache = (slot_pos >= 0) & (slot_pos >= min_pos)
             valid = torch.cat(
                 [
                     valid_cache,
@@ -911,6 +942,11 @@ class DSparkDeepseekV4ForCausalLM(nn.Module):
 
     def combine_hidden_states(self, aux_hidden_states: torch.Tensor) -> torch.Tensor:
         return self.main_norm(_linear_output(self.main_proj(aux_hidden_states)))
+
+    def reset_context_rows(self, rows: torch.Tensor) -> None:
+        """New requests took these persistent rows of the context ring."""
+        for layer in self.layers.values():
+            layer.reset_context_rows(rows)
 
     def precompute_and_store_context_kv(
         self,
