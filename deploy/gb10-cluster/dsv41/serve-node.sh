@@ -45,6 +45,7 @@ ARGS=(
   --max-num-seqs "$SEQS"
   --max-num-batched-tokens "$MNBT"
   --gpu-memory-utilization "$GMU"
+  --kv-cache-memory "$KVMEM"
   --enable-prefix-caching
   --enable-chunked-prefill
   --tool-call-parser deepseek_v41
