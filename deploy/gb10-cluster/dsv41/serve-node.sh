@@ -25,6 +25,9 @@ export NCCL_IB_HCA=$HCA NCCL_IB_GID_INDEX=3 NCCL_IB_GID_AUTO=0 NCCL_CROSS_NIC=1
 export CUDA_HOME=${CUDA_HOME:-/usr/local/cuda}
 export PATH=$CUDA_HOME/bin:$PATH
 export TORCH_CUDA_ARCH_LIST=12.1a FLASHINFER_CUDA_ARCH_LIST=12.1a FLASHINFER_DISABLE_VERSION_CHECK=1
+# A JIT build after the 78 GB of weights are resident has ~20 GiB to work with;
+# each nvcc job takes 5-6 GiB (earlyoom killed 8-way builds twice).
+export MAX_JOBS=${MAX_JOBS:-2}
 export VLLM_ENGINE_READY_TIMEOUT_S=3600 VLLM_EXECUTE_MODEL_TIMEOUT_SECONDS=1800
 
 ARGS=(
