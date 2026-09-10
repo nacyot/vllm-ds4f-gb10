@@ -24,6 +24,7 @@ from vllm.models.deepseek_v4_1.sparse_mla import (
     DeepseekV4SparseMLAMetadataBuilder,
     DeepseekV41SparseSWAMetadataBuilder,
 )
+from vllm.platforms import current_platform
 from vllm.platforms.interface import DeviceCapability
 from vllm.utils.flashinfer import flashinfer_trtllm_batch_decode_sparse_mla_dsv4
 from vllm.v1.attention.backend import AttentionCGSupport, MultipleOf
@@ -110,6 +111,12 @@ class DeepseekV4FlashInferMLASparseBackend(DeepseekV4SparseMLABackend):
 
     @staticmethod
     def get_supported_kernel_block_sizes() -> list[int | MultipleOf]:
+        # SM12x: each compressed group carries 64 * compress_ratio tokens per
+        # block (see DeepseekV4FlashInferSM120Attention), so any multiple of
+        # 64 must pass; the indexer group limits the base block to 64.
+        capability = current_platform.get_device_capability()
+        if capability is not None and capability.major == 12:
+            return [MultipleOf(64)]
         return [128]
 
     @staticmethod
@@ -545,6 +552,12 @@ class DeepseekV4FlashInferSM120Attention(DeepseekV4Attention):
     backend_cls = DeepseekV4FlashInferMLASparseBackend
     swa_backend_cls = DeepseekSparseSWAFlashInferBackend
     use_fp8_ds_mla_layout: ClassVar[bool] = True
+    # flashinfer.mla._sparse_mla_sm120 instantiates the DSV4 decode kernels
+    # for page_block_size=64 and reads the page size off the SWA cache tensor.
+    swa_block_size: ClassVar[int] = 64
+    # The compressed kernels are likewise instantiated for 64-state pages, and
+    # a page holds ``block // compress_ratio`` states.
+    compressed_block_scales_with_ratio: ClassVar[bool] = True
 
     @staticmethod
     def _get_workspace(device: torch.device) -> torch.Tensor:

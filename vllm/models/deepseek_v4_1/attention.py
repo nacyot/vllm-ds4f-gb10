@@ -163,6 +163,12 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase, ABC):
     backend_cls: ClassVar[type[AttentionBackend]]
     # Backend for the SWA cache layer; None uses the default SWA backend.
     swa_backend_cls: ClassVar[type[AttentionBackend] | None] = None
+    # SWA KV page size. FlashInfer's SM120 DSV4 decode kernels take the page
+    # size from this cache tensor and are instantiated for 64 only.
+    swa_block_size: ClassVar[int] = 32
+    # When set, a compressed layer's KV block spans block_size * compress_ratio
+    # tokens so every compressed page holds the same number of states.
+    compressed_block_scales_with_ratio: ClassVar[bool] = False
     # KV-cache per-token block format (both layouts are paged). True (default)
     # = fp8_ds_mla (UE8M0 block-scaled fp8 packed as uint8); False = plain
     # bf16 / per-tensor fp8 KV row. Backends can override the instance hook when
@@ -453,7 +459,7 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase, ABC):
             prefix=f"{prefix}.swa_cache",
             cache_config=cache_config,
             backend_cls=self.swa_backend_cls,
-            block_size=32,
+            block_size=self.swa_block_size,
         )
 
         # The attention layer itself was already registered with the
@@ -938,8 +944,11 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase, ABC):
         # alignment; plain bf16 / per-tensor fp8 rows use natural element-size
         # pages.
         uses_fp8_ds_mla_layout = self.kv_cache_dtype == "fp8_ds_mla"
+        block_size = vllm_config.cache_config.block_size
+        if self.compressed_block_scales_with_ratio:
+            block_size *= self.compress_ratio
         return MLAAttentionSpec(
-            block_size=vllm_config.cache_config.block_size,
+            block_size=block_size,
             num_kv_heads=1,
             head_size=self.head_dim,
             dtype=torch.uint8 if uses_fp8_ds_mla_layout else self.kv_cache_torch_dtype,

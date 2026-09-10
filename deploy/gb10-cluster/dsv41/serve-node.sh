@@ -37,6 +37,7 @@ ARGS=(
   --master-port "$MASTER_PORT"
   --distributed-executor-backend mp
   --load-format "$LOAD_FORMAT"
+  --block-size 64
   --max-model-len "$MAXLEN"
   --max-num-seqs "$SEQS"
   --max-num-batched-tokens "$MNBT"
