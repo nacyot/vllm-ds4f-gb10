@@ -28,6 +28,7 @@ export TORCH_CUDA_ARCH_LIST=12.1a FLASHINFER_CUDA_ARCH_LIST=12.1a FLASHINFER_DIS
 # A JIT build after the 78 GB of weights are resident has ~20 GiB to work with;
 # each nvcc job takes 5-6 GiB (earlyoom killed 8-way builds twice).
 export MAX_JOBS=${MAX_JOBS:-2}
+[ "${ENGRAM_STATS:-0}" = "1" ] && export VLLM_ENGRAM_MMAP_STATS=1
 export VLLM_ENGINE_READY_TIMEOUT_S=3600 VLLM_EXECUTE_MODEL_TIMEOUT_SECONDS=1800
 
 ARGS=(
