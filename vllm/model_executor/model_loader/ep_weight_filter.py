@@ -61,12 +61,26 @@ def compute_local_expert_ids(
         raise ValueError(f"Unknown expert placement strategy: {placement}")
 
 
+_SKIP_SUFFIXES: set[str] = set()
+
+
+def skip_weights_with_suffix(*suffixes: str) -> None:
+    """Skip checkpoint tensors ending in *suffixes* before they are read.
+
+    Registered at model construction time by modules that keep a tensor on
+    disk (an mmap-backed table) and never want it materialized."""
+    _SKIP_SUFFIXES.update(suffixes)
+
+
 def should_skip_weight(
     weight_name: str,
     local_expert_ids: set[int] | None,
 ) -> bool:
     """Return ``True`` if *weight_name* is an expert weight that does not
-    belong to the local rank and should be skipped during loading."""
+    belong to the local rank, or a registered on-disk tensor, and should be
+    skipped during loading."""
+    if _SKIP_SUFFIXES and weight_name.endswith(tuple(_SKIP_SUFFIXES)):
+        return True
     if local_expert_ids is None:
         return False
     eid = parse_expert_id(weight_name)

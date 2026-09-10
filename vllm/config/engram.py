@@ -27,6 +27,18 @@ class EngramConfig:
     Each rank offloads its assigned hash heads, so host table storage and
     lookup traffic scale with the number of heads assigned to the rank."""
 
+    mmap: bool = False
+    """Leave the fp8 tables in the checkpoint's safetensors shards and map
+    them read-only instead of loading them. The lookup kernel reads rows
+    through the mapping, so the GPU must share the CPU's address space (GB10
+    and GH200 in ATS mode); the page cache is the only copy of the table and
+    the OS reclaims it under memory pressure. Before each lookup, CPU threads
+    prefault the pages of the rows about to be read so the GPU never blocks
+    on a disk read. Overrides `cpu_offload`."""
+
+    mmap_prefault_threads: int = 32
+    """Threads issuing madvise(MADV_POPULATE_READ) before an mmap lookup."""
+
     def verify_model_config(self, model_config: "ModelConfig | None") -> None:
         """Reject Engram configuration for models without n-gram embeddings."""
         from vllm.platforms import current_platform
