@@ -21,7 +21,9 @@ tag = sys.argv[1]
 base = sys.argv[2] if len(sys.argv) > 2 else "http://127.0.0.1:8889"
 out_dir = sys.argv[3] if len(sys.argv) > 3 else os.path.expanduser("~/dsv41-prep/bench")
 os.makedirs(out_dir, exist_ok=True)
-model = json.load(urllib.request.urlopen(base + "/v1/models", timeout=30))["data"][0]["id"]
+model = json.load(urllib.request.urlopen(base + "/v1/models", timeout=30))["data"][0][
+    "id"
+]
 
 
 def stream_chat(prompt, max_tokens):
@@ -66,12 +68,16 @@ def stream_chat(prompt, max_tokens):
         "completion_tokens": n,
         "ttft_s": round(ttft, 3),
         "total_s": round(end - t0, 3),
-        "decode_tok_s": round((n - 1) / decode_s, 2) if decode_s > 0 and n > 1 else None,
+        "decode_tok_s": round((n - 1) / decode_s, 2)
+        if decode_s > 0 and n > 1
+        else None,
         "text": "".join(text),
     }
 
 
-ESSAY = "Write a 300-word essay on why unified memory changes local inference. No headings."
+ESSAY = (
+    "Write a 300-word essay on why unified memory changes local inference. No headings."
+)
 FUNCTIONAL = [
     ("Count from 1 to 100, separated by spaces. Output only the numbers.", 420),
     ("What is 84 * 3 / 2? Answer with the number only.", 32),
@@ -92,12 +98,22 @@ runs = []
 for i in range(3):
     r = stream_chat(ESSAY, 256)
     runs.append({k: v for k, v in r.items() if k != "text"})
-    print(f"single[{i}] ttft={r['ttft_s']}s decode={r['decode_tok_s']} tok/s n={r['completion_tokens']}", flush=True)
+    print(
+        f"single[{i}] ttft={r['ttft_s']}s decode={r['decode_tok_s']} tok/s "
+        f"n={r['completion_tokens']}",
+        flush=True,
+    )
 result["single_stream"] = runs
 
 r = stream_chat(NEEDLE, 8)
-result["prefill_8k"] = {k: v for k, v in r.items() if k != "text"} | {"answer": r["text"].strip()[:20]}
-print(f"prefill_8k prompt={r['prompt_tokens']} ttft={r['ttft_s']}s answer={r['text'].strip()[:10]!r}", flush=True)
+result["prefill_8k"] = {k: v for k, v in r.items() if k != "text"} | {
+    "answer": r["text"].strip()[:20]
+}
+print(
+    f"prefill_8k prompt={r['prompt_tokens']} ttft={r['ttft_s']}s "
+    f"answer={r['text'].strip()[:10]!r}",
+    flush=True,
+)
 
 t0 = time.perf_counter()
 with ThreadPoolExecutor(4) as ex:
@@ -115,12 +131,25 @@ print(f"concurrent_4 wall={wall:.1f}s aggregate={tokens / wall:.1f} tok/s", flus
 functional = []
 for prompt, mt in FUNCTIONAL:
     r = stream_chat(prompt, mt)
-    functional.append({"prompt": prompt[:40], "sha256": hashlib.sha256(r["text"].encode()).hexdigest()[:16], "text": r["text"][:200]})
+    functional.append(
+        {
+            "prompt": prompt[:40],
+            "sha256": hashlib.sha256(r["text"].encode()).hexdigest()[:16],
+            "text": r["text"][:200],
+        }
+    )
 r = stream_chat(NEEDLE, 8)
-functional.append({"prompt": "needle-8k", "sha256": hashlib.sha256(r["text"].encode()).hexdigest()[:16], "text": r["text"][:40]})
+functional.append(
+    {
+        "prompt": "needle-8k",
+        "sha256": hashlib.sha256(r["text"].encode()).hexdigest()[:16],
+        "text": r["text"][:40],
+    }
+)
 result["functional"] = functional
 print("functional hashes:", [f["sha256"] for f in functional], flush=True)
 
 path = os.path.join(out_dir, f"{tag}.json")
-json.dump(result, open(path, "w"), indent=1, ensure_ascii=False)
+with open(path, "w") as f:
+    json.dump(result, f, indent=1, ensure_ascii=False)
 print("wrote", path)
