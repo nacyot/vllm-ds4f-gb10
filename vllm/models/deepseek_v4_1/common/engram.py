@@ -749,6 +749,8 @@ class ParallelEngramEmbedding(nn.Module):
     unchanged either way.
     """
 
+    mmap_table: MmapEngramTable | None = None
+
     def __init__(
         self,
         num_embeddings: int,

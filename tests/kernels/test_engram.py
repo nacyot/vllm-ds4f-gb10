@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 import bisect
+import os
 from types import SimpleNamespace
 
 import pytest
@@ -9,6 +10,7 @@ import torch
 from vllm.models.deepseek_v4_1.common import engram as engram_ops
 from vllm.models.deepseek_v4_1.common.engram import (
     Engram,
+    MmapEngramTable,
     NgramHashState,
     ParallelEngramEmbedding,
 )
@@ -776,3 +778,102 @@ def test_engram_head_collectives_survive_graph_breaks():
     if torch.accelerator.device_count() < 2:
         pytest.skip("Requires two GPUs")
     torch.multiprocessing.spawn(_engram_tp_worker, args=(2, get_open_port()), nprocs=2)
+
+
+def _write_engram_shard(tmp_path, layer_id, weight, scales):
+    """A one-shard checkpoint holding one Engram table, as the reader sees it."""
+    import json
+    import struct
+
+    rows, dim = weight.shape
+    scale_cols = scales.shape[1]
+    weight_name = f"layers.{layer_id}.engram.embed.weight"
+    scale_name = f"layers.{layer_id}.engram.embed.scale"
+    header = {
+        weight_name: {
+            "dtype": "F8_E4M3",
+            "shape": [rows, dim],
+            "data_offsets": [0, rows * dim],
+        },
+        scale_name: {
+            "dtype": "F8_E8M0",
+            "shape": [rows, scale_cols],
+            "data_offsets": [rows * dim, rows * dim + rows * scale_cols],
+        },
+        f"layers.{layer_id}.engram.q_weight": {
+            "dtype": "BF16",
+            "shape": [2, 4],
+            "data_offsets": [
+                rows * dim + rows * scale_cols,
+                rows * dim + rows * scale_cols + 16,
+            ],
+        },
+    }
+    encoded = json.dumps(header).encode()
+    encoded += b" " * ((8 - len(encoded) % 8) % 8)
+    shard = tmp_path / "model-00001-of-00001.safetensors"
+    with open(shard, "wb") as f:
+        f.write(struct.pack("<Q", len(encoded)))
+        f.write(encoded)
+        f.write(weight.view(torch.uint8).numpy().tobytes())
+        f.write(scales.numpy().tobytes())
+        f.write(b"\0" * 16)
+    index = {"weight_map": {name: shard.name for name in header}}
+    (tmp_path / "model.safetensors.index.json").write_text(json.dumps(index))
+    return shard
+
+
+@pytest.mark.skipif(not current_platform.is_cuda(), reason="CUDA required")
+@pytest.mark.skipif(
+    os.environ.get("VLLM_TEST_ENGRAM_MMAP") != "1",
+    reason="the GPU must share the host address space (GB10/GH200 ATS); "
+    "set VLLM_TEST_ENGRAM_MMAP=1 on such a machine",
+)
+@pytest.mark.parametrize("tp_size", [1, 4])
+def test_engram_mmap_matches_resident(tp_size, tmp_path, monkeypatch):
+    """mmap mode reads the same rows the resident head shard would, on every
+    rank, and the checkpoint tensors it maps are skipped by the reader."""
+    from vllm.model_executor.model_loader import ep_weight_filter
+    from vllm.model_executor.model_loader.weight_utils import (
+        safetensors_weights_iterator,
+    )
+
+    head_sizes = tuple(97 + 2 * h for h in range(24))
+    num_rows, dim = sum(head_sizes), 64
+    torch.manual_seed(0)
+    weight = (torch.randn(num_rows, dim) * 4).to(torch.float8_e4m3fn)
+    scales = torch.randint(120, 134, (num_rows, dim // 32), dtype=torch.uint8)
+    shard = _write_engram_shard(tmp_path, 1, weight, scales)
+    ids = torch.empty(31, len(head_sizes), dtype=torch.int32, device="cuda")
+    start = 0
+    for head, size in enumerate(head_sizes):
+        ids[:, head].random_(start, start + size)
+        start += size
+    monkeypatch.setattr(
+        engram_ops, "get_tensor_model_parallel_world_size", lambda: tp_size
+    )
+    monkeypatch.setattr(ep_weight_filter, "_SKIP_SUFFIXES", set())
+    table = MmapEngramTable(str(tmp_path), 1, dim, 32, num_threads=4)
+    for rank in range(tp_size):
+        monkeypatch.setattr(
+            engram_ops, "get_tensor_model_parallel_rank", lambda rank=rank: rank
+        )
+        with torch.device("cuda"):
+            resident = ParallelEngramEmbedding(num_rows, dim, head_sizes)
+            mapped = ParallelEngramEmbedding(
+                num_rows, dim, head_sizes, mmap_table=table
+            )
+        resident.weight.weight_loader(resident.weight, weight)
+        resident.weight_scale_inv.weight_loader(
+            resident.weight_scale_inv, scales.view(torch.float8_e8m0fnu)
+        )
+        shape = (len(ids), resident.part_n_hash_cols, dim)
+        expected = torch.empty(shape, device="cuda", dtype=torch.bfloat16)
+        actual = torch.empty_like(expected)
+        resident.lookup(ids, expected)
+        mapped.prefault(ids)
+        mapped.lookup(ids, actual)
+        torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+        assert len(list(mapped.parameters())) == 0
+    names = [name for name, _ in safetensors_weights_iterator([str(shard)], False)]
+    assert names == ["layers.1.engram.q_weight"]
