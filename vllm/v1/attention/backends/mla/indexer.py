@@ -294,13 +294,14 @@ class DeepseekV4IndexerBackend(DeepseekV32IndexerBackend):
 
     @staticmethod
     def get_supported_kernel_block_sizes() -> list[int | MultipleOf]:
-        # DeepGEMM's paged MQA logits metadata takes block_kv of 32 or 64 on
-        # SM90 and SM12x.
-        capability = current_platform.get_device_capability()
-        if current_platform.is_device_capability_family(90) or (
-            capability is not None and capability.major == 12
-        ):
+        # DeepGEMM's paged MQA logits take block_kv of 32 or 64 on SM90, and
+        # exactly 64 (fp8) on SM12x, where the V4.1 indexer cache of a ratio-r
+        # layer spans 64 * r tokens per block so every page holds 64 states.
+        if current_platform.is_device_capability_family(90):
             return [64]
+        capability = current_platform.get_device_capability()
+        if capability is not None and capability.major == 12:
+            return [MultipleOf(64)]
         return [128]
 
 

@@ -387,6 +387,7 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase, ABC):
                     prefix=f"{prefix}.indexer.k_cache",
                     cache_config=cache_config,
                     compress_ratio=self.compress_ratio,
+                    block_scales_with_ratio=self.compressed_block_scales_with_ratio,
                 )
             else:
                 assert self.kv_source_layer_id is not None
@@ -980,6 +981,7 @@ class DeepseekV4IndexerCache(torch.nn.Module, AttentionLayerBase):
         prefix: str,
         cache_config: CacheConfig,
         compress_ratio: int = 1,
+        block_scales_with_ratio: bool = False,
     ):
         super().__init__()
         self.kv_cache = torch.tensor([])
@@ -988,6 +990,7 @@ class DeepseekV4IndexerCache(torch.nn.Module, AttentionLayerBase):
         self.cache_config = cache_config
         self.dtype = dtype
         self.compress_ratio = compress_ratio
+        self.block_scales_with_ratio = block_scales_with_ratio
         compilation_config = get_current_vllm_config().compilation_config
         if prefix in compilation_config.static_forward_context:
             raise ValueError(f"Duplicate layer name: {prefix}")
@@ -1001,8 +1004,11 @@ class DeepseekV4IndexerCache(torch.nn.Module, AttentionLayerBase):
         # head_dim already carries the fp8 scale padding
         # tokens_per_state=1 for V3.2, >1 for DeepseekV4; same cache layout.
         uses_fp8_ds_mla_layout = vllm_config.cache_config.cache_dtype == "fp8_ds_mla"
+        block_size = self.cache_config.block_size
+        if self.block_scales_with_ratio:
+            block_size *= self.compress_ratio
         return MLAAttentionSpec(
-            block_size=self.cache_config.block_size,
+            block_size=block_size,
             num_kv_heads=1,
             head_size=self.head_dim,
             dtype=self.dtype,
