@@ -59,7 +59,13 @@ else
   ARGS+=(--engram-config '{"cpu_offload":false}')
 fi
 [ "$TEXT_ONLY" = "1" ] && ARGS+=(--language-model-only)
-[ "$EAGER" = "1" ] && ARGS+=(--enforce-eager)
+if [ "$EAGER" = "1" ]; then
+  ARGS+=(--enforce-eager)
+else
+  CG="{\"cudagraph_capture_sizes\":[${CAPTURE_SIZES}],\"max_cudagraph_capture_size\":${CAPTURE_SIZES##*,}"
+  [ -n "$CUDAGRAPH_MODE" ] && CG="$CG,\"cudagraph_mode\":\"$CUDAGRAPH_MODE\""
+  ARGS+=(--compilation-config "$CG}")
+fi
 [ "$SPEC" = "dspark" ] && ARGS+=(--speculative-config "{\"method\":\"dspark\",\"num_speculative_tokens\":$SPEC_K,\"draft_sample_method\":\"probabilistic\"}")
 # shellcheck disable=SC2206
 [ -n "$EXTRA_ARGS" ] && ARGS+=($EXTRA_ARGS)

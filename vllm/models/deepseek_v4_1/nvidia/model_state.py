@@ -6,6 +6,7 @@ import torch
 import torch.nn as nn
 
 from vllm.config import VllmConfig
+from vllm.models.deepseek_v4_1.common.mm_preprocess import image_sentinel_mask
 from vllm.triton_utils import tl, triton
 from vllm.v1.worker.gpu.input_batch import InputBatch
 from vllm.v1.worker.gpu.mm.encoder_cache import EncoderCache
@@ -49,6 +50,10 @@ class DeepseekV41ModelState(DefaultModelState):
     the full token history on device, so the window is gathered there every
     step: exact for prompt and generated tokens alike, whatever instance
     produced their KV.
+
+    With mmap'd engram tables the step's hash ids are also computed here and
+    their pages prefaulted before the forward runs, so the forward has no
+    host sync and can be captured in a CUDA graph.
     """
 
     def __init__(
@@ -66,6 +71,22 @@ class DeepseekV41ModelState(DefaultModelState):
             self.lookback_token_ids = torch.full(
                 (self.max_num_reqs, depth), -1, dtype=torch.int32, device=device
             )
+        self.engram_hash = None
+        self.engram_prefault_targets: list[tuple[Any, int]] = []
+        inner = getattr(model, "model", None)
+        if inner is None and hasattr(model, "language_model"):
+            inner = getattr(model.language_model, "model", None)
+        engram_hash = getattr(inner, "engram_hash", None)
+        if engram_hash is not None:
+            for layer in inner.layers:
+                engram = getattr(layer, "engram", None)
+                if engram is not None and engram.embed_tokens.mmap_table is not None:
+                    engram.embed_tokens.runner_prefaults = True
+                    self.engram_prefault_targets.append(
+                        (engram.embed_tokens, engram.layer_hash_index)
+                    )
+            if self.engram_prefault_targets:
+                self.engram_hash = engram_hash
 
     def prepare_inputs(
         self, input_batch: InputBatch, req_states: RequestState
@@ -87,7 +108,28 @@ class DeepseekV41ModelState(DefaultModelState):
             BLOCK_DEPTH=triton.next_power_of_2(depth),
         )
         model_inputs["lookback_token_ids"] = window
+        if self.engram_hash is not None and self.engram_hash.ensure_cache():
+            self._prefault_engram_rows(input_batch, window)
         return model_inputs
+
+    def _prefault_engram_rows(
+        self, input_batch: InputBatch, window: torch.Tensor
+    ) -> None:
+        """Hash this step's n-grams and map their table pages before the forward."""
+        num_tokens = input_batch.num_tokens
+        input_ids = input_batch.input_ids[:num_tokens]
+        hashes = self.engram_hash(
+            input_ids,
+            input_batch.positions[:num_tokens],
+            input_batch.query_start_loc[: input_batch.num_reqs + 1],
+            image_sentinel_mask(input_ids),
+            window,
+            image_sentinel_mask(window),
+            None,
+            None,
+        ).cpu()
+        for embed_tokens, layer_hash_index in self.engram_prefault_targets:
+            embed_tokens.prefault(hashes[:, layer_hash_index])
 
     def prepare_dummy_inputs(self, num_reqs: int, num_tokens: int) -> dict[str, Any]:
         model_inputs = super().prepare_dummy_inputs(num_reqs, num_tokens)

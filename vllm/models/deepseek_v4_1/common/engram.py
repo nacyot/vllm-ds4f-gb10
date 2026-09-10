@@ -39,6 +39,7 @@ import json
 import mmap
 import os
 import struct
+import time
 import weakref
 from concurrent.futures import ThreadPoolExecutor
 
@@ -702,6 +703,27 @@ class MmapEngramTable:
             )
         self.pool = ThreadPoolExecutor(num_threads, thread_name_prefix="engram-mmap")
         self.num_threads = num_threads
+        self.stats_enabled = os.environ.get("VLLM_ENGRAM_MMAP_STATS", "0") == "1"
+        self.stats_calls = 0
+        self.stats_rows = 0
+        self.stats_pages = 0
+        self.stats_seconds = 0.0
+
+    def _record_stats(self, num_rows: int, num_pages: int, t0: float) -> None:
+        self.stats_calls += 1
+        self.stats_rows += num_rows
+        self.stats_pages += num_pages
+        self.stats_seconds += time.perf_counter() - t0
+        if self.stats_calls % 200 == 0:
+            logger.info(
+                "engram mmap %s: %d prefaults, %.1f rows/call, %.1f pages/call, "
+                "%.2f ms/call",
+                os.path.basename(self.path),
+                self.stats_calls,
+                self.stats_rows / self.stats_calls,
+                self.stats_pages / self.stats_calls,
+                1e3 * self.stats_seconds / self.stats_calls,
+            )
 
     def weight_address(self, row: int) -> int:
         return self.base + self.weight_offset + row * self.dim
@@ -714,6 +736,7 @@ class MmapEngramTable:
         the GPU gather that follows finds every page resident."""
         if rows.size == 0:
             return
+        t0 = time.perf_counter() if self.stats_enabled else 0.0
         pages = np.concatenate(
             [
                 (self.weight_offset + rows * self.dim) // self.page,
@@ -734,9 +757,11 @@ class MmapEngramTable:
 
         if runs.shape[0] <= 64:
             work(runs)
-            return
-        splits = np.array_split(runs, min(self.num_threads * 4, runs.shape[0]))
-        list(self.pool.map(work, splits))
+        else:
+            splits = np.array_split(runs, min(self.num_threads * 4, runs.shape[0]))
+            list(self.pool.map(work, splits))
+        if self.stats_enabled:
+            self._record_stats(rows.size, pages.size, t0)
 
 
 class ParallelEngramEmbedding(nn.Module):
@@ -750,6 +775,10 @@ class ParallelEngramEmbedding(nn.Module):
     """
 
     mmap_table: MmapEngramTable | None = None
+    # Set by the model runner's state when it prefaults the rows of each step
+    # before the forward (outside any CUDA graph); the in-forward prefault is
+    # then skipped.
+    runner_prefaults: bool = False
 
     def __init__(
         self,
@@ -1130,7 +1159,8 @@ class Engram(nn.Module):
 
     def prepare_embeddings(self, hash_ids: torch.Tensor) -> None:
         """Gather this layer's rows on the main stream before decoder layers."""
-        self.embed_tokens.prefault(hash_ids)
+        if not self.embed_tokens.runner_prefaults:
+            self.embed_tokens.prefault(hash_ids)
         self.embed_tokens.lookup(hash_ids, self.staged_rows[: hash_ids.shape[0]])
 
     def embed(self, hash_ids: torch.Tensor) -> torch.Tensor:
