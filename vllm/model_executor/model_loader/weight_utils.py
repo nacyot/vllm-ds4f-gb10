@@ -1104,12 +1104,75 @@ def fastsafetensors_weights_iterator(
             pl.close()
 
 
+def _split_files_by_skip_registry(
+    hf_weights_files: list[str],
+) -> tuple[list[str], list[str], list[str], set[str]]:
+    """Partition safetensors shards around tensors registered to stay on disk.
+
+    InstantTensor streams whole files, so a shard leaves its list as soon as
+    one of its tensors is rejected by ``should_skip_weight`` through the
+    ``skip_weights_with_suffix`` registry (an mmap-backed table that must
+    never be materialized). Only the headers are read. The registry is the
+    same on every rank, which keeps the InstantTensor collective consistent.
+
+    Returns:
+        ``(stream, lazy, dropped, expected)``: shards without registered
+        tensors, shards mixing registered and regular tensors (read with the
+        lazy safetensors iterator), shards holding only registered tensors,
+        and the names the loader must yield in total.
+    """
+    stream: list[str] = []
+    lazy: list[str] = []
+    dropped: list[str] = []
+    expected: set[str] = set()
+    for st_file in sorted(hf_weights_files, key=_natural_sort_key):
+        with safe_open(st_file, framework="pt") as f:
+            names = list(f.keys())
+        kept = [name for name in names if not should_skip_weight(name, None)]
+        expected.update(kept)
+        if len(kept) == len(names):
+            stream.append(st_file)
+        elif kept:
+            lazy.append(st_file)
+        else:
+            dropped.append(st_file)
+    return stream, lazy, dropped, expected
+
+
+def safetensors_files_holding(
+    model_dir: str,
+    accepts: Callable[[str], bool],
+    index_file: str = SAFE_WEIGHTS_INDEX_NAME,
+) -> list[str] | None:
+    """Exact shard filenames whose index entries satisfy *accepts*.
+
+    Returns None when *model_dir* has no readable index, so callers fall back
+    to scanning every shard.
+    """
+    if not os.path.isdir(model_dir):
+        return None
+    index_path = os.path.join(model_dir, index_file)
+    if not os.path.isfile(index_path):
+        return None
+    try:
+        with open(index_path) as f:
+            weight_map = json.load(f)["weight_map"]
+    except (OSError, ValueError, KeyError):
+        return None
+    return sorted({fn for name, fn in weight_map.items() if accepts(name)})
+
+
 def instanttensor_weights_iterator(
     hf_weights_files: list[str],
     use_tqdm_on_load: bool,
 ) -> Generator[tuple[str, torch.Tensor], None, None]:
     """Iterate over the weights in the model safetensor files
-    using instanttensor library."""
+    using instanttensor library.
+
+    Shards holding tensors registered with ``skip_weights_with_suffix`` stay
+    out of the InstantTensor list; the regular tensors they also hold are read
+    with the lazy safetensors iterator, which skips per tensor.
+    """
     try:
         import instanttensor
     except ImportError as e:
@@ -1120,43 +1183,78 @@ def instanttensor_weights_iterator(
     if not current_platform.is_cuda():
         raise ValueError("InstantTensor requires NVIDIA GPUs")
 
-    try:
-        world_group = get_world_group()
-    except AssertionError:
-        # Entering here only in unit tests where the world group is not initialized.
-        process_group = None
-    else:
-        process_group = world_group.device_group if world_group.world_size > 1 else None
-
-    device = current_platform.current_device()
-
-    # copy=True yields tensors that own their memory, staying valid after the
-    # context exits or InstantTensor reuses its buffer.
-    with instanttensor.safe_open(
-        hf_weights_files,
-        framework="pt",
-        device=device,
-        process_group=process_group,
-        copy=True,
-    ) as f:
-        # Track bytes so the bar reports load throughput (GB/s).
-        pbar = tqdm(
-            total=f.total_tensor_size,
-            desc="Loading safetensors using InstantTensor loader",
-            disable=not enable_tqdm(use_tqdm_on_load),
-            bar_format=_BAR_FORMAT,
-            position=tqdm._get_free_pos(),
-            unit="B",
-            unit_scale=True,
-            unit_divisor=1024,
-            mininterval=1.0,
+    stream_files, lazy_files, dropped_files, expected = _split_files_by_skip_registry(
+        hf_weights_files
+    )
+    if lazy_files or dropped_files:
+        logger.info(
+            "InstantTensor streams %d shards; %d shards holding on-disk tensors "
+            "are read lazily with safetensors (%s); %d shards skipped entirely",
+            len(stream_files),
+            len(lazy_files),
+            ", ".join(os.path.basename(f) for f in lazy_files),
+            len(dropped_files),
         )
+
+    yielded: set[str] = set()
+    if stream_files:
         try:
-            for name, tensor in f.tensors():
-                pbar.update(tensor.numel() * tensor.element_size())
-                yield name, tensor
-        finally:
-            pbar.close()
+            world_group = get_world_group()
+        except AssertionError:
+            # Entering here only in unit tests where the world group is not
+            # initialized.
+            process_group = None
+        else:
+            process_group = (
+                world_group.device_group if world_group.world_size > 1 else None
+            )
+
+        device = current_platform.current_device()
+
+        # copy=True yields tensors that own their memory, staying valid after
+        # the context exits or InstantTensor reuses its buffer.
+        with instanttensor.safe_open(
+            stream_files,
+            framework="pt",
+            device=device,
+            process_group=process_group,
+            copy=True,
+        ) as f:
+            # Track bytes so the bar reports load throughput (GB/s).
+            pbar = tqdm(
+                total=f.total_tensor_size,
+                desc="Loading safetensors using InstantTensor loader",
+                disable=not enable_tqdm(use_tqdm_on_load),
+                bar_format=_BAR_FORMAT,
+                position=tqdm._get_free_pos(),
+                unit="B",
+                unit_scale=True,
+                unit_divisor=1024,
+                mininterval=1.0,
+            )
+            try:
+                for name, tensor in f.tensors():
+                    pbar.update(tensor.numel() * tensor.element_size())
+                    yielded.add(name)
+                    yield name, tensor
+            finally:
+                pbar.close()
+
+    if lazy_files:
+        for name, tensor in safetensors_weights_iterator(
+            lazy_files, use_tqdm_on_load, "lazy"
+        ):
+            yielded.add(name)
+            yield name, tensor
+
+    if yielded != expected:
+        missing = sorted(expected - yielded)[:5]
+        unexpected = sorted(yielded - expected)[:5]
+        raise RuntimeError(
+            f"InstantTensor loader yielded {len(yielded)} tensors but the shard "
+            f"headers list {len(expected)} (missing {missing}, unexpected "
+            f"{unexpected})"
+        )
 
 
 def pt_weights_iterator(
