@@ -1305,6 +1305,9 @@ def instanttensor_weights_iterator(
                     yield name, tensor
             finally:
                 pbar.close()
+        # The clones churned through the caching allocator in sizes nothing at
+        # runtime reuses; on unified memory that cache is host memory too.
+        torch.cuda.empty_cache()
 
     if lazy_files:
         for name, tensor in safetensors_weights_iterator(
