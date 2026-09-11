@@ -38,6 +38,7 @@ from vllm.v1.kv_offload.base import (
     OffloadingEvent,
     OffloadKey,
     ReqContext,
+    get_offload_group_idx,
 )
 from vllm.v1.kv_offload.file_mapper import FileMapper
 from vllm.v1.kv_offload.tiering.async_lookup import AsyncLookupManager
@@ -165,6 +166,21 @@ class FileSystemTierManager(SecondaryTierManager):
             "primary_kv_view.strides cannot be None"
         )
         self._block_size: int = primary_kv_view.strides[0]
+        # Bytes persisted per key, by KV cache group. With a packed block
+        # layout and a single valid worker slot (replicated layout or rank-0
+        # relay) a group's KV is the prefix of slot 0, so only that prefix is
+        # written; otherwise the whole CPU row is stored.
+        config = offloading_spec.config
+        single_slot = config.replicated_layout or bool(
+            config.extra_config.get("relay_from_rank0", False)
+        )
+        self._group_bytes: list[int] = [
+            min(group.bytes_per_block, self._block_size)
+            if (config.packed_layout and single_slot and group.bytes_per_block > 0)
+            else self._block_size
+            for group in config.groups
+        ]
+        self._compact = any(n != self._block_size for n in self._group_bytes)
 
         # Opt in; FileMapper enables it only for a parallelism-invariant block.
         self.file_mapper = FileMapper.from_offloading_spec(
@@ -172,16 +188,32 @@ class FileSystemTierManager(SecondaryTierManager):
             offloading_spec=offloading_spec,
             blocks_per_file=offloading_spec.blocks_per_chunk,
             parallel_agnostic=True,
+            group_bytes=self._group_bytes if self._compact else None,
         )
 
-        # Write config file
+        # Write config file; an existing one must describe the same run,
+        # otherwise the directory hash would differ.
         config_path = self.file_mapper.get_config_file_path()
         os.makedirs(os.path.dirname(config_path), exist_ok=True)
+        run_config = self.file_mapper.get_run_config()
         if not os.path.exists(config_path):
             with open(config_path, "w") as f:
-                json.dump(
-                    self.file_mapper.get_run_config(), f, indent=2, sort_keys=True
+                json.dump(run_config, f, indent=2, sort_keys=True)
+        else:
+            with open(config_path) as f:
+                existing = json.load(f)
+            if existing != run_config:
+                raise ValueError(
+                    f"KV offload store {config_path} was written by a different "
+                    "run configuration; refusing to reuse it."
                 )
+        logger.info(
+            "KV offload fs tier at %s: %d groups, bytes per key %s (row %d)",
+            self.file_mapper.base_path,
+            len(self._group_bytes),
+            sorted(set(self._group_bytes)),
+            self._block_size,
+        )
 
         # Prefer O_DIRECT to bypass the page cache, but fall back to buffered
         # I/O on filesystems that reject it (e.g. overlayfs, some NFS mounts)
@@ -202,6 +234,11 @@ class FileSystemTierManager(SecondaryTierManager):
         )
 
         self._lookup_manager = FsAsyncLookupManager(tier=self, tier_type=self.tier_type)
+
+    def _key_sizes(self, keys: list[OffloadKey]) -> int | list[int]:
+        if not self._compact:
+            return self._block_size
+        return [self._group_bytes[get_offload_group_idx(key)] for key in keys]
 
     @override
     def on_new_request(self, req_context: ReqContext) -> RequestOffloadingContext:
@@ -224,7 +261,7 @@ class FileSystemTierManager(SecondaryTierManager):
             [self.file_mapper.get_file_name(key) for key in keys],
             self._primary_kv_view,
             [int(bid) * self._block_size for bid in job_metadata.block_ids],
-            self._block_size,
+            self._key_sizes(keys),
             self._use_o_direct,
         )
         self._pool.enqueue_store(job_metadata.job_id, 1, [task])
@@ -238,6 +275,7 @@ class FileSystemTierManager(SecondaryTierManager):
         self._load_job_keys[job_id] = keys
         paths = [self.file_mapper.get_file_name(key) for key in keys]
         offsets = [int(bid) * self._block_size for bid in job_metadata.block_ids]
+        sizes = self._key_sizes(keys)
 
         def load_task() -> None:
             try:
@@ -245,7 +283,7 @@ class FileSystemTierManager(SecondaryTierManager):
                     paths,
                     self._primary_kv_view,
                     offsets,
-                    self._block_size,
+                    sizes,
                     self._use_o_direct,
                 )
             except OSError as exc:

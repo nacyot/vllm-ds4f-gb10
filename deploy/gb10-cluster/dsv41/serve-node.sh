@@ -88,7 +88,9 @@ if [ "${KVOFF_GIB:-0}" != "0" ]; then
   if [ -n "$KVFS_DIR" ]; then
     mkdir -p "$KVFS_DIR"
     # cpu_bytes_to_use is merged in by VllmConfig from --kv-offloading-size.
-    ARGS+=(--kv-transfer-config "{\"kv_connector\":\"OffloadingConnector\",\"kv_role\":\"kv_both\",\"kv_connector_extra_config\":{\"spec_name\":\"TieringOffloadingSpec\",\"blocks_per_chunk\":1,\"secondary_tiers\":[{\"type\":\"fs\",\"root_dir\":\"$KVFS_DIR\",\"n_read_threads\":16,\"n_write_threads\":16}]}}")
+    # relay_from_rank0: ranks live on 4 nodes, so only rank 0's CPU tier feeds the
+    # fs tier; loads are broadcast from rank 0's GPU (MLA-style KV is TP-replicated).
+    ARGS+=(--kv-transfer-config "{\"kv_connector\":\"OffloadingConnector\",\"kv_role\":\"kv_both\",\"kv_load_failure_policy\":\"recompute\",\"kv_connector_extra_config\":{\"spec_name\":\"TieringOffloadingSpec\",\"blocks_per_chunk\":1,\"relay_from_rank0\":${KV_RELAY:-true},\"secondary_tiers\":[{\"type\":\"fs\",\"root_dir\":\"$KVFS_DIR\",\"n_read_threads\":16,\"n_write_threads\":16}]}}")
   fi
 fi
 # shellcheck disable=SC2206

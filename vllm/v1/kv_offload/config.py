@@ -14,6 +14,10 @@ class OffloadingGroupConfig:
     tokens_per_block: int
     # Layer names belonging to this group.
     layer_names: tuple[str, ...]
+    # Bytes of this group's own KV pages in one block (sum of its layers'
+    # page sizes). In a packed block-outermost layout these occupy the first
+    # ``bytes_per_block`` bytes of the block; 0 when unknown.
+    bytes_per_block: int = 0
 
 
 @dataclass(frozen=True)
@@ -86,3 +90,8 @@ class OffloadingConfig:
     canonical_layout: bool = False
     # Resolved KVCacheLayout name of the worker KV cache.
     kv_cache_layout: str | None = None
+    # True when every KV cache tensor is block-outermost with the shared block
+    # stride (all groups' layers interleaved inside one manager block, e.g.
+    # DeepSeek V4). Then a group's data is the prefix of its block and tiers
+    # may persist only ``bytes_per_block`` of it.
+    packed_layout: bool = False

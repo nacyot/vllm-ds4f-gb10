@@ -49,6 +49,9 @@ def build_offloading_config(
                 parallel_config.decode_context_parallel_size,
             ),
             layer_names=tuple(group.layer_names),
+            bytes_per_block=sum(
+                spec.page_size_bytes for spec in iter_layer_specs(group.kv_cache_spec)
+            ),
         )
         for group in kv_cache_config.kv_cache_groups
     )
@@ -99,11 +102,16 @@ def build_offloading_config(
         blocks_per_chunk = tokens_per_chunk_int // tokens_per_block
 
     worker_kv_bytes_per_block = 0
+    packed_layout = False
     if kv_cache_config.num_blocks > 0 and kv_cache_config.kv_cache_tensors:
         # Every KVCacheTensor describes placement within the same backing allocation,
         # so its size is the total, not a per-tensor share.
         total_gpu_kv_bytes = kv_cache_config.kv_cache_tensors[0].size
         worker_kv_bytes_per_block = total_gpu_kv_bytes // kv_cache_config.num_blocks
+        packed_layout = all(
+            tensor.block_stride == worker_kv_bytes_per_block
+            for tensor in kv_cache_config.kv_cache_tensors
+        )
 
     single_group_spec = (
         kv_cache_config.kv_cache_groups[0].kv_cache_spec
@@ -226,4 +234,5 @@ def build_offloading_config(
         replicated_layout=replicated_layout,
         canonical_layout=canonical_layout,
         kv_cache_layout=vllm_config.cache_config.kv_cache_layout,
+        packed_layout=packed_layout,
     )

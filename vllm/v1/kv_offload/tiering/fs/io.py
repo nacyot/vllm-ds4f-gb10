@@ -87,6 +87,13 @@ def _validate_offsets(view: memoryview, offsets: list[int], block_size: int) -> 
             )
 
 
+def _block_sizes(block_size: int | list[int], count: int) -> list[int]:
+    if isinstance(block_size, int):
+        return [block_size] * count
+    assert len(block_size) == count
+    return list(block_size)
+
+
 def _store_block(
     dest_path: str,
     buffer: memoryview,
@@ -169,52 +176,56 @@ def batch_store_block(
     paths: list[str],
     view: memoryview,
     offsets: list[int],
-    block_size: int,
+    block_size: int | list[int],
     use_o_direct: bool = True,
 ) -> None:
     """
     Store a batch of KV blocks from a shared buffer to disk in one call.
 
-    Each block buffer[offsets[i] : offsets[i]+block_size] is written atomically
-    to dest_paths[i] via a temp-file rename.  Raises on first error.
+    Each block buffer[offsets[i] : offsets[i]+size_i] is written atomically
+    to dest_paths[i] via a temp-file rename, where size_i is ``block_size``
+    or ``block_size[i]`` when a per-block list is given. Raises on first error.
     """
-    _validate_offsets(view, offsets, block_size)
+    sizes = _block_sizes(block_size, len(offsets))
+    _validate_offsets(view, offsets, max(sizes, default=0))
 
     if _HAS_FSIO_C:
         view_B = view.cast("B")
-        view_slices = [view_B[x : x + block_size] for x in offsets]
+        view_slices = [view_B[x : x + n] for x, n in zip(offsets, sizes)]
         tmp_paths = [p + _get_tmp_suffix() for p in paths]
         return batch_store_block_C(tmp_paths, paths, view_slices, use_o_direct)
     else:
-        for path, offset in zip(paths, offsets):
-            _store_block(path, view, offset, block_size, use_o_direct)
+        for path, offset, n in zip(paths, offsets, sizes):
+            _store_block(path, view, offset, n, use_o_direct)
 
 
 def batch_load_block(
     paths: list[str],
     view: memoryview,
     offsets: list[int],
-    block_size: int,
+    block_size: int | list[int],
     use_o_direct: bool = True,
 ) -> None:
     """
     Load a batch of KV blocks from disk into a shared buffer in one call.
 
-    Block i is read from source_paths[i] into view[offsets[i] : offsets[i]+block_size].
+    Block i is read from source_paths[i] into view[offsets[i] : offsets[i]+size_i]
+    (``block_size`` or ``block_size[i]``).
     Raises on first error (see _load_block for the delete-on-short-read policy).
     On failure the raised OSError carries ``num_succeeded`` = the number of
     blocks loaded before the failing one, so the tier can keep them.
     """
-    _validate_offsets(view, offsets, block_size)
+    sizes = _block_sizes(block_size, len(offsets))
+    _validate_offsets(view, offsets, max(sizes, default=0))
 
     if _HAS_FSIO_C:
         view_B = view.cast("B")
-        view_slices = [view_B[x : x + block_size] for x in offsets]
+        view_slices = [view_B[x : x + n] for x, n in zip(offsets, sizes)]
         return batch_load_block_C(paths, view_slices, use_o_direct)
     else:
-        for i, (path, offset) in enumerate(zip(paths, offsets)):
+        for i, (path, offset, n) in enumerate(zip(paths, offsets, sizes)):
             try:
-                _load_block(path, view, offset, block_size, use_o_direct)
+                _load_block(path, view, offset, n, use_o_direct)
             except OSError as exc:
                 # Blocks 0..i-1 loaded fine; record the count for partial keep.
                 # The C path sets the same attribute via PyObject_SetAttrString.
