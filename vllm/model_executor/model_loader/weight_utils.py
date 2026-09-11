@@ -1115,6 +1115,34 @@ def _mem_available_gib() -> float:
     return float("nan")
 
 
+def _instanttensor_ref_trace(name: str, tensor: torch.Tensor) -> None:
+    """Diagnostics (VLLM_INSTANTTENSOR_REF_TRACE=1): who still references a
+    yielded tensor after the consumer returned it."""
+    import gc
+    import sys
+    import types
+
+    refs = []
+    for r in gc.get_referrers(tensor):
+        if isinstance(r, types.FrameType):
+            refs.append(
+                f"frame {r.f_code.co_filename.rsplit('/', 1)[-1]}:{r.f_lineno} "
+                f"{r.f_code.co_name}"
+            )
+        elif isinstance(r, dict):
+            refs.append(f"dict[{len(r)}] keys {list(r)[:3]}")
+        elif isinstance(r, (list, tuple, set)):
+            refs.append(f"{type(r).__name__}[{len(r)}]")
+        else:
+            refs.append(type(r).__name__)
+    logger.warning(
+        "InstantTensor ref trace: %s refcount=%d referrers=%s",
+        name,
+        sys.getrefcount(tensor),
+        refs[:8],
+    )
+
+
 def _instanttensor_mem_check(streamed: int, guard_gib: float) -> None:
     """Log the loader's memory footprint; with a guard, abort before the host
     starves (unified memory: the GPU clones and the page cache share DRAM)."""
@@ -1141,10 +1169,16 @@ def _instanttensor_mem_check(streamed: int, guard_gib: float) -> None:
             torch.cuda.memory_reserved() / 1024**3,
         )
         if avail_after < guard_gib:
-            raise RuntimeError(
-                f"InstantTensor load aborted: MemAvailable {avail_after:.1f} GiB "
-                f"< VLLM_INSTANTTENSOR_MEMAVAIL_MIN_GIB={guard_gib}"
+            # Raising would close the InstantTensor context while the other
+            # ranks sit in its collective and deadlock the boot; exit instead,
+            # the executor tears the engine down when a worker dies.
+            logger.error(
+                "InstantTensor load aborted: MemAvailable %.1f GiB < "
+                "VLLM_INSTANTTENSOR_MEMAVAIL_MIN_GIB=%s",
+                avail_after,
+                guard_gib,
             )
+            os._exit(3)
 
 
 def _split_files_by_skip_registry(
@@ -1278,6 +1312,8 @@ def instanttensor_weights_iterator(
             guard_gib = float(
                 os.environ.get("VLLM_INSTANTTENSOR_MEMAVAIL_MIN_GIB", "0") or 0
             )
+            ref_trace = os.environ.get("VLLM_INSTANTTENSOR_REF_TRACE") == "1"
+            traced = 0
             streamed = 0
             next_check = 0
             try:
@@ -1291,6 +1327,9 @@ def instanttensor_weights_iterator(
                         _instanttensor_mem_check(streamed, guard_gib)
                     yielded.add(name)
                     yield name, tensor
+                    if ref_trace and traced < 6 and nbytes >= (16 << 20):
+                        _instanttensor_ref_trace(name, tensor)
+                        traced += 1
             finally:
                 pbar.close()
 
