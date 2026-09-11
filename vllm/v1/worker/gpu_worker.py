@@ -366,8 +366,13 @@ class Worker(WorkerBase):
                 else None
             )
             if alloc_conf:
-                logger.info("CUDA allocator settings: %s", alloc_conf)
-                torch.cuda.memory._set_allocator_settings(alloc_conf)
+                try:
+                    torch.cuda.memory._set_allocator_settings(alloc_conf)
+                    logger.info("CUDA allocator settings: %s", alloc_conf)
+                except RuntimeError:
+                    logger.warning(
+                        "CUDA allocator settings %r rejected", alloc_conf, exc_info=True
+                    )
             parallel_config = self.parallel_config
             if (
                 parallel_config.distributed_executor_backend
