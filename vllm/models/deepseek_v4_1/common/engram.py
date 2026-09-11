@@ -41,6 +41,7 @@ import os
 import struct
 import time
 import weakref
+from collections import deque
 from concurrent.futures import ThreadPoolExecutor
 
 import numpy as np
@@ -654,6 +655,7 @@ class MmapEngramTable:
         dim: int,
         block_size: int,
         num_threads: int,
+        release_after_steps: int = 0,
     ) -> None:
         index_path = os.path.join(model_dir, "model.safetensors.index.json")
         with open(index_path) as f:
@@ -703,10 +705,16 @@ class MmapEngramTable:
             )
         self.pool = ThreadPoolExecutor(num_threads, thread_name_prefix="engram-mmap")
         self.num_threads = num_threads
+        # Pages of the last `release_after_steps` prefaults, oldest first; a
+        # prefault releases the pages that fall out of the ring unless a
+        # newer step still needs them.
+        self.release_after_steps = release_after_steps
+        self._recent_pages: deque[np.ndarray] = deque()
         self.stats_enabled = os.environ.get("VLLM_ENGRAM_MMAP_STATS", "0") == "1"
         self.stats_calls = 0
         self.stats_rows = 0
         self.stats_pages = 0
+        self.stats_released = 0
         self.stats_seconds = 0.0
 
     def _record_stats(self, num_rows: int, num_pages: int, t0: float) -> None:
@@ -717,11 +725,12 @@ class MmapEngramTable:
         if self.stats_calls % 200 == 0:
             logger.info(
                 "engram mmap %s: %d prefaults, %.1f rows/call, %.1f pages/call, "
-                "%.2f ms/call",
+                "%.1f released/call, %.2f ms/call",
                 os.path.basename(self.path),
                 self.stats_calls,
                 self.stats_rows / self.stats_calls,
                 self.stats_pages / self.stats_calls,
+                self.stats_released / self.stats_calls,
                 1e3 * self.stats_seconds / self.stats_calls,
             )
 
@@ -731,37 +740,77 @@ class MmapEngramTable:
     def scale_address(self, row: int) -> int:
         return self.base + self.scale_offset + row * self.scale_cols
 
-    def prefault(self, rows: np.ndarray) -> None:
-        """Populate the page-table entries for `rows` (global row ids), so
-        the GPU gather that follows finds every page resident."""
-        if rows.size == 0:
-            return
-        t0 = time.perf_counter() if self.stats_enabled else 0.0
+    def _pages_of(self, rows: np.ndarray) -> np.ndarray:
+        """Sorted unique page numbers holding the weight and scale rows."""
         pages = np.concatenate(
             [
                 (self.weight_offset + rows * self.dim) // self.page,
                 (self.scale_offset + rows * self.scale_cols) // self.page,
             ]
         )
-        pages = np.unique(pages)
-        # Coalesce runs of consecutive pages into one madvise each.
+        return np.unique(pages)
+
+    def _run_over_pages(self, pages: np.ndarray, work) -> None:
+        """Call `work(runs)` over runs of consecutive pages, in parallel when
+        there are many runs."""
+        if pages.size == 0:
+            return
         breaks = np.flatnonzero(np.diff(pages) != 1) + 1
         starts = np.concatenate([[0], breaks])
         ends = np.concatenate([breaks, [pages.size]])
         runs = np.stack([pages[starts], pages[ends - 1] - pages[starts] + 1], axis=1)
-        madvise, base, page = self._libc.madvise, self.base, self.page
-
-        def work(chunk: np.ndarray) -> None:
-            for start, length in chunk.tolist():
-                madvise(base + start * page, length * page, _MADV_POPULATE_READ)
-
         if runs.shape[0] <= 64:
             work(runs)
         else:
             splits = np.array_split(runs, min(self.num_threads * 4, runs.shape[0]))
             list(self.pool.map(work, splits))
+
+    def prefault(self, rows: np.ndarray) -> None:
+        """Populate the page-table entries for `rows` (global row ids), so
+        the GPU gather that follows finds every page resident. Then release
+        the pages of the step that falls out of the ring (see
+        `release_after_steps`)."""
+        if rows.size == 0:
+            return
+        t0 = time.perf_counter() if self.stats_enabled else 0.0
+        pages = self._pages_of(rows)
+        madvise, base, page = self._libc.madvise, self.base, self.page
+
+        def populate(chunk: np.ndarray) -> None:
+            for start, length in chunk.tolist():
+                madvise(base + start * page, length * page, _MADV_POPULATE_READ)
+
+        self._run_over_pages(pages, populate)
+        num_released = 0
+        if self.release_after_steps > 0:
+            self._recent_pages.append(pages)
+            if len(self._recent_pages) > self.release_after_steps:
+                old = self._recent_pages.popleft()
+                in_flight = np.unique(np.concatenate(list(self._recent_pages)))
+                num_released = self.release(np.setdiff1d(old, in_flight))
         if self.stats_enabled:
+            self.stats_released += num_released
             self._record_stats(rows.size, pages.size, t0)
+
+    def release(self, pages: np.ndarray) -> int:
+        """Unmap `pages` and drop them from the page cache. Rows still in use
+        by an in-flight step must not be passed: the GPU would then fault
+        them back in through the slow path. Returns the page count."""
+        madvise, fadvise, base, page, fd = (
+            self._libc.madvise,
+            os.posix_fadvise,
+            self.base,
+            self.page,
+            self.fd,
+        )
+
+        def drop(chunk: np.ndarray) -> None:
+            for start, length in chunk.tolist():
+                madvise(base + start * page, length * page, mmap.MADV_DONTNEED)
+                fadvise(fd, start * page, length * page, os.POSIX_FADV_DONTNEED)
+
+        self._run_over_pages(pages, drop)
+        return int(pages.size)
 
 
 class ParallelEngramEmbedding(nn.Module):
@@ -1122,6 +1171,7 @@ class Engram(nn.Module):
                 layout.head_dim,
                 32,
                 engram_config.mmap_prefault_threads,
+                engram_config.mmap_release_after_steps,
             )
         self.embed_tokens = ParallelEngramEmbedding(
             layout.num_embeddings[layer_hash_index],

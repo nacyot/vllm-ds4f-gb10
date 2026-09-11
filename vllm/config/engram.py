@@ -39,6 +39,12 @@ class EngramConfig:
     mmap_prefault_threads: int = 32
     """Threads issuing madvise(MADV_POPULATE_READ) before an mmap lookup."""
 
+    mmap_release_after_steps: int = 3
+    """Drop the pages of the rows prefaulted this many steps ago (madvise
+    MADV_DONTNEED, then posix_fadvise DONTNEED on the shard), so the page
+    cache holds only the last few steps' rows instead of every row ever
+    read; 0 leaves reclaim to the kernel."""
+
     def verify_model_config(self, model_config: "ModelConfig | None") -> None:
         """Reject Engram configuration for models without n-gram embeddings."""
         from vllm.platforms import current_platform

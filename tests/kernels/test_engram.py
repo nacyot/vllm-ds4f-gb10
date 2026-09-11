@@ -4,6 +4,7 @@ import bisect
 import os
 from types import SimpleNamespace
 
+import numpy as np
 import pytest
 import torch
 
@@ -853,7 +854,9 @@ def test_engram_mmap_matches_resident(tp_size, tmp_path, monkeypatch):
         engram_ops, "get_tensor_model_parallel_world_size", lambda: tp_size
     )
     monkeypatch.setattr(ep_weight_filter, "_SKIP_SUFFIXES", set())
-    table = MmapEngramTable(str(tmp_path), 1, dim, 32, num_threads=4)
+    table = MmapEngramTable(
+        str(tmp_path), 1, dim, 32, num_threads=4, release_after_steps=1
+    )
     for rank in range(tp_size):
         monkeypatch.setattr(
             engram_ops, "get_tensor_model_parallel_rank", lambda rank=rank: rank
@@ -875,5 +878,15 @@ def test_engram_mmap_matches_resident(tp_size, tmp_path, monkeypatch):
         mapped.lookup(ids, actual)
         torch.testing.assert_close(actual, expected, rtol=0, atol=0)
         assert len(list(mapped.parameters())) == 0
+        # Releasing the rows (ring of one step: the next prefault drops the
+        # previous step's pages) and reading them again yields the same rows.
+        torch.cuda.synchronize()
+        other = ids.roll(1, dims=0)
+        mapped.prefault(other)
+        assert table.release(table._pages_of(np.arange(num_rows))) > 0
+        actual.zero_()
+        mapped.prefault(ids)
+        mapped.lookup(ids, actual)
+        torch.testing.assert_close(actual, expected, rtol=0, atol=0)
     names = [name for name, _ in safetensors_weights_iterator([str(shard)], False)]
     assert names == ["layers.1.engram.q_weight"]
