@@ -3,7 +3,10 @@
 TTFT, answer correctness and the prefix-cache / kv_offload counter deltas.
 Used for the concurrent cold-restore test after a server restart.
 
-Usage: kvoff_concurrent.py <tag> <n> <records_per_prompt> [salt_prefix]
+Usage: kvoff_concurrent.py <tag> <n> <records_per_prompt> [salt_prefix|salt,salt,...]
+
+A comma-separated fourth argument names the salts explicitly (e.g. sessions
+stored earlier), and then n is the number of those salts to use.
 """
 
 import json
@@ -15,10 +18,11 @@ from kvoff_probe import metrics, run_prompt
 
 tag, n, nrec = sys.argv[1], int(sys.argv[2]), int(sys.argv[3])
 prefix = sys.argv[4] if len(sys.argv) > 4 else "S"
+salts = prefix.split(",")[:n] if "," in prefix else [f"{prefix}{i}" for i in range(n)]
 m0 = metrics()
 t0 = time.perf_counter()
-with ThreadPoolExecutor(n) as ex:
-    results = list(ex.map(lambda i: run_prompt(f"{prefix}{i}", nrec), range(n)))
+with ThreadPoolExecutor(len(salts)) as ex:
+    results = list(ex.map(lambda salt: run_prompt(salt, nrec), salts))
 wall = time.perf_counter() - t0
 time.sleep(2)
 m1 = metrics()
