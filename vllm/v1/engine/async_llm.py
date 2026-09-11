@@ -190,6 +190,7 @@ class AsyncLLM(EngineClient):
         except RuntimeError:
             pass
 
+        self.profiler: TorchProfilerWrapper | None = None
         if (
             vllm_config.profiler_config.profiler == "torch"
             and not vllm_config.profiler_config.ignore_frontend
