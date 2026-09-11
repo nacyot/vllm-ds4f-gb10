@@ -1186,13 +1186,28 @@ def _instanttensor_live_tensor_dump() -> None:
         torch.cuda.memory_allocated() / 1024**3,
     )
     for t in samples:
+        referrers = [r for r in gc.get_referrers(t) if r is not samples]
         logger.error(
             "  other %s %s %.0f MiB referrers=%s",
             tuple(t.shape),
             t.dtype,
             t.numel() * t.element_size() / 1024**2,
-            [describe(r) for r in gc.get_referrers(t)][:6],
+            [describe(r) for r in referrers][:6],
         )
+        for r in referrers:
+            if isinstance(r, tuple) and len(r) == 2:
+                head = r[0] if isinstance(r[0], str) else repr(r[0])[:80]
+                holders = [
+                    describe(h) for h in gc.get_referrers(r) if h is not referrers
+                ]
+                logger.error(
+                    "    tuple(%r, tensor) held by %s", head[:100], holders[:6]
+                )
+                for h in gc.get_referrers(r):
+                    if isinstance(h, (list, dict)) and h is not referrers:
+                        owners = [describe(o) for o in gc.get_referrers(h)][:6]
+                        logger.error("      %s owned by %s", describe(h), owners)
+                        break
 
 
 def _instanttensor_mem_check(streamed: int, guard_gib: float) -> None:
