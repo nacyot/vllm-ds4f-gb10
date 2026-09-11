@@ -71,6 +71,21 @@ class Transfer:
     batch_src: torch.Tensor
     batch_dst: torch.Tensor
     batch_sizes: torch.Tensor
+    # Relay staging (GPU buffer + pinned pointer table), returned to the pool
+    # once the transfer completes.
+    relay_buffers: tuple[torch.Tensor, torch.Tensor] | None = None
+
+
+class RelayConfig(NamedTuple):
+    """Rank-0 relay for multi-node TP: only the source rank copies KV between
+    its CPU tier and the GPU; loads are broadcast from its GPU to the other
+    ranks over a dedicated process group, stores on other ranks are no-ops.
+    Valid only when every rank holds identical KV (MLA-style caches)."""
+
+    group: torch.distributed.ProcessGroup
+    source_global_rank: int
+    is_source: bool
+    window_bytes: int = 256 << 20
 
 
 def compute_sub_block_ptrs(
@@ -249,6 +264,7 @@ class SingleDirectionOffloadingHandler:
         layer_refs_per_group: list[list[CanonicalKVCacheRef]],
         gpu_to_cpu: bool,
         canonical_layout: bool = False,
+        relay: RelayConfig | None = None,
     ):
         """
         Initialize a SingleDirectionOffloadingHandler.
@@ -263,6 +279,7 @@ class SingleDirectionOffloadingHandler:
             gpu_to_cpu: if True, transfer from GPU to CPU; otherwise CPU to GPU.
             canonical_layout: if True, CPU pages use the canonical layout
                 described by the refs' mappings.
+            relay: rank-0 relay configuration (see RelayConfig), or None.
         """
         assert len(gpu_tensors) == len(cpu_tensors)
         assert len(gpu_tensors) > 0
@@ -335,6 +352,9 @@ class SingleDirectionOffloadingHandler:
         self._event_pool: list[torch.Event] = []
         # list of pinned descriptor buffer sets available for re-use
         self._buffer_pool: list[tuple[torch.Tensor, torch.Tensor, torch.Tensor]] = []
+        self._relay = relay
+        # (GPU staging buffer, pinned pointer table) sets available for re-use
+        self._relay_pool: list[tuple[torch.Tensor, torch.Tensor]] = []
 
     def _estimate_max_copy_ops(self, group_sizes: Sequence[int]) -> int:
         """Upper bound on the number of copy descriptors for a transfer.
@@ -653,15 +673,31 @@ class SingleDirectionOffloadingHandler:
         # writing; we must keep STREAM ordering so source reads are gated
         # by the transfer stream's wait_stream(compute) barrier.
         is_src_access_order_any = not self.gpu_to_cpu
+        relay_buffers: tuple[torch.Tensor, torch.Tensor] | None = None
         with current_platform.stream(stream):
             start_event.record(stream)
-            if op_idx > 0:
+            if op_idx > 0 and self._relay is None:
                 self._swap_blocks_batch(
                     src,
                     dst,
                     sizes,
                     is_src_access_order_any=is_src_access_order_any,
                 )
+            elif op_idx > 0 and self.gpu_to_cpu:
+                # Relay store: only the source rank's CPU tier is read by the
+                # scheduler-side tiers, other ranks skip the copy.
+                assert self._relay is not None
+                if self._relay.is_source:
+                    self._swap_blocks_batch(
+                        src,
+                        dst,
+                        sizes,
+                        is_src_access_order_any=is_src_access_order_any,
+                    )
+                else:
+                    num_transfer_bytes = 0
+            elif op_idx > 0:
+                relay_buffers = self._relay_load(src, dst, sizes, all_sizes[:op_idx])
             end_event.record(stream)
 
         self._transfer_events[job_id] = end_event
@@ -675,11 +711,73 @@ class SingleDirectionOffloadingHandler:
                 batch_src=batch_src,
                 batch_dst=batch_dst,
                 batch_sizes=batch_sizes,
+                relay_buffers=relay_buffers,
             )
         )
 
         # success
         return True
+
+    def _relay_load(
+        self,
+        src: torch.Tensor,
+        dst: torch.Tensor,
+        sizes: torch.Tensor,
+        sizes_np: np.ndarray,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """CPU->GPU load with rank-0 relay, on the current (transfer) stream.
+
+        The source rank copies CPU->GPU as usual, gathers the destination
+        pages into a contiguous GPU staging buffer and broadcasts it; the other
+        ranks receive the staging buffer and scatter it to their own pages.
+        Descriptors are identical on every rank because all workers see the
+        same transfer spec. Windows bound the staging memory."""
+        assert self._relay is not None
+        relay = self._relay
+        num_ops = len(sizes_np)
+        total = int(sizes_np.sum())
+        staging, stage_ptrs = (
+            self._relay_pool.pop() if self._relay_pool else (None, None)
+        )
+        window = min(total, relay.window_bytes)
+        if staging is None or staging.numel() < window:
+            staging = torch.empty(window, dtype=torch.uint8, device="cuda")
+        if stage_ptrs is None or stage_ptrs.numel() < num_ops:
+            stage_ptrs = torch.empty(num_ops, dtype=torch.int64, pin_memory=PIN_MEMORY)
+        # Pointer table: staging base + running offset, restarted per window.
+        offsets = np.cumsum(sizes_np, dtype=np.int64) - sizes_np
+        ptrs_np = stage_ptrs.numpy()
+        base = staging.data_ptr()
+        start = 0
+        while start < num_ops:
+            end = start
+            window_start = int(offsets[start])
+            while end < num_ops and int(
+                offsets[end] + sizes_np[end]
+            ) - window_start <= (relay.window_bytes):
+                end += 1
+            assert end > start, "a single page exceeds the relay window"
+            ptrs_np[start:end] = base + (offsets[start:end] - window_start)
+            window_bytes = int(offsets[end - 1] + sizes_np[end - 1]) - window_start
+            if relay.is_source:
+                self._swap_blocks_batch(
+                    src[start:end],
+                    dst[start:end],
+                    sizes[start:end],
+                    is_src_access_order_any=True,
+                )
+                ops.swap_blocks_batch(
+                    dst[start:end], stage_ptrs[start:end], sizes[start:end]
+                )
+            torch.distributed.broadcast(
+                staging[:window_bytes], src=relay.source_global_rank, group=relay.group
+            )
+            if not relay.is_source:
+                ops.swap_blocks_batch(
+                    stage_ptrs[start:end], dst[start:end], sizes[start:end]
+                )
+            start = end
+        return staging, stage_ptrs
 
     def get_finished(self) -> list[TransferResult]:
         results: list[TransferResult] = []
@@ -702,6 +800,8 @@ class SingleDirectionOffloadingHandler:
             self._buffer_pool.append(
                 (transfer.batch_src, transfer.batch_dst, transfer.batch_sizes)
             )
+            if transfer.relay_buffers is not None:
+                self._relay_pool.append(transfer.relay_buffers)
             del self._transfer_events[transfer.job_id]
         return results
 
@@ -739,6 +839,23 @@ class SingleDirectionOffloadingHandler:
             raise sync_error
 
 
+def _make_relay_config() -> RelayConfig | None:
+    """Build the rank-0 relay over the tensor-parallel ranks, or None when the
+    TP group is a single rank. A dedicated NCCL group keeps the relay's
+    collectives ordered independently of the model's communicator."""
+    from vllm.distributed.parallel_state import get_tp_group
+
+    tp = get_tp_group()
+    if tp.world_size <= 1:
+        return None
+    group = torch.distributed.new_group(ranks=list(tp.ranks), backend="nccl")
+    return RelayConfig(
+        group=group,
+        source_global_rank=tp.ranks[0],
+        is_source=tp.rank_in_group == 0,
+    )
+
+
 class CPUOffloadingWorker(OffloadingWorker):
     """OffloadingWorker for CPU offloading.
 
@@ -754,8 +871,16 @@ class CPUOffloadingWorker(OffloadingWorker):
         num_cpu_blocks: int,
         mmap_region: SharedOffloadRegion | None = None,
         canonical_layout: bool = False,
+        relay_from_rank0: bool = False,
     ):
         assert not canonical_layout or mmap_region is not None
+        relay = _make_relay_config() if relay_from_rank0 else None
+        if relay is not None:
+            logger.info(
+                "KV offload relay enabled: rank %d is %s",
+                torch.distributed.get_rank(),
+                "the source" if relay.is_source else "a receiver",
+            )
         # The caller owns mmap_region until this constructor returns. After a
         # successful construction, the worker is the sole owner and releases
         # it after both transfer directions have stopped.
@@ -813,6 +938,7 @@ class CPUOffloadingWorker(OffloadingWorker):
             layer_refs_per_group=kv_caches.group_data_refs,
             gpu_to_cpu=True,
             canonical_layout=canonical_layout,
+            relay=relay,
         )
 
         self._load_handler = SingleDirectionOffloadingHandler(
@@ -822,6 +948,7 @@ class CPUOffloadingWorker(OffloadingWorker):
             layer_refs_per_group=kv_caches.group_data_refs,
             gpu_to_cpu=False,
             canonical_layout=canonical_layout,
+            relay=relay,
         )
 
     def submit_store(

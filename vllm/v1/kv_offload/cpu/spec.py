@@ -133,6 +133,11 @@ class CPUOffloadingSpec(OffloadingSpec):
         self._worker: CPUOffloadingWorker | None = None
 
         self.eviction_policy: str = self.extra_config.get("eviction_policy", "lru")
+        # Multi-node TP: only rank 0's CPU tier is visible to the scheduler-side
+        # tiers, so loads are broadcast from rank 0's GPU to the other ranks.
+        self.relay_from_rank0: bool = bool(
+            self.extra_config.get("relay_from_rank0", False)
+        )
         self.cache_policy_module_path: str | None = self.extra_config.get(
             "cache_policy_module_path"
         )
@@ -190,6 +195,7 @@ class CPUOffloadingSpec(OffloadingSpec):
                 blocks_per_chunk=self.blocks_per_chunk,
                 num_cpu_blocks=self.num_blocks,
                 mmap_region=mmap_region,
+                relay_from_rank0=self.relay_from_rank0,
             )
         except Exception:
             if mmap_region is not None:
