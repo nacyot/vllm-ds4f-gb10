@@ -10,7 +10,8 @@ To implement non-causal attention, we leverage the sparse attention implementati
 include the future query tokens in the top-k indices for each query token.
 """
 
-from collections.abc import Iterable
+import os
+from collections.abc import Callable, Iterable
 
 import regex as re
 import torch
@@ -38,7 +39,10 @@ from vllm.model_executor.layers.vocab_parallel_embedding import (
     ParallelLMHead,
     VocabParallelEmbedding,
 )
-from vllm.model_executor.model_loader.weight_utils import default_weight_loader
+from vllm.model_executor.model_loader.weight_utils import (
+    default_weight_loader,
+    safetensors_files_holding,
+)
 from vllm.model_executor.models.qwen3_dspark import (
     DSparkConfidenceHead,
     DSparkMarkovHead,
@@ -296,6 +300,33 @@ def _insert_context_kv(
         )
 
 
+def _dspark_checkpoint_files(
+    model_dir: str | None, accepts: Callable[[str], bool]
+) -> list[str] | None:
+    """Exact shard filenames holding the tensors this draft loads.
+
+    The default loader opens every shard and materializes every tensor before
+    load_weights drops the names it does not want, so a folded draft re-reads
+    the whole target checkpoint. Read model.safetensors.index.json once and
+    hand the loader only the shards holding accepted names; the tensors read,
+    and their values, are unchanged. None keeps the full scan (no local index,
+    or DSPARK_DRAFT_PRUNE=0).
+    """
+    if os.environ.get("DSPARK_DRAFT_PRUNE", "1") != "1":
+        return None
+    if not isinstance(model_dir, str):
+        return None
+    files = safetensors_files_holding(model_dir, accepts)
+    if not files:
+        return None
+    logger.info(
+        "DSpark draft loader: restricting the checkpoint scan to %d shards (%s)",
+        len(files),
+        ", ".join(files),
+    )
+    return files
+
+
 class DSparkDeepseekV4ForCausalLM(nn.Module):
     # Draft weights ship in the target checkpoint (mtp.*) without embed/head, so
     # load_dspark_model always aliases the target's.
@@ -326,6 +357,12 @@ class DSparkDeepseekV4ForCausalLM(nn.Module):
             prefix=maybe_prefix(prefix, "lm_head"),
         )
         self.logits_processor = LogitsProcessor(self.config.vocab_size)
+        # Read by DefaultModelLoader.get_all_weights (exact filenames, unioned);
+        # _remap_dspark_name is the definition of the names this draft loads.
+        self.allow_patterns_overrides = _dspark_checkpoint_files(
+            self.draft_model_config.model,
+            lambda name: self._remap_dspark_name(name) is not None,
+        )
 
     # --- Hooks used by the speculator -------------------------------------
 
