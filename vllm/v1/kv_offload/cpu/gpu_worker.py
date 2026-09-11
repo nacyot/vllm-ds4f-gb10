@@ -10,7 +10,6 @@ from typing import NamedTuple
 
 import numpy as np
 import torch
-
 from vllm import _custom_ops as ops
 from vllm.logger import init_logger
 from vllm.platforms import current_platform
@@ -867,6 +866,12 @@ def _make_relay_config() -> RelayConfig | None:
     if tp.world_size <= 1:
         return None
     group = torch.distributed.new_group(ranks=list(tp.ranks), backend="nccl")
+    # The first collective on a new NCCL group pays the connection setup
+    # (about 14 s across four RoCE nodes); take it at init, not on the first
+    # restore.
+    probe = torch.zeros(1, dtype=torch.uint8, device="cuda")
+    torch.distributed.broadcast(probe, src=tp.ranks[0], group=group)
+    torch.cuda.synchronize()
     return RelayConfig(
         group=group,
         source_global_rank=tp.ranks[0],
