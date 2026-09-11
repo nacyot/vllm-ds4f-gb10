@@ -27,7 +27,7 @@ case $CMD in
     echo "dsv41 TP=4 launched (head $HEAD :${PORT:-8889})";;
   stop)
     for h in "${ALL[@]}"; do $SSH "nacyot@$h" "$PRE; systemctl --user stop dsv41-serve.service 2>/dev/null; pkill -TERM -f 'serve-node.sh|[v]llm serve.*DeepSeek-V4.1' 2>/dev/null; true"; done
-    sleep 6; for h in "${ALL[@]}"; do $SSH "nacyot@$h" "pkill -KILL -f '[v]llm serve.*DeepSeek-V4.1|[V]LLM::|[E]ngineCore' 2>/dev/null; rm -f /dev/shm/sem.mp-* /dev/shm/psm_* 2>/dev/null; true"; done
+    sleep 6; for h in "${ALL[@]}"; do $SSH "nacyot@$h" "pkill -KILL -f '[v]llm serve.*DeepSeek-V4.1|[V]LLM::|[E]ngineCore' 2>/dev/null; rm -f /dev/shm/sem.mp-* /dev/shm/psm_* /dev/shm/vllm_offload_*.mmap 2>/dev/null; true"; done
     echo "dsv41 stopped";;
   status)
     for h in "${ALL[@]}"; do printf "%s r%s: " "$h" "${RANK[$h]}"; $SSH "nacyot@$h" "export XDG_RUNTIME_DIR=/run/user/\$(id -u); systemctl --user is-active dsv41-serve.service 2>/dev/null | tr '\n' ' '; free -g | awk 'NR==2{print \"used\",\$3,\"GiB avail\",\$7,\"GiB\"}'"; done
