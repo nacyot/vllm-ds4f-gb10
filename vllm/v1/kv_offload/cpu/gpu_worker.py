@@ -10,6 +10,7 @@ from typing import NamedTuple
 
 import numpy as np
 import torch
+
 from vllm import _custom_ops as ops
 from vllm.logger import init_logger
 from vllm.platforms import current_platform
