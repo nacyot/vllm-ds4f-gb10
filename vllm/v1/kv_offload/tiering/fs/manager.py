@@ -31,6 +31,7 @@ except ImportError:
 from typing_extensions import override
 
 from vllm.logger import init_logger
+from vllm.utils.math_utils import round_up
 from vllm.v1.kv_offload.base import (
     Locality,
     LookupResult,
@@ -61,6 +62,8 @@ if TYPE_CHECKING:
     from vllm.v1.kv_offload.base import OffloadingSpec
 
 logger = init_logger(__name__)
+
+_O_DIRECT_ALIGN = 4096
 
 
 class FsAsyncLookupManager(AsyncLookupManager):
@@ -174,8 +177,9 @@ class FileSystemTierManager(SecondaryTierManager):
         single_slot = config.replicated_layout or bool(
             config.extra_config.get("relay_from_rank0", False)
         )
+        # O_DIRECT needs page-multiple lengths; the CPU row is page aligned.
         self._group_bytes: list[int] = [
-            min(group.bytes_per_block, self._block_size)
+            min(round_up(group.bytes_per_block, _O_DIRECT_ALIGN), self._block_size)
             if (config.packed_layout and single_slot and group.bytes_per_block > 0)
             else self._block_size
             for group in config.groups
@@ -208,10 +212,9 @@ class FileSystemTierManager(SecondaryTierManager):
                     "run configuration; refusing to reuse it."
                 )
         logger.info(
-            "KV offload fs tier at %s: %d groups, bytes per key %s (row %d)",
+            "KV offload fs tier at %s: bytes per key by group %s (row %d)",
             self.file_mapper.base_path,
-            len(self._group_bytes),
-            sorted(set(self._group_bytes)),
+            self._group_bytes,
             self._block_size,
         )
 

@@ -336,6 +336,37 @@ def test_worker_kv_bytes_preserves_tensor_layout(packed: bool):
     assert offloading_config.cache.blocks_per_chunk == 2
 
 
+def test_packed_layout_and_group_bytes():
+    """Block-outermost packing (all layers inside one manager block) is
+    detected from the tensor strides, and a group's bytes_per_block is one
+    page per layer regardless of how the group spec is represented."""
+    num_blocks = 4
+    spec = FullAttentionSpec(
+        block_size=16, num_kv_heads=1, head_size=1, dtype=torch.float32
+    )
+    page = spec.page_size_bytes
+    packed = KVCacheConfig(
+        num_blocks=num_blocks,
+        kv_cache_tensors=[
+            KVCacheTensor(
+                size=2 * page * num_blocks,
+                layers=["layer0", "layer1"],
+                layer_stride=page,
+                block_stride=2 * page,
+            )
+        ],
+        kv_cache_groups=[KVCacheGroupSpec(["layer0", "layer1"], spec)],
+    )
+    offloading_config = build_offloading_config(_make_vllm_config(), packed)
+    assert offloading_config.packed_layout
+    assert offloading_config.groups[0].bytes_per_block == 2 * page
+
+    layer_outer = _make_sizing_kv_cache_config(packed=False)
+    offloading_config = build_offloading_config(_make_vllm_config(), layer_outer)
+    assert not offloading_config.packed_layout
+    assert offloading_config.groups[0].bytes_per_block == 2 * page
+
+
 def test_zero_blocks_skips_tensor_layout_validation():
     kv_cache_config = _make_sizing_kv_cache_config(packed=False)
     kv_cache_config.num_blocks = 0

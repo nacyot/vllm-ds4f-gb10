@@ -11,10 +11,12 @@ from vllm.v1.core.kv_cache_utils import (
 from vllm.v1.kv_cache_interface import (
     AttentionSpec,
     FullAttentionSpec,
+    KVCacheGroupSpec,
     KVCacheSpec,
     MLAAttentionSpec,
     SlidingWindowMLASpec,
     SlidingWindowSpec,
+    UniformTypeKVCacheSpecs,
     iter_layer_specs,
 )
 from vllm.v1.kv_offload.config import (
@@ -28,6 +30,18 @@ from vllm.v1.kv_offload.config import (
 if TYPE_CHECKING:
     from vllm.config import VllmConfig
     from vllm.v1.kv_cache_interface import KVCacheConfig
+
+
+def _group_bytes_per_block(group: KVCacheGroupSpec) -> int:
+    """Bytes of the group's own pages in one block: one page per layer.
+
+    ``UniformTypeKVCacheSpecs`` carries a spec per layer; any other spec
+    describes every layer of the group.
+    """
+    spec = group.kv_cache_spec
+    if isinstance(spec, UniformTypeKVCacheSpecs):
+        return sum(s.page_size_bytes for s in spec.kv_cache_specs.values())
+    return spec.page_size_bytes * len(group.layer_names)
 
 
 def build_offloading_config(
@@ -49,9 +63,7 @@ def build_offloading_config(
                 parallel_config.decode_context_parallel_size,
             ),
             layer_names=tuple(group.layer_names),
-            bytes_per_block=sum(
-                spec.page_size_bytes for spec in iter_layer_specs(group.kv_cache_spec)
-            ),
+            bytes_per_block=_group_bytes_per_block(group),
         )
         for group in kv_cache_config.kv_cache_groups
     )
