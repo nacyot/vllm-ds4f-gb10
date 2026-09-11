@@ -1143,6 +1143,58 @@ def _instanttensor_ref_trace(name: str, tensor: torch.Tensor) -> None:
     )
 
 
+def _instanttensor_live_tensor_dump() -> None:
+    """Diagnostics: the CUDA tensors Python still tracks when the guard trips,
+    split into parameters and everything else, with sample referrers."""
+    import gc
+    import types
+
+    def describe(r) -> str:
+        if isinstance(r, types.FrameType):
+            return (
+                f"frame {r.f_code.co_filename.rsplit('/', 1)[-1]}:{r.f_lineno} "
+                f"{r.f_code.co_name}"
+            )
+        if isinstance(r, dict):
+            return f"dict[{len(r)}] {list(r)[:3]}"
+        if isinstance(r, (list, tuple, set)):
+            return f"{type(r).__name__}[{len(r)}]"
+        return type(r).__name__
+
+    params = others = 0
+    param_bytes = other_bytes = 0
+    samples: list[torch.Tensor] = []
+    for obj in gc.get_objects():
+        if not isinstance(obj, torch.Tensor) or not obj.is_cuda:
+            continue
+        nbytes = obj.numel() * obj.element_size()
+        if isinstance(obj, torch.nn.Parameter):
+            params += 1
+            param_bytes += nbytes
+        else:
+            others += 1
+            other_bytes += nbytes
+            if nbytes >= (16 << 20) and len(samples) < 6:
+                samples.append(obj)
+    logger.error(
+        "InstantTensor live CUDA tensors: %d parameters %.1f GiB, %d others "
+        "%.1f GiB (torch allocated %.1f GiB)",
+        params,
+        param_bytes / 1024**3,
+        others,
+        other_bytes / 1024**3,
+        torch.cuda.memory_allocated() / 1024**3,
+    )
+    for t in samples:
+        logger.error(
+            "  other %s %s %.0f MiB referrers=%s",
+            tuple(t.shape),
+            t.dtype,
+            t.numel() * t.element_size() / 1024**2,
+            [describe(r) for r in gc.get_referrers(t)][:6],
+        )
+
+
 def _instanttensor_mem_check(streamed: int, guard_gib: float) -> None:
     """Log the loader's memory footprint; with a guard, abort before the host
     starves (unified memory: the GPU clones and the page cache share DRAM)."""
@@ -1169,6 +1221,7 @@ def _instanttensor_mem_check(streamed: int, guard_gib: float) -> None:
             torch.cuda.memory_reserved() / 1024**3,
         )
         if avail_after < guard_gib:
+            _instanttensor_live_tensor_dump()
             # Raising would close the InstantTensor context while the other
             # ranks sit in its collective and deadlock the boot; exit instead,
             # the executor tears the engine down when a worker dies.
@@ -1316,6 +1369,7 @@ def instanttensor_weights_iterator(
             traced = 0
             streamed = 0
             next_check = 0
+            next_guard = 0
             try:
                 for name, tensor in f.tensors():
                     nbytes = tensor.numel() * tensor.element_size()
@@ -1324,7 +1378,12 @@ def instanttensor_weights_iterator(
                     if streamed >= next_check:
                         step = 2 << 30 if streamed < (32 << 30) else 16 << 30
                         next_check = streamed + step
+                        next_guard = streamed
                         _instanttensor_mem_check(streamed, guard_gib)
+                    elif guard_gib and streamed >= next_guard:
+                        next_guard = streamed + (256 << 20)
+                        if _mem_available_gib() < guard_gib:
+                            _instanttensor_mem_check(streamed, guard_gib)
                     yielded.add(name)
                     yield name, tensor
                     if ref_trace and traced < 6 and nbytes >= (16 << 20):
