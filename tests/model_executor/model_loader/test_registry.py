@@ -199,6 +199,20 @@ def test_draft_load_config_modes(monkeypatch):
         _instanttensor_draft_load_config(vllm_config, draft, None)
 
 
+def test_draft_load_config_keeps_the_target_when_the_draft_aliases_it(
+    monkeypatch,
+):
+    # ngram/suffix set draft_model_config = target_model_config: loading the
+    # target through get_model must not be rerouted to safetensors.
+    monkeypatch.delenv("INSTANTTENSOR_DRAFT_LOADER", raising=False)
+    vllm_config, target, _ = _spec_configs()
+    vllm_config.speculative_config.draft_model_config = target
+    assert (
+        _instanttensor_draft_load_config(vllm_config, target, None)
+        is vllm_config.load_config
+    )
+
+
 def test_draft_load_config_is_a_noop_without_instanttensor(monkeypatch):
     monkeypatch.delenv("INSTANTTENSOR_DRAFT_LOADER", raising=False)
     vllm_config, _, draft = _spec_configs()

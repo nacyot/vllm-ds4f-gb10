@@ -157,6 +157,11 @@ def _instanttensor_draft_load_config(
     draft_model_config = getattr(speculative_config, "draft_model_config", None)
     if draft_model_config is None or model_config is not draft_model_config:
         return effective
+    if draft_model_config is vllm_config.model_config:
+        # Methods without a draft model (ngram, suffix) alias the target
+        # config: a caller loading the target through get_model must keep
+        # InstantTensor.
+        return effective
 
     if mode == "auto":
         target_model_config = (
