@@ -356,6 +356,18 @@ class Worker(WorkerBase):
         if self.device_config.device_type == "cuda":
             # This env var set by Ray causes exceptions with graph building.
             os.environ.pop("NCCL_ASYNC_ERROR_HANDLING", None)
+            # --additional-config '{"cuda_alloc_conf": "expandable_segments:True"}'
+            # applies allocator settings before the first allocation (the
+            # launcher's environment does not reach this process reliably).
+            additional_config = self.vllm_config.additional_config
+            alloc_conf = (
+                additional_config.get("cuda_alloc_conf")
+                if isinstance(additional_config, dict)
+                else None
+            )
+            if alloc_conf:
+                logger.info("CUDA allocator settings: %s", alloc_conf)
+                torch.cuda.memory._set_allocator_settings(alloc_conf)
             parallel_config = self.parallel_config
             if (
                 parallel_config.distributed_executor_backend
