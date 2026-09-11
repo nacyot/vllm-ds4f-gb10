@@ -136,6 +136,53 @@ def maybe_rocm_profiling_fallback(profile_result: MemoryProfilingResult) -> int 
     return torch_reserved
 
 
+def _maybe_write_state_digest(worker: "Worker") -> None:
+    """Validation boots only: per-tensor sha256 of the loaded target and draft
+    state_dict (DSPARK_STATE_DIGEST=<path prefix>, one file per rank), to
+    prove a loader change left every value untouched."""
+    prefix = os.environ.get("DSPARK_STATE_DIGEST")
+    if not prefix:
+        return
+    import hashlib
+
+    t0 = time.perf_counter()
+    path = f"{prefix}-rank{worker.rank}.txt"
+    os.makedirs(os.path.dirname(os.path.abspath(path)), exist_ok=True)
+    # Hash through bounded host copies: a fused expert tensor is several GiB
+    # and the ranks have little memory to spare after loading.
+    chunk = 64 << 20
+    models = [("target", worker.model_runner.get_model())]
+    get_draft_model = getattr(worker.model_runner, "get_draft_model", None)
+    if get_draft_model is not None:
+        models.append(("draft", get_draft_model()))
+    total = hashlib.sha256()
+    n = 0
+    with open(path, "w") as f:
+        for tag, model in models:
+            if model is None:
+                continue
+            for name, t in model.state_dict().items():
+                if not isinstance(t, torch.Tensor) or t.numel() == 0:
+                    continue
+                flat = t.detach().reshape(-1).contiguous().view(torch.uint8)
+                h = hashlib.sha256()
+                for start in range(0, flat.numel(), chunk):
+                    h.update(flat[start : start + chunk].cpu().numpy().tobytes())
+                line = f"{tag} {name} {tuple(t.shape)} {t.dtype} {h.hexdigest()}\n"
+                f.write(line)
+                total.update(line.encode())
+                n += 1
+        f.write(f"TOTAL tensors={n} sha256={total.hexdigest()}\n")
+    logger.info(
+        "State digest rank=%d tensors=%d sha256=%s written to %s in %.1fs",
+        worker.rank,
+        n,
+        total.hexdigest()[:16],
+        path,
+        time.perf_counter() - t0,
+    )
+
+
 if TYPE_CHECKING:
     from vllm.device_allocator.sleep_mode_backend import SleepModeBackend
     from vllm.model_executor.model_loader.tensorizer import TensorizerConfig
@@ -923,6 +970,8 @@ class Worker(WorkerBase):
             )
 
             trigger_inductor_lazy_init(self.device)
+
+        _maybe_write_state_digest(self)
 
         # All warmup is done — start monitoring for unexpected JIT
         # compilations that would cause latency spikes during inference.
