@@ -162,7 +162,7 @@ def _maybe_write_state_digest(worker: "Worker") -> None:
             if model is None:
                 continue
             for name, t in model.state_dict().items():
-                if not isinstance(t, torch.Tensor) or t.numel() == 0:
+                if not isinstance(t, torch.Tensor) or t.is_meta or t.numel() == 0:
                     continue
                 flat = t.detach().reshape(-1).contiguous().view(torch.uint8)
                 h = hashlib.sha256()
