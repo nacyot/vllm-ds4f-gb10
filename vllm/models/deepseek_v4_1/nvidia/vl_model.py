@@ -83,6 +83,20 @@ class DeepseekV4VLImagePixelInputs(TensorSchema):
     types: Annotated[torch.Tensor, TensorShape("ns", dynamic_dims={"ns"})]
 
 
+def _route_language_weights(
+    weights: Iterable[tuple[str, torch.Tensor]],
+    prefix: str,
+    rest: list[tuple[str, torch.Tensor]],
+) -> Iterable[tuple[str, torch.Tensor]]:
+    """Yield the weights under *prefix* (name stripped) as they stream by;
+    collect every other weight into *rest* for the wrapper's own loader."""
+    for name, weight in weights:
+        if name.startswith(prefix):
+            yield name[len(prefix) :], weight
+        else:
+            rest.append((name, weight))
+
+
 def _make_deepseek_v4_vl_weights_mapper(
     expert_dtype: str, linear_scale_name: str
 ) -> WeightsMapper:
@@ -336,14 +350,23 @@ class DeepseekV41ForCausalLM(nn.Module, SupportsMultiModal, SupportsPP, Supports
         return self.language_model.get_mtp_target_hidden_states()
 
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
-        # Map HF names into this wrapper's namespace up front and sort, so
-        # the "language_model." group reaches the child loader as one
-        # contiguous block (AutoWeightsLoader delegates per contiguous group,
-        # and the child's load_weights finalizes fused expert weights, which
-        # must not run on a partially loaded model).
-        mapped = sorted(self.hf_to_vllm_mapper.apply(weights), key=lambda x: x[0])
-        loader = AutoWeightsLoader(self)
-        loaded_params = loader.load_weights(mapped)
+        # The "language_model." group must reach the child loader in one call
+        # (its load_weights finalizes the fused expert weights, which must not
+        # run on a partially loaded model), but the first shard interleaves
+        # vision and language tensors, so AutoWeightsLoader's contiguous
+        # grouping would split it. Route lazily rather than sorting: sorting
+        # materialized every tensor, which with a GPU-streaming loader
+        # (InstantTensor) is the whole checkpoint held in device memory.
+        prefix = "language_model."
+        rest: list[tuple[str, torch.Tensor]] = []
+        language_weights = _route_language_weights(
+            self.hf_to_vllm_mapper.apply(weights), prefix, rest
+        )
+        loaded_params = {
+            prefix + name for name in self.language_model.load_weights(language_weights)
+        }
+        if rest:
+            loaded_params |= set(AutoWeightsLoader(self).load_weights(rest))
         # The child's load_weights already ran its post-load finalization.
         self._weights_finalized = True
         return loaded_params
