@@ -47,6 +47,7 @@ from vllm.v1.core.sched.output import (
 )
 from vllm.v1.kv_cache_interface import (
     ChunkedLocalAttentionSpec,
+    CircularBufferSpec,
     FullAttentionSpec,
     KVCacheGroupSpec,
     SlidingWindowSpec,
@@ -1192,6 +1193,100 @@ def test_two_groups_full_and_sliding_window(request_runner, async_scheduling: bo
         #   are within the window → loads blocks 1,2
         expected_loaded=((0, 3), (1, 3)),
     )
+
+
+@pytest.mark.parametrize("async_scheduling", [True, False])
+def test_scratch_group_is_never_offloaded(request_runner, async_scheduling: bool):
+    """A non-prefix-cacheable group (the CSA compressor ring of DeepSeek V4)
+    holds one fixed block per request. Its block size is not a multiple of the
+    hash block, and it must be skipped by lookup, touch, store and load while
+    the other groups keep offloading normally."""
+    block_size = 4
+    kv_cache_groups = [
+        KVCacheGroupSpec(
+            ["layer0"],
+            FullAttentionSpec(
+                block_size=block_size,
+                num_kv_heads=1,
+                head_size=1,
+                dtype=torch.float32,
+            ),
+        ),
+        KVCacheGroupSpec(
+            ["layer1"],
+            SlidingWindowSpec(
+                block_size=block_size,
+                num_kv_heads=1,
+                head_size=1,
+                dtype=torch.float32,
+                sliding_window=8,
+            ),
+        ),
+        KVCacheGroupSpec(
+            ["ring"],
+            CircularBufferSpec(
+                block_size=6,
+                num_kv_heads=1,
+                head_size=1,
+                dtype=torch.float32,
+            ),
+        ),
+    ]
+    runner = request_runner(
+        block_size=block_size,
+        num_gpu_blocks=100,
+        async_scheduling=async_scheduling,
+        kv_cache_groups=kv_cache_groups,
+    )
+
+    kv_group_configs = runner.connector_scheduler.config.kv_group_configs
+    assert [c.is_scratch_group for c in kv_group_configs] == [False, False, True]
+    assert kv_group_configs[2].sliding_window_size_in_chunks is None
+    assert runner.connector_scheduler._lookup_groups == (0, 1)
+
+    def groups_of(transfers):
+        return {block.group_idx for t in transfers for block in t.gpu_blocks}
+
+    runner.new_request(token_ids=[0] * block_size * 3)
+    runner.manager.prepare_store.side_effect = lambda keys, req_context: (
+        generate_store_output(keys)
+    )
+    runner._run(decoded_tokens=[0] * (block_size * 3 + 2), complete_transfers=True)
+    # touch is called once per offloadable group and never for the ring
+    for touch_call in runner.manager.touch.call_args_list:
+        touched = {get_offload_group_idx(key) for key in touch_call.args[0]}
+        assert touched <= {0, 1}
+    stored = runner.completed_stores
+    assert groups_of(stored) == {0, 1}
+    full_attn_offsets = {
+        block.request_block_offset
+        for t in stored
+        for block in t.gpu_blocks
+        if block.group_idx == 0
+    }
+    assert full_attn_offsets >= {0, 1, 2}
+    for t in stored:
+        for gpu_block, address in zip(t.gpu_blocks, t.offload_addresses):
+            runner.offloaded[address] = gpu_block
+    runner.completed_stores.clear()
+    runner._run(decoded_tokens=[EOS_TOKEN_ID], complete_transfers=True)
+    runner.completed_stores.clear()
+
+    runner.scheduler.reset_prefix_cache()
+    runner.manager.reset_mock()
+    runner.new_request(token_ids=[0] * (block_size * 3 + 1))
+    runner.manager.lookup.return_value = LookupResult.HIT
+    runner._run(decoded_tokens=[EOS_TOKEN_ID], complete_transfers=True)
+    loaded = runner.completed_loads
+    assert groups_of(loaded) == {0, 1}
+    assert {
+        block.request_block_offset
+        for t in loaded
+        for block in t.gpu_blocks
+        if block.group_idx == 0
+    } == {0, 1, 2}
+    for key_args in runner.manager.lookup.call_args_list:
+        assert get_offload_group_idx(key_args.args[0]) in (0, 1)
 
 
 @pytest.mark.parametrize("async_scheduling", [True, False])

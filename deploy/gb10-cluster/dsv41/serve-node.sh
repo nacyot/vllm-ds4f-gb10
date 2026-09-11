@@ -82,6 +82,14 @@ if [ "$SPEC" = "dspark" ]; then
   [ -n "$SPEC_EXTRA" ] && SC="$SC,$SPEC_EXTRA"
   ARGS+=(--speculative-config "$SC}")
 fi
+if [ "${KVOFF_GIB:-0}" != "0" ]; then
+  ARGS+=(--kv-offloading-size "$KVOFF_GIB")
+  if [ -n "$KVFS_DIR" ]; then
+    mkdir -p "$KVFS_DIR"
+    # cpu_bytes_to_use is merged in by VllmConfig from --kv-offloading-size.
+    ARGS+=(--kv-transfer-config "{\"kv_connector\":\"OffloadingConnector\",\"kv_role\":\"kv_both\",\"kv_connector_extra_config\":{\"spec_name\":\"TieringOffloadingSpec\",\"blocks_per_chunk\":1,\"secondary_tiers\":[{\"type\":\"fs\",\"root_dir\":\"$KVFS_DIR\",\"n_read_threads\":16,\"n_write_threads\":16}]}}")
+  fi
+fi
 # shellcheck disable=SC2206
 [ -n "$EXTRA_ARGS" ] && ARGS+=($EXTRA_ARGS)
 

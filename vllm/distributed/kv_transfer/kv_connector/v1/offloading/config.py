@@ -54,7 +54,12 @@ def build_offloading_config(
     )
 
     _, tokens_per_hash = resolve_kv_cache_block_sizes(kv_cache_config, vllm_config)
-    for group in groups:
+    for group, kv_cache_group in zip(groups, kv_cache_config.kv_cache_groups):
+        if not kv_cache_group.kv_cache_spec.prefix_cacheable:
+            # Scratch groups (e.g. the CSA compressor ring) hold one fixed
+            # block per request that covers no token range; they are never
+            # offloaded, so their block size need not align with the hash.
+            continue
         assert group.tokens_per_block % tokens_per_hash == 0, (
             f"tokens_per_block={group.tokens_per_block} not divisible by "
             f"tokens_per_hash={tokens_per_hash}. "

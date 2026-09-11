@@ -103,6 +103,11 @@ class GroupOffloadConfig(NamedTuple):
     # of these groups is volatile and lacks a stable hash, so it must
     # be excluded from store and load scheduling.
     is_eagle_group: bool = False
+    # True for groups whose spec is not prefix cacheable (e.g. the CSA
+    # compressor ring): one fixed block per request covering no token range.
+    # They are kept in the tuple so group indices stay positional, but are
+    # excluded from lookup, touch and store.
+    is_scratch_group: bool = False
 
 
 def get_sliding_window_size_in_chunks(
@@ -174,6 +179,8 @@ class SchedulerOffloadConfig(NamedTuple):
         full_attn_tokens_per_chunk: set[int] = set()
         for idx, tokens_per_block in enumerate(spec.tokens_per_block):
             kv_spec = kv_cache_config.kv_cache_groups[idx].kv_cache_spec
+            if not kv_spec.prefix_cacheable:
+                continue
             sw = get_sliding_window_size_in_chunks(
                 kv_spec, tokens_per_block * spec.blocks_per_chunk
             )
@@ -222,8 +229,13 @@ class SchedulerOffloadConfig(NamedTuple):
         for idx, tokens_per_block in enumerate(spec.tokens_per_block):
             kv_cache_group = kv_cache_config.kv_cache_groups[idx]
             kv_spec = kv_cache_group.kv_cache_spec
-            sw = get_sliding_window_size_in_chunks(
-                kv_spec, tokens_per_block * spec.blocks_per_chunk
+            is_scratch_group = not kv_spec.prefix_cacheable
+            sw = (
+                None
+                if is_scratch_group
+                else get_sliding_window_size_in_chunks(
+                    kv_spec, tokens_per_block * spec.blocks_per_chunk
+                )
             )
             manager_cls = KVCacheSpecRegistry.get_manager_class(kv_spec)
             assert manager_cls is not None, (
@@ -243,6 +255,7 @@ class SchedulerOffloadConfig(NamedTuple):
                     manager_cls=manager_cls,
                     kv_event_group_spec=get_offloading_event_group_spec(kv_cache_group),
                     is_eagle_group=idx in eagle_groups,
+                    is_scratch_group=is_scratch_group,
                     requires_cow_source=(
                         isinstance(kv_spec, MambaSpec)
                         and kv_spec.mamba_cache_mode == "align"
@@ -250,7 +263,11 @@ class SchedulerOffloadConfig(NamedTuple):
                 )
             )
         kv_group_configs = tuple(kv_group_configs_list)
-        group_block_sizes = {config.tokens_per_block for config in kv_group_configs}
+        group_block_sizes = {
+            config.tokens_per_block
+            for config in kv_group_configs
+            if not config.is_scratch_group
+        }
         has_partial_recurrent_group = any(
             config.requires_cow_source
             and config.tokens_per_block > spec.tokens_per_hash
@@ -360,6 +377,8 @@ class RequestOffloadState:
         for group_config, group_state in zip(
             self.config.kv_group_configs, self.group_states
         ):
+            if group_config.is_scratch_group:
+                continue
             for req_block_hash in islice(
                 self.req.block_hashes,
                 group_config.hashes_per_chunk * len(group_state.offload_keys)
@@ -508,6 +527,8 @@ class OffloadingConnectorScheduler:
         full_attention_groups: list[int] = []
         sliding_window_groups: list[int] = []
         for group_config in self.config.kv_group_configs:
+            if group_config.is_scratch_group:
+                continue
             if group_config.sliding_window_size_in_chunks is None:
                 full_attention_groups.append(group_config.group_idx)
             else:
@@ -671,6 +692,8 @@ class OffloadingConnectorScheduler:
         for group_config, group_state in zip(
             self.config.kv_group_configs, req_status.group_states
         ):
+            if group_config.is_scratch_group:
+                continue
             if group_config.sliding_window_size_in_chunks is None:
                 self.manager.touch(group_state.offload_keys, req_status.req_context)
             else:
@@ -899,6 +922,8 @@ class OffloadingConnectorScheduler:
             boundary_missed = False
             boundary_keys = []
             for group_config in self.config.kv_group_configs:
+                if group_config.is_scratch_group:
+                    continue
                 key = self._make_boundary_key(
                     req_status.req, group_config.group_idx, boundary
                 )
@@ -1021,6 +1046,10 @@ class OffloadingConnectorScheduler:
             self._current_batch_allocated_block_ids.update(
                 block.block_id for block in group_blocks if block.block_id != 0
             )
+            if group_config.is_scratch_group:
+                group_sizes.append(0)
+                block_indices.append(0)
+                continue
 
             tokens_per_block = group_config.tokens_per_block
             tokens_per_chunk = group_config.tokens_per_chunk
@@ -1366,12 +1395,11 @@ class OffloadingConnectorScheduler:
             for group_config, group_state in zip(
                 self.config.kv_group_configs, req_status.group_states
             ):
+                if group_config.is_scratch_group or group_config.requires_cow_source:
+                    continue
                 num_chunks = req_status.storable_chunks(
                     group_config, group_state, num_offloadable_tokens
                 )
-
-                if group_config.requires_cow_source:
-                    continue
 
                 start_chunk_idx = group_state.next_stored_chunk_idx
                 if num_chunks <= start_chunk_idx:
