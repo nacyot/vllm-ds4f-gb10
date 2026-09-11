@@ -31,6 +31,7 @@ from vllm.distributed.kv_transfer.kv_connector.v1.offloading.metrics import (
 )
 from vllm.distributed.kv_transfer.kv_connector.v1.offloading.scheduler import (
     OffloadingConnectorScheduler,
+    RequestGroupState,
     RequestOffloadState,
     get_sliding_window_size_in_chunks,
 )
@@ -109,6 +110,37 @@ def _reduce_kv_connector_stats(runner):
         for key, value in stats.reduce().items():
             reduced[key] = reduced.get(key, 0) + value
     return reduced
+
+
+def test_finished_request_stores_trailing_eagle_chunk():
+    """The trailing draft chunk is withheld while decoding (rejection may
+    rewrite it) but is final once the request has finished."""
+    config = MagicMock()
+    config.kv_group_configs = [MagicMock()]
+    config.blocks_per_chunk = 1
+    req = MagicMock()
+    req.kv_transfer_params = None
+    req.num_prompt_tokens = 8
+    req.is_finished.return_value = False
+    state = RequestOffloadState(
+        config=config,
+        req=req,
+        req_context=MagicMock(),
+        offloading_context=MagicMock(),
+    )
+    group_config = MagicMock()
+    group_config.is_eagle_group = True
+    group_config.tokens_per_chunk = 4
+    group_state = RequestGroupState(
+        offload_keys=[MagicMock()] * 4, block_ids=[1, 2, 3, 4]
+    )
+
+    # End of prefill: the draft input of the last position is a prompt token.
+    assert state.storable_chunks(group_config, group_state, 8) == 2
+    # Decoding: the trailing chunk is volatile.
+    assert state.storable_chunks(group_config, group_state, 16) == 3
+    req.is_finished.return_value = True
+    assert state.storable_chunks(group_config, group_state, 16) == 4
 
 
 def test_partial_tail_store_uses_attention_and_recurrent_cow_sources():

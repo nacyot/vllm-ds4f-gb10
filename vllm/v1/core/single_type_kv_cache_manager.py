@@ -1085,6 +1085,11 @@ class SlidingWindowManager(SingleTypeKVCacheManager):
             for boundary_tokens in reachable_boundaries:
                 aligned = boundary_tokens // alignment_tokens * alignment_tokens
                 end = aligned // block_size + shift
+                # The EAGLE peek block past a boundary that is not block
+                # aligned would be the partial block, which is never hashed:
+                # keep the ``need``-block run ending on the last full block
+                # instead, so the popped block is a stored one.
+                end = min(end, (boundary_tokens + 1) // block_size)
                 for j in range(max(start_block, end - need), min(end_block, end)):
                     mask[j - start_block] = True
 

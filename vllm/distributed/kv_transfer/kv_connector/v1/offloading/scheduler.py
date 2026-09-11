@@ -422,7 +422,8 @@ class RequestOffloadState:
         range is excluded while decoding: the draft-layer KV of the last
         accepted position may be rewritten after spec-token rejection. During
         prefill the trailing chunk is stable (the draft input for a chunk's
-        last position is the next prompt token), so it is stored immediately.
+        last position is the next prompt token), so it is stored immediately,
+        and so is the trailing chunk of a finished request.
         The exclusion must be applied consistently everywhere
         ``next_stored_chunk_idx`` is derived: otherwise the trailing chunk of
         each step is skipped on collection but jumped over by
@@ -431,7 +432,9 @@ class RequestOffloadState:
         """
         num_chunks = num_offloadable_tokens // group_config.tokens_per_chunk
         is_decoding = num_offloadable_tokens > self.req.num_prompt_tokens
-        if group_config.is_eagle_group and is_decoding:
+        # Once the request has finished no further rejection can rewrite the
+        # draft KV, so its trailing chunk is stable too.
+        if group_config.is_eagle_group and is_decoding and not self.req.is_finished():
             num_chunks = max(0, num_chunks - 1)
         num_allocated_chunks = (
             len(group_state.block_ids) // self.config.blocks_per_chunk

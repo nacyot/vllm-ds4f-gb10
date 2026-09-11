@@ -4433,6 +4433,44 @@ def test_swa_reachable_block_mask_pins_shared_prefix():
     assert retained(0, 0, block_size) == {14}
 
 
+def test_swa_reachable_block_mask_eagle_tail_ends_on_full_block():
+    """With EAGLE the boundary tail is one block longer and normally ends on
+    the peek block past the boundary. When the replay boundary is not block
+    aligned that peek block is the partial one, which is never hashed, so the
+    tail must end on the last full block for a windowed hit to land there."""
+    from vllm.v1.core.single_type_kv_cache_manager import SlidingWindowManager
+
+    block_size = 16
+    spec = SlidingWindowSpec(
+        block_size=block_size,
+        num_kv_heads=1,
+        head_size=1,
+        dtype=torch.float32,
+        sliding_window=3 * block_size,
+    )
+
+    def retained(num_prompt_tokens, use_eagle):
+        m = SlidingWindowManager.reachable_block_mask(
+            start_block=0,
+            end_block=16,
+            alignment_tokens=block_size,
+            kv_cache_spec=spec,
+            use_eagle=use_eagle,
+            retention_interval=0,
+            reachable_boundaries=[num_prompt_tokens - 1],
+        )
+        return {i for i, v in enumerate(m) if v}
+
+    # need = 3 (+1 with EAGLE). Block-aligned prompt: the EAGLE run ends on
+    # the full block 15 (popped on lookup); without EAGLE on block 14.
+    assert retained(256, use_eagle=False) == {12, 13, 14}
+    assert retained(256, use_eagle=True) == {12, 13, 14, 15}
+    # Prompt ending inside block 15: block 15 is partial, so the EAGLE run
+    # ends on block 14 instead (not {12, 13, 14, 15}).
+    assert retained(250, use_eagle=False) == {12, 13, 14}
+    assert retained(250, use_eagle=True) == {11, 12, 13, 14}
+
+
 def test_swa_reachable_block_mask_with_dcp_scaling():
     """DCP shards each block's KV across ranks, scaling the effective block size.
     Verify that dcp_world_size > 1 scales block size in reachability calculations,
