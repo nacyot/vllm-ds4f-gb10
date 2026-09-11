@@ -857,6 +857,16 @@ class SingleDirectionOffloadingHandler:
             raise sync_error
 
 
+def is_relay_receiver() -> bool:
+    """Whether this worker only receives relayed loads (multi-rank TP, not the
+    TP-group leader). A receiver never reads or writes host KV, so it needs no
+    CPU tier region of its own."""
+    from vllm.distributed.parallel_state import get_tp_group
+
+    tp = get_tp_group()
+    return tp.world_size > 1 and tp.rank_in_group != 0
+
+
 def _make_relay_config() -> RelayConfig | None:
     """Build the rank-0 relay over the tensor-parallel ranks, or None when the
     TP group is a single rank. A dedicated NCCL group keeps the relay's

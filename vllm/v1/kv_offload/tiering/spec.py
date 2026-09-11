@@ -68,7 +68,10 @@ from vllm.v1.kv_offload.base import (
     OffloadingMetricMetadata,
 )
 from vllm.v1.kv_offload.config import OffloadingConfig
-from vllm.v1.kv_offload.cpu.gpu_worker import CPUOffloadingWorker
+from vllm.v1.kv_offload.cpu.gpu_worker import (
+    CPUOffloadingWorker,
+    is_relay_receiver,
+)
 from vllm.v1.kv_offload.cpu.shared_offload_region import SharedOffloadRegion
 from vllm.v1.kv_offload.cpu.spec import CPUOffloadingSpec
 from vllm.v1.kv_offload.tiering.base import TieringOffloadingMetrics
@@ -385,32 +388,42 @@ class TieringOffloadingSpec(CPUOffloadingSpec):
     @override
     def create_worker(self, kv_caches: CanonicalKVCaches) -> CPUOffloadingWorker:
         world_size = self.config.parallel.world_size
-        if self.replicated_layout:
+        if self.single_copy:
             rank = 0
         else:
             # Fold the global physical device index into the replica-local
             # [0, world_size) slot range.
             rank = torch.accelerator.current_device_index() % world_size
-        worker_mmap = SharedOffloadRegion(
-            engine_id=self._engine_id,
-            num_blocks=self.num_blocks,
-            rank=rank,
-            kv_bytes_per_block=self.kv_bytes_per_chunk,
-            cpu_page_size=self.cpu_page_size_per_worker,
-        )
+        worker_mmap: SharedOffloadRegion | None = None
+        num_cpu_blocks = self.num_blocks
+        if self.relay_from_rank0 and is_relay_receiver():
+            # Relayed loads arrive over NCCL and stores are skipped, so the
+            # region (num_blocks rows, populated and pinned) would only cost
+            # host memory on this node: use a one-row placeholder instead.
+            num_cpu_blocks = 1
+            logger.info("KV offload relay receiver: no host tier region on this rank")
+        else:
+            worker_mmap = SharedOffloadRegion(
+                engine_id=self._engine_id,
+                num_blocks=self.num_blocks,
+                rank=rank,
+                kv_bytes_per_block=self.kv_bytes_per_chunk,
+                cpu_page_size=self.cpu_page_size_per_worker,
+            )
         try:
             if self.config.canonical_layout:
                 self._validate_canonical_refs(kv_caches)
             return CPUOffloadingWorker(
                 kv_caches=kv_caches,
                 blocks_per_chunk=self.blocks_per_chunk,
-                num_cpu_blocks=self.num_blocks,
+                num_cpu_blocks=num_cpu_blocks,
                 mmap_region=worker_mmap,
                 canonical_layout=self.config.canonical_layout,
                 relay_from_rank0=self.relay_from_rank0,
             )
         except Exception:
-            worker_mmap.cleanup()
+            if worker_mmap is not None:
+                worker_mmap.cleanup()
             raise
 
     def _validate_canonical_refs(self, kv_caches: CanonicalKVCaches) -> None:
