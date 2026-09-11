@@ -1115,101 +1115,6 @@ def _mem_available_gib() -> float:
     return float("nan")
 
 
-def _instanttensor_ref_trace(name: str, tensor: torch.Tensor) -> None:
-    """Diagnostics (VLLM_INSTANTTENSOR_REF_TRACE=1): who still references a
-    yielded tensor after the consumer returned it."""
-    import gc
-    import sys
-    import types
-
-    refs = []
-    for r in gc.get_referrers(tensor):
-        if isinstance(r, types.FrameType):
-            refs.append(
-                f"frame {r.f_code.co_filename.rsplit('/', 1)[-1]}:{r.f_lineno} "
-                f"{r.f_code.co_name}"
-            )
-        elif isinstance(r, dict):
-            refs.append(f"dict[{len(r)}] keys {list(r)[:3]}")
-        elif isinstance(r, (list, tuple, set)):
-            refs.append(f"{type(r).__name__}[{len(r)}]")
-        else:
-            refs.append(type(r).__name__)
-    logger.warning(
-        "InstantTensor ref trace: %s refcount=%d referrers=%s",
-        name,
-        sys.getrefcount(tensor),
-        refs[:8],
-    )
-
-
-def _instanttensor_live_tensor_dump() -> None:
-    """Diagnostics: the CUDA tensors Python still tracks when the guard trips,
-    split into parameters and everything else, with sample referrers."""
-    import gc
-    import types
-
-    def describe(r) -> str:
-        if isinstance(r, types.FrameType):
-            return (
-                f"frame {r.f_code.co_filename.rsplit('/', 1)[-1]}:{r.f_lineno} "
-                f"{r.f_code.co_name}"
-            )
-        if isinstance(r, dict):
-            return f"dict[{len(r)}] {list(r)[:3]}"
-        if isinstance(r, (list, tuple, set)):
-            return f"{type(r).__name__}[{len(r)}]"
-        return type(r).__name__
-
-    params = others = 0
-    param_bytes = other_bytes = 0
-    samples: list[torch.Tensor] = []
-    for obj in gc.get_objects():
-        if not isinstance(obj, torch.Tensor) or not obj.is_cuda:
-            continue
-        nbytes = obj.numel() * obj.element_size()
-        if isinstance(obj, torch.nn.Parameter):
-            params += 1
-            param_bytes += nbytes
-        else:
-            others += 1
-            other_bytes += nbytes
-            if nbytes >= (16 << 20) and len(samples) < 6:
-                samples.append(obj)
-    logger.error(
-        "InstantTensor live CUDA tensors: %d parameters %.1f GiB, %d others "
-        "%.1f GiB (torch allocated %.1f GiB)",
-        params,
-        param_bytes / 1024**3,
-        others,
-        other_bytes / 1024**3,
-        torch.cuda.memory_allocated() / 1024**3,
-    )
-    for t in samples:
-        referrers = [r for r in gc.get_referrers(t) if r is not samples]
-        logger.error(
-            "  other %s %s %.0f MiB referrers=%s",
-            tuple(t.shape),
-            t.dtype,
-            t.numel() * t.element_size() / 1024**2,
-            [describe(r) for r in referrers][:6],
-        )
-        for r in referrers:
-            if isinstance(r, tuple) and len(r) == 2:
-                head = r[0] if isinstance(r[0], str) else repr(r[0])[:80]
-                holders = [
-                    describe(h) for h in gc.get_referrers(r) if h is not referrers
-                ]
-                logger.error(
-                    "    tuple(%r, tensor) held by %s", head[:100], holders[:6]
-                )
-                for h in gc.get_referrers(r):
-                    if isinstance(h, (list, dict)) and h is not referrers:
-                        owners = [describe(o) for o in gc.get_referrers(h)][:6]
-                        logger.error("      %s owned by %s", describe(h), owners)
-                        break
-
-
 def _instanttensor_mem_check(streamed: int, guard_gib: float) -> None:
     """Log the loader's memory footprint; with a guard, abort before the host
     starves (unified memory: the GPU clones and the page cache share DRAM)."""
@@ -1236,7 +1141,6 @@ def _instanttensor_mem_check(streamed: int, guard_gib: float) -> None:
             torch.cuda.memory_reserved() / 1024**3,
         )
         if avail_after < guard_gib:
-            _instanttensor_live_tensor_dump()
             # Raising would close the InstantTensor context while the other
             # ranks sit in its collective and deadlock the boot; exit instead,
             # the executor tears the engine down when a worker dies.
@@ -1380,8 +1284,6 @@ def instanttensor_weights_iterator(
             guard_gib = float(
                 os.environ.get("VLLM_INSTANTTENSOR_MEMAVAIL_MIN_GIB", "0") or 0
             )
-            ref_trace = os.environ.get("VLLM_INSTANTTENSOR_REF_TRACE") == "1"
-            traced = 0
             streamed = 0
             next_check = 0
             next_guard = 0
@@ -1401,9 +1303,6 @@ def instanttensor_weights_iterator(
                             _instanttensor_mem_check(streamed, guard_gib)
                     yielded.add(name)
                     yield name, tensor
-                    if ref_trace and traced < 6 and nbytes >= (16 << 20):
-                        _instanttensor_ref_trace(name, tensor)
-                        traced += 1
             finally:
                 pbar.close()
 
