@@ -63,9 +63,19 @@ fi
 if [ "$EAGER" = "1" ]; then
   ARGS+=(--enforce-eager)
 else
-  CG="{\"cudagraph_capture_sizes\":[${CAPTURE_SIZES}],\"max_cudagraph_capture_size\":${CAPTURE_SIZES##*,}"
+  SIZES="$CAPTURE_SIZES"
+  if [ "$SPEC" = "dspark" ] && [ -z "$CAPTURE_SIZES_EXPLICIT" ]; then
+    # The V2 runner only captures a FULL decode graph for token counts that are a
+    # multiple of the verify query (k+1 per request); the draft runs k per request.
+    # Cover every batch up to SEQS requests exactly (no padded rows), plus the
+    # small non-spec sizes for prefill tails.
+    K=$SPEC_K
+    SIZES=$( { echo "$CAPTURE_SIZES" | tr , '\n'; seq "$K" "$K" $((K * SEQS)); seq $((K + 1)) $((K + 1)) $(((K + 1) * SEQS)); } | sort -n -u | paste -sd, - )
+  fi
+  CG="{\"cudagraph_capture_sizes\":[${SIZES}],\"max_cudagraph_capture_size\":${SIZES##*,}"
   [ -n "$CUDAGRAPH_MODE" ] && CG="$CG,\"cudagraph_mode\":\"$CUDAGRAPH_MODE\""
   ARGS+=(--compilation-config "$CG}")
+  export VLLM_USE_BREAKABLE_CUDAGRAPH=${VLLM_USE_BREAKABLE_CUDAGRAPH:-1}
 fi
 [ "$SPEC" = "dspark" ] && ARGS+=(--speculative-config "{\"method\":\"dspark\",\"num_speculative_tokens\":$SPEC_K,\"draft_sample_method\":\"probabilistic\"}")
 # shellcheck disable=SC2206
