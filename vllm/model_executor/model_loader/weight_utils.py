@@ -1104,6 +1104,49 @@ def fastsafetensors_weights_iterator(
             pl.close()
 
 
+def _mem_available_gib() -> float:
+    try:
+        with open("/proc/meminfo") as f:
+            for line in f:
+                if line.startswith("MemAvailable:"):
+                    return int(line.split()[1]) / 1024**2
+    except OSError:
+        pass
+    return float("nan")
+
+
+def _instanttensor_mem_check(streamed: int, guard_gib: float) -> None:
+    """Log the loader's memory footprint; with a guard, abort before the host
+    starves (unified memory: the GPU clones and the page cache share DRAM)."""
+    free_b, _ = torch.cuda.mem_get_info()
+    avail = _mem_available_gib()
+    logger.info(
+        "InstantTensor: streamed %.1f GiB, torch allocated %.1f / reserved %.1f "
+        "GiB, device free %.1f GiB, MemAvailable %.1f GiB",
+        streamed / 1024**3,
+        torch.cuda.memory_allocated() / 1024**3,
+        torch.cuda.memory_reserved() / 1024**3,
+        free_b / 1024**3,
+        avail,
+    )
+    if guard_gib and avail < guard_gib:
+        torch.cuda.empty_cache()
+        avail_after = _mem_available_gib()
+        logger.warning(
+            "InstantTensor: MemAvailable %.1f GiB below the %.1f GiB guard; "
+            "empty_cache -> %.1f GiB (reserved now %.1f GiB)",
+            avail,
+            guard_gib,
+            avail_after,
+            torch.cuda.memory_reserved() / 1024**3,
+        )
+        if avail_after < guard_gib:
+            raise RuntimeError(
+                f"InstantTensor load aborted: MemAvailable {avail_after:.1f} GiB "
+                f"< VLLM_INSTANTTENSOR_MEMAVAIL_MIN_GIB={guard_gib}"
+            )
+
+
 def _split_files_by_skip_registry(
     hf_weights_files: list[str],
 ) -> tuple[list[str], list[str], list[str], set[str]]:
@@ -1232,9 +1275,20 @@ def instanttensor_weights_iterator(
                 unit_divisor=1024,
                 mininterval=1.0,
             )
+            guard_gib = float(
+                os.environ.get("VLLM_INSTANTTENSOR_MEMAVAIL_MIN_GIB", "0") or 0
+            )
+            streamed = 0
+            next_check = 0
             try:
                 for name, tensor in f.tensors():
-                    pbar.update(tensor.numel() * tensor.element_size())
+                    nbytes = tensor.numel() * tensor.element_size()
+                    pbar.update(nbytes)
+                    streamed += nbytes
+                    if streamed >= next_check:
+                        step = 2 << 30 if streamed < (32 << 30) else 16 << 30
+                        next_check = streamed + step
+                        _instanttensor_mem_check(streamed, guard_gib)
                     yielded.add(name)
                     yield name, tensor
             finally:
