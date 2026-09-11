@@ -174,6 +174,13 @@ logger = init_logger(__name__)
 class GPUModelRunner(LoRAModelRunnerMixin):
     def __init__(self, vllm_config: VllmConfig, device: torch.device):
         self.vllm_config = vllm_config
+        # --additional-config '{"mem_trace": true}' logs allocator state per
+        # prefill chunk (see _trace_memory).
+        additional_config = vllm_config.additional_config
+        self._mem_trace = isinstance(additional_config, dict) and bool(
+            additional_config.get("mem_trace", False)
+        )
+        self._mem_trace_step = 0
         self.model_config = vllm_config.model_config
         self.cache_config = vllm_config.cache_config
         self.compilation_config = vllm_config.compilation_config
@@ -1531,6 +1538,31 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         )
 
     @torch.inference_mode()
+    def _trace_memory(self, scheduler_output: SchedulerOutput) -> None:
+        """mem_trace: log the allocator state on every prefill chunk (>= 1024
+        scheduled tokens) and every 200th step, to line host-side
+        /proc/meminfo samples up with GPU-side reservations (GB10 unified
+        memory has no nvidia-smi accounting)."""
+        self._mem_trace_step += 1
+        num_tokens = scheduler_output.total_num_scheduled_tokens
+        if num_tokens < 1024 and self._mem_trace_step % 200 != 0:
+            return
+        stats = torch.cuda.memory_stats()
+        free, _ = torch.cuda.mem_get_info()
+        gib = 1 << 30
+        logger.info(
+            "mem trace step %d: %d tokens, %d reqs; allocated %.2f GiB "
+            "(peak %.2f), reserved %.2f GiB (peak %.2f), device free %.2f GiB",
+            self._mem_trace_step,
+            num_tokens,
+            len(scheduler_output.num_scheduled_tokens),
+            stats.get("allocated_bytes.all.current", 0) / gib,
+            stats.get("allocated_bytes.all.peak", 0) / gib,
+            stats.get("reserved_bytes.all.current", 0) / gib,
+            stats.get("reserved_bytes.all.peak", 0) / gib,
+            free / gib,
+        )
+
     def execute_model(
         self,
         scheduler_output: SchedulerOutput,
@@ -1541,6 +1573,8 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         context_len: int = 0,
         valid_dummy_state_slots: bool = False,
     ) -> ModelRunnerOutput | IntermediateTensors | None:
+        if self._mem_trace and not dummy_run:
+            self._trace_memory(scheduler_output)
         if not dummy_run:
             # Update the request states.
             self.update_pp_decode_requests()
