@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 import functools
+import os
 import time
 from collections import deque
 from collections.abc import Sequence
@@ -33,6 +34,9 @@ from vllm.v1.kv_offload.cpu.swap_blocks_triton import (
 )
 
 logger = init_logger(__name__)
+
+# VLLM_KV_OFFLOAD_TRACE=1 logs every relay load (size, windows, stream time).
+_TRACE = os.environ.get("VLLM_KV_OFFLOAD_TRACE", "0") == "1"
 
 
 def _select_swap_blocks_fn(
@@ -698,6 +702,14 @@ class SingleDirectionOffloadingHandler:
                     num_transfer_bytes = 0
             elif op_idx > 0:
                 relay_buffers = self._relay_load(src, dst, sizes, all_sizes[:op_idx])
+                if _TRACE:
+                    logger.info(
+                        "relay load job %d: %d ops, %d bytes, %d windows",
+                        job_id,
+                        op_idx,
+                        num_transfer_bytes,
+                        cdiv(num_transfer_bytes, self._relay.window_bytes),
+                    )
             end_event.record(stream)
 
         self._transfer_events[job_id] = end_event
@@ -792,6 +804,12 @@ class SingleDirectionOffloadingHandler:
                 transfer_size=transfer.num_bytes,
                 transfer_time=transfer_time,
             )
+            if _TRACE and transfer.relay_buffers is not None:
+                logger.info(
+                    "relay load job %d done: %.1f ms on the transfer stream",
+                    transfer.job_id,
+                    transfer_time * 1e3,
+                )
 
             results.append(result)
             self._stream_pool.append(transfer.stream)

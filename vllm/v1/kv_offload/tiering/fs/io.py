@@ -7,6 +7,7 @@ import mmap
 import os
 import random
 import threading
+import zlib
 
 try:
     from vllm.fs_io_C import (  # pyright: ignore[reportMissingImports]
@@ -85,6 +86,51 @@ def _validate_offsets(view: memoryview, offsets: list[int], block_size: int) -> 
                 f"block offset {offset} (block_size {block_size}) is out of "
                 f"bounds for a buffer of size {total_len}"
             )
+
+
+_XATTR_CRC = "user.vllm_kv_crc32"
+
+
+def _crc_of(view: memoryview, offset: int, size: int) -> int:
+    return zlib.crc32(view.cast("B")[offset : offset + size]) & 0xFFFFFFFF
+
+
+def write_checksums(
+    paths: list[str], view: memoryview, offsets: list[int], sizes: list[int]
+) -> None:
+    """Record a CRC32 of each stored block as an extended attribute so a
+    byte-for-byte corruption with the right length is caught on load.
+    Silently skipped where the filesystem has no xattr support."""
+    for path, offset, size in zip(paths, offsets, sizes):
+        try:
+            os.setxattr(
+                path, _XATTR_CRC, _crc_of(view, offset, size).to_bytes(4, "big")
+            )
+        except OSError:
+            return
+
+
+def verify_checksums(
+    paths: list[str], view: memoryview, offsets: list[int], sizes: list[int]
+) -> None:
+    """Compare each loaded block with its recorded CRC32. The first mismatching
+    file is removed and an OSError carrying ``num_succeeded`` is raised so the
+    tier keeps the blocks before it and marks the rest as misses."""
+    for i, (path, offset, size) in enumerate(zip(paths, offsets, sizes)):
+        try:
+            recorded = os.getxattr(path, _XATTR_CRC)
+        except OSError:
+            continue
+        if int.from_bytes(recorded, "big") != _crc_of(view, offset, size):
+            try:
+                os.remove(path)
+            except OSError as cleanup_exc:
+                logger.warning(
+                    "Failed to remove corrupt file %s: %s", path, cleanup_exc
+                )
+            exc = OSError(f"Checksum mismatch for {path}")
+            exc.num_succeeded = i  # type: ignore[attr-defined]
+            raise exc
 
 
 def _block_sizes(block_size: int | list[int], count: int) -> list[int]:
@@ -178,6 +224,7 @@ def batch_store_block(
     offsets: list[int],
     block_size: int | list[int],
     use_o_direct: bool = True,
+    checksums: bool = False,
 ) -> None:
     """
     Store a batch of KV blocks from a shared buffer to disk in one call.
@@ -193,10 +240,12 @@ def batch_store_block(
         view_B = view.cast("B")
         view_slices = [view_B[x : x + n] for x, n in zip(offsets, sizes)]
         tmp_paths = [p + _get_tmp_suffix() for p in paths]
-        return batch_store_block_C(tmp_paths, paths, view_slices, use_o_direct)
+        batch_store_block_C(tmp_paths, paths, view_slices, use_o_direct)
     else:
         for path, offset, n in zip(paths, offsets, sizes):
             _store_block(path, view, offset, n, use_o_direct)
+    if checksums:
+        write_checksums(paths, view, offsets, sizes)
 
 
 def batch_load_block(
@@ -205,6 +254,7 @@ def batch_load_block(
     offsets: list[int],
     block_size: int | list[int],
     use_o_direct: bool = True,
+    checksums: bool = False,
 ) -> None:
     """
     Load a batch of KV blocks from disk into a shared buffer in one call.
@@ -221,7 +271,7 @@ def batch_load_block(
     if _HAS_FSIO_C:
         view_B = view.cast("B")
         view_slices = [view_B[x : x + n] for x, n in zip(offsets, sizes)]
-        return batch_load_block_C(paths, view_slices, use_o_direct)
+        batch_load_block_C(paths, view_slices, use_o_direct)
     else:
         for i, (path, offset, n) in enumerate(zip(paths, offsets, sizes)):
             try:
@@ -231,3 +281,5 @@ def batch_load_block(
                 # The C path sets the same attribute via PyObject_SetAttrString.
                 exc.num_succeeded = i  # type: ignore[attr-defined]
                 raise
+    if checksums:
+        verify_checksums(paths, view, offsets, sizes)

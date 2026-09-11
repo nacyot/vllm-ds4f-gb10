@@ -83,6 +83,7 @@ if [ "$SPEC" = "dspark" ]; then
   ARGS+=(--speculative-config "$SC}")
 fi
 [ -n "${KV_RETENTION:-}" ] && export VLLM_PREFIX_CACHE_RETENTION_INTERVAL=$KV_RETENTION
+[ "${KV_TRACE:-0}" = "1" ] && export VLLM_KV_OFFLOAD_TRACE=1
 if [ "${KVOFF_GIB:-0}" != "0" ]; then
   ARGS+=(--kv-offloading-size "$KVOFF_GIB")
   if [ -n "$KVFS_DIR" ]; then

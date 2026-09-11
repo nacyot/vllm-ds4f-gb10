@@ -121,6 +121,7 @@ class FileSystemTierManager(SecondaryTierManager):
         n_write_threads: int = 16,
         enable_kv_events: bool = False,
         locality: str | None = None,
+        checksums: bool = True,
     ):
         """
         Args:
@@ -136,6 +137,8 @@ class FileSystemTierManager(SecondaryTierManager):
                 cache events are enabled globally (kv_events_config).
             locality: Whether this tier's storage is LOCAL or REMOTE relative
                 to the publishing vLLM instance.
+            checksums: Record a CRC32 per block file (xattr) and verify it on
+                load; a mismatch is a load failure for that block.
         """
         super().__init__(offloading_spec, primary_kv_view, tier_type)
         self.locality = Locality(locality) if locality is not None else None
@@ -185,6 +188,7 @@ class FileSystemTierManager(SecondaryTierManager):
             for group in config.groups
         ]
         self._compact = any(n != self._block_size for n in self._group_bytes)
+        self._checksums = checksums
 
         # Opt in; FileMapper enables it only for a parallelism-invariant block.
         self.file_mapper = FileMapper.from_offloading_spec(
@@ -266,6 +270,7 @@ class FileSystemTierManager(SecondaryTierManager):
             [int(bid) * self._block_size for bid in job_metadata.block_ids],
             self._key_sizes(keys),
             self._use_o_direct,
+            self._checksums,
         )
         self._pool.enqueue_store(job_metadata.job_id, 1, [task])
 
@@ -288,6 +293,7 @@ class FileSystemTierManager(SecondaryTierManager):
                     offsets,
                     sizes,
                     self._use_o_direct,
+                    self._checksums,
                 )
             except OSError as exc:
                 # Runs on the pool worker thread. Record how many blocks loaded
