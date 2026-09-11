@@ -16,7 +16,7 @@ start_rank() { # host
   local h=$1 r=${RANK[$1]}
   $SSH "nacyot@$h" "$PRE; systemctl --user stop dsv41-serve.service 2>/dev/null; rm -f /dev/shm/sem.mp-* /dev/shm/psm_* 2>/dev/null;
     sudo -n sh -c 'sync; echo 3 > /proc/sys/vm/drop_caches' 2>/dev/null || true;
-    systemd-run --user --collect --unit=dsv41-serve $KNOBS \
+    systemd-run --user --collect --unit=dsv41-serve -p LimitNOFILE=65536 $KNOBS \
       -p StandardOutput=append:/home/nacyot/dsv41-prep/logs/dsv41-r${r}.log -p StandardError=append:/home/nacyot/dsv41-prep/logs/dsv41-r${r}.log \
       /home/nacyot/vllm-dsv41/deploy/gb10-cluster/dsv41/serve-node.sh ${r} 2>&1 | tail -1"
 }
