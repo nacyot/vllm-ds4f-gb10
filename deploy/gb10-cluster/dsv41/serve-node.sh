@@ -95,6 +95,7 @@ AC=""
 [ "${MEM_TRACE:-0}" = "1" ] && AC+='"mem_trace":true,'
 [ -n "${ALLOC_CONF:-}" ] && AC+="\"cuda_alloc_conf\":\"$ALLOC_CONF\","
 [ "${EMPTY_CACHE:-0}" = "1" ] && AC+='"empty_cache_after_prefill":true,'
+[ "${LOG_PARAM_BYTES:-0}" = "1" ] && AC+='"log_param_bytes":true,'
 [ -n "$AC" ] && ARGS+=(--additional-config "{${AC%,}}")
 if [ "${KVOFF_GIB:-0}" != "0" ]; then
   ARGS+=(--kv-offloading-size "$KVOFF_GIB")

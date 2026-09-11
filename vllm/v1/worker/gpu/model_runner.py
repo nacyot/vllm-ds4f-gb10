@@ -386,6 +386,35 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             tasks.extend(PoolingRunner.get_supported_tasks(self.model))
         return tuple(tasks)
 
+    def _log_param_bytes(self) -> None:
+        """--additional-config '{"log_param_bytes": true}': parameter and
+        buffer bytes by top-level module (after any repacking), to compare the
+        resident weights against the checkpoint's own share per rank."""
+        by_prefix: dict[str, int] = {}
+        total = 0
+        for kind, items in (
+            ("param", self.model.named_parameters()),
+            ("buffer", self.model.named_buffers()),
+        ):
+            for name, tensor in items:
+                parts = name.split(".")
+                # e.g. language_model.model.layers.3.mlp -> layers.3.mlp
+                prefix = ".".join(
+                    parts[parts.index("layers") : parts.index("layers") + 3]
+                    if "layers" in parts and len(parts) > parts.index("layers") + 2
+                    else parts[:3]
+                )
+                n = tensor.numel() * tensor.element_size()
+                by_prefix[f"{kind}:{prefix}"] = by_prefix.get(f"{kind}:{prefix}", 0) + n
+                total += n
+        gib = 1 << 30
+        top = sorted(by_prefix.items(), key=lambda kv: -kv[1])[:40]
+        logger.info(
+            "param bytes total %.2f GiB; top: %s",
+            total / gib,
+            ", ".join(f"{k}={v / gib:.3f}" for k, v in top),
+        )
+
     def load_model(self, load_dummy_weights: bool = False, *args, **kwargs) -> None:
         time_before_load = time.perf_counter()
         if load_dummy_weights:
@@ -424,6 +453,10 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             format_gib(m.consumed_memory),
             time_after_load - time_before_load,
         )
+        if isinstance(self.vllm_config.additional_config, dict) and bool(
+            self.vllm_config.additional_config.get("log_param_bytes", False)
+        ):
+            self._log_param_bytes()
 
         # Initialize the components that require the model.
         self.model_state = init_model_state(
