@@ -32,8 +32,11 @@ ap.add_argument("--skip-public", action="store_true")
 args = ap.parse_args()
 os.makedirs(args.out, exist_ok=True)
 base = args.base
-model = json.load(urllib.request.urlopen(base + "/v1/models", timeout=30))["data"][0]["id"]
-prompts = json.load(open(os.path.join(HERE, "bench_prompts_v1.json")))
+model = json.load(urllib.request.urlopen(base + "/v1/models", timeout=30))["data"][0][
+    "id"
+]
+with open(os.path.join(HERE, "bench_prompts_v1.json")) as f:
+    prompts = json.load(f)
 
 
 def post(path, body, timeout=3600):
@@ -73,13 +76,14 @@ def stream_chat(messages, max_tokens, tools=None):
                 usage = chunk["usage"]
             for c in chunk.get("choices", []):
                 delta = c.get("delta", {})
-                if delta.get("content") or delta.get("tool_calls"):
-                    if first is None:
-                        first = time.perf_counter()
+                if (delta.get("content") or delta.get("tool_calls")) and first is None:
+                    first = time.perf_counter()
                 if delta.get("content"):
                     text.append(delta["content"])
                 for tc in delta.get("tool_calls") or []:
-                    slot = tool_calls.setdefault(tc.get("index", 0), {"name": "", "arguments": ""})
+                    slot = tool_calls.setdefault(
+                        tc.get("index", 0), {"name": "", "arguments": ""}
+                    )
                     fn = tc.get("function", {})
                     slot["name"] += fn.get("name") or ""
                     slot["arguments"] += fn.get("arguments") or ""
@@ -117,7 +121,14 @@ def spec_counters():
 def run_cell(prompt, max_tokens, c):
     with ThreadPoolExecutor(c) as ex:
         t0 = time.perf_counter()
-        rs = list(ex.map(lambda _: stream_chat([{"role": "user", "content": prompt}], max_tokens), range(c)))
+        rs = list(
+            ex.map(
+                lambda _: stream_chat(
+                    [{"role": "user", "content": prompt}], max_tokens
+                ),
+                range(c),
+            )
+        )
         wall = time.perf_counter() - t0
     toks = sum(r["completion_tokens"] for r in rs)
     decs = [r["decode_tok_s"] for r in rs if r["decode_tok_s"]]
@@ -131,7 +142,12 @@ def run_cell(prompt, max_tokens, c):
     }
 
 
-result = {"tag": args.tag, "model": model, "time": time.strftime("%Y-%m-%dT%H:%M:%S%z"), "batches": []}
+result = {
+    "tag": args.tag,
+    "model": model,
+    "time": time.strftime("%Y-%m-%dT%H:%M:%S%z"),
+    "batches": [],
+}
 spec0 = spec_counters()
 print("model:", model, "tag:", args.tag, flush=True)
 
@@ -146,47 +162,176 @@ if not args.skip_public:
             b = run_cell(cat["prompt"], cat["max_tokens"], c)
             b["category"] = cat["name"]
             result["batches"].append(b)
-            print(f"  C{c} {cat['name']:14s} agg {b['agg_tok_s']:7.2f} per-stream {b['per_stream_tok_s']} ttft {b['ttft_mean_s']}s", flush=True)
+            print(
+                f"  C{c} {cat['name']:14s} agg {b['agg_tok_s']:7.2f} "
+                f"per-stream {b['per_stream_tok_s']} ttft {b['ttft_mean_s']}s",
+                flush=True,
+            )
     for c in levels:
-        rows = [b for b in result["batches"] if b["c"] == c and b["category"] != "ceiling_count"]
-        print(f"C{c} mean over 8 categories: agg {statistics.mean(b['agg_tok_s'] for b in rows):.2f} tok/s, per-stream {statistics.mean(b['per_stream_tok_s'] for b in rows if b['per_stream_tok_s']):.2f} tok/s", flush=True)
+        rows = [
+            b
+            for b in result["batches"]
+            if b["c"] == c and b["category"] != "ceiling_count"
+        ]
+        agg_mean = statistics.mean(b["agg_tok_s"] for b in rows)
+        per_mean = statistics.mean(
+            b["per_stream_tok_s"] for b in rows if b["per_stream_tok_s"]
+        )
+        print(
+            f"C{c} mean over 8 categories: agg {agg_mean:.2f} tok/s, "
+            f"per-stream {per_mean:.2f} tok/s",
+            flush=True,
+        )
 
 # pi-style set (single stream), hashed
 pi = []
-def add(name, r, ok=None):
-    pi.append({"name": name, "sha256": hashlib.sha256((r["text"] + json.dumps(r["tool_calls"], sort_keys=True)).encode()).hexdigest()[:16],
-               "decode_tok_s": r["decode_tok_s"], "ttft_s": r["ttft_s"], "completion_tokens": r["completion_tokens"], "ok": ok,
-               "text": r["text"][:160], "tool_calls": r["tool_calls"]})
-    print(f"  pi {name:12s} decode {r['decode_tok_s']} tok/s ttft {r['ttft_s']}s ok={ok} :: {r['text'][:60]!r} {r['tool_calls'] if r['tool_calls'] else ''}", flush=True)
 
-r = stream_chat([{"role": "user", "content": "한국어로 답해 주세요. 부산에 처음 가는 친구에게 하루 일정을 추천해 주세요. 다섯 문장 이내로."}], 220)
+
+def add(name, r, ok=None):
+    pi.append(
+        {
+            "name": name,
+            "sha256": hashlib.sha256(
+                (r["text"] + json.dumps(r["tool_calls"], sort_keys=True)).encode()
+            ).hexdigest()[:16],
+            "decode_tok_s": r["decode_tok_s"],
+            "ttft_s": r["ttft_s"],
+            "completion_tokens": r["completion_tokens"],
+            "ok": ok,
+            "text": r["text"][:160],
+            "tool_calls": r["tool_calls"],
+        }
+    )
+    print(
+        f"  pi {name:12s} decode {r['decode_tok_s']} tok/s ttft {r['ttft_s']}s "
+        f"ok={ok} :: {r['text'][:60]!r} {r['tool_calls'] if r['tool_calls'] else ''}",
+        flush=True,
+    )
+
+
+r = stream_chat(
+    [
+        {
+            "role": "user",
+            "content": "한국어로 답해 주세요. 부산에 처음 가는 친구에게 "
+            "하루 일정을 추천해 주세요. 다섯 문장 이내로.",
+        }
+    ],
+    220,
+)
 add("ko-chat", r, ok=any("가" <= ch <= "힣" for ch in r["text"]))
-r = stream_chat([{"role": "user", "content": "다음 파이썬 함수의 버그를 찾아 고친 코드를 보여 주세요. 설명은 한 줄만.\n\ndef mean(xs):\n    return sum(xs) / len(xs) if xs else None\n\nprint(mean([]) + 1)"}], 220)
+r = stream_chat(
+    [
+        {
+            "role": "user",
+            "content": "다음 파이썬 함수의 버그를 찾아 고친 코드를 보여 주세요. "
+            "설명은 한 줄만.\n\ndef mean(xs):\n"
+            "    return sum(xs) / len(xs) if xs else None\n\nprint(mean([]) + 1)",
+        }
+    ],
+    220,
+)
 add("ko-code", r, ok="def" in r["text"])
-r = stream_chat([{"role": "user", "content": "Write a Python function is_prime(n) with a short docstring. Code only."}], 200)
+r = stream_chat(
+    [
+        {
+            "role": "user",
+            "content": "Write a Python function is_prime(n) with a short docstring. "
+            "Code only.",
+        }
+    ],
+    200,
+)
 add("code", r, ok="def is_prime" in r["text"])
-tools = [{"type": "function", "function": {"name": "get_weather", "description": "Get the current weather for a city",
-          "parameters": {"type": "object", "properties": {"city": {"type": "string"}, "unit": {"type": "string", "enum": ["c", "f"]}}, "required": ["city"]}}}]
-r1 = stream_chat([{"role": "user", "content": "What is the weather in Paris in celsius? Use the tool."}], 120, tools=tools)
-call_ok = bool(r1["tool_calls"]) and r1["tool_calls"][0]["name"] == "get_weather" and "Paris" in r1["tool_calls"][0]["arguments"]
+tools = [
+    {
+        "type": "function",
+        "function": {
+            "name": "get_weather",
+            "description": "Get the current weather for a city",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "city": {"type": "string"},
+                    "unit": {"type": "string", "enum": ["c", "f"]},
+                },
+                "required": ["city"],
+            },
+        },
+    }
+]
+r1 = stream_chat(
+    [
+        {
+            "role": "user",
+            "content": "What is the weather in Paris in celsius? Use the tool.",
+        }
+    ],
+    120,
+    tools=tools,
+)
+call_ok = (
+    bool(r1["tool_calls"])
+    and r1["tool_calls"][0]["name"] == "get_weather"
+    and "Paris" in r1["tool_calls"][0]["arguments"]
+)
 add("tool-call", r1, ok=call_ok)
 if call_ok:
     args_json = r1["tool_calls"][0]["arguments"]
-    msgs = [{"role": "user", "content": "What is the weather in Paris in celsius? Use the tool."},
-            {"role": "assistant", "content": None, "tool_calls": [{"id": "call_1", "type": "function", "function": {"name": "get_weather", "arguments": args_json}}]},
-            {"role": "tool", "tool_call_id": "call_1", "content": json.dumps({"city": "Paris", "temp_c": 18, "condition": "light rain"})}]
+    msgs = [
+        {
+            "role": "user",
+            "content": "What is the weather in Paris in celsius? Use the tool.",
+        },
+        {
+            "role": "assistant",
+            "content": None,
+            "tool_calls": [
+                {
+                    "id": "call_1",
+                    "type": "function",
+                    "function": {"name": "get_weather", "arguments": args_json},
+                }
+            ],
+        },
+        {
+            "role": "tool",
+            "tool_call_id": "call_1",
+            "content": json.dumps(
+                {"city": "Paris", "temp_c": 18, "condition": "light rain"}
+            ),
+        },
+    ]
     r2 = stream_chat(msgs, 120, tools=tools)
     add("tool-roundtrip", r2, ok=("18" in r2["text"]))
 facts = "\n".join(f"Fact {i}: item {i} has value {i * 7 % 101}." for i in range(1, 700))
-r = stream_chat([{"role": "user", "content": "The following is a numbered list of facts.\n" + facts + "\nQuestion: what is the value of item 512? Answer with the number only."}], 8)
+r = stream_chat(
+    [
+        {
+            "role": "user",
+            "content": "The following is a numbered list of facts.\n"
+            + facts
+            + "\nQuestion: what is the value of item 512? Answer with the number only.",
+        }
+    ],
+    8,
+)
 add("needle-8k", r, ok=str(512 * 7 % 101) in r["text"])
 result["pi"] = pi
 
 spec1 = spec_counters()
-result["spec_delta"] = {k: spec1.get(k, 0) - spec0.get(k, 0) for k in set(spec0) | set(spec1)}
+result["spec_delta"] = {
+    k: spec1.get(k, 0) - spec0.get(k, 0) for k in set(spec0) | set(spec1)
+}
 if result["spec_delta"].get("draft_tokens", 0):
     d = result["spec_delta"]
-    print(f"spec: drafts {d.get('drafts', 0):.0f} draft_tokens {d.get('draft_tokens', 0):.0f} accepted {d.get('accepted_tokens', 0):.0f} -> {d.get('accepted_tokens', 0) / max(d.get('drafts', 1), 1):.2f} accepted/draft", flush=True)
+    print(
+        f"spec: drafts {d.get('drafts', 0):.0f} "
+        f"draft_tokens {d.get('draft_tokens', 0):.0f} "
+        f"accepted {d.get('accepted_tokens', 0):.0f} -> "
+        f"{d.get('accepted_tokens', 0) / max(d.get('drafts', 1), 1):.2f} acc/draft",
+        flush=True,
+    )
 
 path = os.path.join(args.out, f"{args.tag}.json")
 with open(path, "w") as f:

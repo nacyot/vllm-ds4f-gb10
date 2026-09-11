@@ -77,7 +77,11 @@ else
   ARGS+=(--compilation-config "$CG}")
   export VLLM_USE_BREAKABLE_CUDAGRAPH=${VLLM_USE_BREAKABLE_CUDAGRAPH:-1}
 fi
-[ "$SPEC" = "dspark" ] && ARGS+=(--speculative-config "{\"method\":\"dspark\",\"num_speculative_tokens\":$SPEC_K,\"draft_sample_method\":\"probabilistic\"}")
+if [ "$SPEC" = "dspark" ]; then
+  SC="{\"method\":\"dspark\",\"num_speculative_tokens\":$SPEC_K,\"draft_sample_method\":\"${SPEC_DRAFT:-probabilistic}\""
+  [ -n "$SPEC_EXTRA" ] && SC="$SC,$SPEC_EXTRA"
+  ARGS+=(--speculative-config "$SC}")
+fi
 # shellcheck disable=SC2206
 [ -n "$EXTRA_ARGS" ] && ARGS+=($EXTRA_ARGS)
 
