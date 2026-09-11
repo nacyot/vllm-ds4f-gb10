@@ -21,6 +21,11 @@ AVAIL_GIB=$(( $(awk '/MemAvailable/ {print $2}' /proc/meminfo) / 1048576 ))
 export VLLM_HOST_IP=$(ip -o -4 addr show "$NIC" | awk '{print $4}' | cut -d/ -f1)
 export NCCL_SOCKET_IFNAME=$NIC TP_SOCKET_IFNAME=$NIC GLOO_SOCKET_IFNAME=$NIC
 export NCCL_IB_HCA=$HCA NCCL_IB_GID_INDEX=3 NCCL_IB_GID_AUTO=0 NCCL_CROSS_NIC=1
+# GB10 unified memory: NCCL's cuMem pools and UCX mmap hooks are the two
+# allocators community reports tie to memory that is not returned after a
+# crash (x.com/Dragonomi/status/2092917630311313445); keep them off.
+export NCCL_CUMEM_ENABLE=${NCCL_CUMEM_ENABLE:-0}
+export UCX_MEM_MMAP_HOOK_MODE=${UCX_MEM_MMAP_HOOK_MODE:-none}
 # FlashInfer JIT needs nvcc on PATH (vLLM's has_flashinfer() probes for it).
 export CUDA_HOME=${CUDA_HOME:-/usr/local/cuda}
 export PATH=$CUDA_HOME/bin:$PATH
