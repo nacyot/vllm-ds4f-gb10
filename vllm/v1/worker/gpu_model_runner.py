@@ -4,6 +4,7 @@
 import functools
 import gc
 import itertools
+import os
 import threading
 import time
 from collections import defaultdict
@@ -257,6 +258,9 @@ if TYPE_CHECKING:
     from vllm.v1.worker.encoder_cudagraph import EncoderCudaGraphManager
 
 logger = init_logger(__name__)
+
+# VLLM_MEM_TRACE=1 logs allocator state per prefill chunk (see _trace_memory).
+_MEM_TRACE = os.environ.get("VLLM_MEM_TRACE", "0") == "1"
 
 
 def _get_parameter_for_reload(model: nn.Module, name: str) -> nn.Parameter:
@@ -4299,6 +4303,31 @@ class GPUModelRunner(
         return bool(self.discard_request_mask.np[:num_reqs].all())
 
     @torch.inference_mode()
+    def _trace_memory(self, scheduler_output: "SchedulerOutput") -> None:
+        """VLLM_MEM_TRACE=1: log the allocator state on every prefill chunk
+        (>= 1024 scheduled tokens) and every 200th step, to line host-side
+        /proc/meminfo samples up with GPU-side reservations (GB10 unified
+        memory has no nvidia-smi accounting)."""
+        self._mem_trace_step = getattr(self, "_mem_trace_step", 0) + 1
+        num_tokens = scheduler_output.total_num_scheduled_tokens
+        if num_tokens < 1024 and self._mem_trace_step % 200 != 0:
+            return
+        stats = torch.cuda.memory_stats()
+        free, total = torch.cuda.mem_get_info()
+        gib = 1 << 30
+        logger.info(
+            "mem trace step %d: %d tokens, %d reqs; allocated %.2f GiB "
+            "(peak %.2f), reserved %.2f GiB (peak %.2f), device free %.2f GiB",
+            self._mem_trace_step,
+            num_tokens,
+            len(scheduler_output.num_scheduled_tokens),
+            stats.get("allocated_bytes.all.current", 0) / gib,
+            stats.get("allocated_bytes.all.peak", 0) / gib,
+            stats.get("reserved_bytes.all.current", 0) / gib,
+            stats.get("reserved_bytes.all.peak", 0) / gib,
+            free / gib,
+        )
+
     def execute_model(
         self,
         scheduler_output: "SchedulerOutput",
@@ -4309,6 +4338,8 @@ class GPUModelRunner(
                 "State error: sample_tokens() must be called "
                 "after execute_model() returns None."
             )
+        if _MEM_TRACE:
+            self._trace_memory(scheduler_output)
 
         # If ngram_gpu is used, we need to copy the scheduler_output to avoid
         # the modification has influence on the scheduler_output in engine core process.
