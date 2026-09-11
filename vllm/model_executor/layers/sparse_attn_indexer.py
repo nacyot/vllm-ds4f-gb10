@@ -694,10 +694,13 @@ def sparse_attn_indexer(
             and current_platform.has_device_capability(90)
             and not current_platform.is_device_capability_family(120)
         )
-        use_persistent_topk = current_platform.is_cuda() and topk_tokens in (
-            512,
-            1024,
-            2048,
+        # SM12x (48 SMs, 99 KB smem): persistent_topk oversubscribes on long rows
+        # and its fallback needs 128 KB smem; top_k_per_row_decode is faster on
+        # GB10 at every measured width (Tech2Wild sm12x-indexer-topk, 2026-09-10).
+        use_persistent_topk = (
+            current_platform.is_cuda()
+            and topk_tokens in (512, 1024, 2048)
+            and not current_platform.is_device_capability_family(120)
         )
         if use_cooperative_topk:
             workspace_manager = current_workspace_manager()
