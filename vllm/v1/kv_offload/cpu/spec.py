@@ -113,6 +113,12 @@ class CPUOffloadingSpec(OffloadingSpec):
         # One host copy per block: either every rank's bytes are identical
         # (replicated layout) or only rank 0 ever touches the host tier (relay).
         self.single_copy = self.replicated_layout or self.relay_from_rank0
+        # GPU staging window of the relay broadcast (MiB); smaller windows
+        # cost more collectives per load but hold less device memory.
+        window_mib = self.extra_config.get("relay_window_mib")
+        self.relay_window_bytes: int | None = (
+            int(window_mib) << 20 if window_mib else None
+        )
         if config.worker_kv_bytes_per_block > 0 and world_size > 0:
             num_copies = 1 if self.single_copy else world_size
             kv_bytes_per_block = config.worker_kv_bytes_per_block * num_copies
@@ -200,6 +206,7 @@ class CPUOffloadingSpec(OffloadingSpec):
                 num_cpu_blocks=self.num_blocks,
                 mmap_region=mmap_region,
                 relay_from_rank0=self.relay_from_rank0,
+                relay_window_bytes=self.relay_window_bytes,
             )
         except Exception:
             if mmap_region is not None:

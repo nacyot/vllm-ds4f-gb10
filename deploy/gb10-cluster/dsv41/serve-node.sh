@@ -35,6 +35,7 @@ export TORCH_CUDA_ARCH_LIST=12.1a FLASHINFER_CUDA_ARCH_LIST=12.1a FLASHINFER_DIS
 # each nvcc job takes 5-6 GiB (earlyoom killed 8-way builds twice).
 export MAX_JOBS=${MAX_JOBS:-2}
 [ "${ENGRAM_STATS:-0}" = "1" ] && export VLLM_ENGRAM_MMAP_STATS=1
+[ -n "${FI_WORKSPACE_MIB:-}" ] && export VLLM_FLASHINFER_WORKSPACE_BUFFER_SIZE=$((FI_WORKSPACE_MIB * 1024 * 1024))
 export VLLM_ENGINE_READY_TIMEOUT_S=3600 VLLM_EXECUTE_MODEL_TIMEOUT_SECONDS=1800
 
 ARGS=(
@@ -102,7 +103,7 @@ if [ "${KVOFF_GIB:-0}" != "0" ]; then
     # cpu_bytes_to_use is merged in by VllmConfig from --kv-offloading-size.
     # relay_from_rank0: ranks live on 4 nodes, so only rank 0's CPU tier feeds the
     # fs tier; loads are broadcast from rank 0's GPU (MLA-style KV is TP-replicated).
-    ARGS+=(--kv-transfer-config "{\"kv_connector\":\"OffloadingConnector\",\"kv_role\":\"kv_both\",\"kv_load_failure_policy\":\"recompute\",\"kv_connector_extra_config\":{\"spec_name\":\"TieringOffloadingSpec\",\"blocks_per_chunk\":1,\"relay_from_rank0\":${KV_RELAY:-true},\"secondary_tiers\":[{\"type\":\"fs\",\"root_dir\":\"$KVFS_DIR\",\"n_read_threads\":16,\"n_write_threads\":16}]}}")
+    ARGS+=(--kv-transfer-config "{\"kv_connector\":\"OffloadingConnector\",\"kv_role\":\"kv_both\",\"kv_load_failure_policy\":\"recompute\",\"kv_connector_extra_config\":{\"spec_name\":\"TieringOffloadingSpec\",\"blocks_per_chunk\":1,\"relay_from_rank0\":${KV_RELAY:-true},\"relay_window_mib\":${KV_RELAY_WINDOW_MIB:-256},\"secondary_tiers\":[{\"type\":\"fs\",\"root_dir\":\"$KVFS_DIR\",\"n_read_threads\":16,\"n_write_threads\":16}]}}")
   fi
 fi
 # shellcheck disable=SC2206

@@ -867,7 +867,7 @@ def is_relay_receiver() -> bool:
     return tp.world_size > 1 and tp.rank_in_group != 0
 
 
-def _make_relay_config() -> RelayConfig | None:
+def _make_relay_config(window_bytes: int | None = None) -> RelayConfig | None:
     """Build the rank-0 relay over the tensor-parallel ranks, or None when the
     TP group is a single rank. A dedicated NCCL group keeps the relay's
     collectives ordered independently of the model's communicator."""
@@ -887,6 +887,7 @@ def _make_relay_config() -> RelayConfig | None:
         group=group,
         source_global_rank=tp.ranks[0],
         is_source=tp.rank_in_group == 0,
+        window_bytes=window_bytes or RelayConfig.window_bytes,
     )
 
 
@@ -906,9 +907,10 @@ class CPUOffloadingWorker(OffloadingWorker):
         mmap_region: SharedOffloadRegion | None = None,
         canonical_layout: bool = False,
         relay_from_rank0: bool = False,
+        relay_window_bytes: int | None = None,
     ):
         assert not canonical_layout or mmap_region is not None
-        relay = _make_relay_config() if relay_from_rank0 else None
+        relay = _make_relay_config(relay_window_bytes) if relay_from_rank0 else None
         if relay is not None:
             logger.info(
                 "KV offload relay enabled: rank %d is %s",

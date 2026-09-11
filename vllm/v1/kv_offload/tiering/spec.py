@@ -420,6 +420,7 @@ class TieringOffloadingSpec(CPUOffloadingSpec):
                 mmap_region=worker_mmap,
                 canonical_layout=self.config.canonical_layout,
                 relay_from_rank0=self.relay_from_rank0,
+                relay_window_bytes=self.relay_window_bytes,
             )
         except Exception:
             if worker_mmap is not None:
