@@ -1289,6 +1289,43 @@ def test_scratch_group_is_never_offloaded(request_runner, async_scheduling: bool
         assert get_offload_group_idx(key_args.args[0]) in (0, 1)
 
 
+def test_nested_full_attention_chunks_align_to_largest(request_runner):
+    """DeepSeek V4 has full-attention groups with 64- and 128-token blocks
+    plus sliding-window groups. The hit boundary is the largest chunk, so the
+    sliding-window store mask must not collapse to dense."""
+    kv_cache_groups = [
+        KVCacheGroupSpec(
+            ["mla_ratio1"],
+            FullAttentionSpec(
+                block_size=4, num_kv_heads=1, head_size=1, dtype=torch.float32
+            ),
+        ),
+        KVCacheGroupSpec(
+            ["mla_ratio2"],
+            FullAttentionSpec(
+                block_size=8, num_kv_heads=1, head_size=1, dtype=torch.float32
+            ),
+        ),
+        KVCacheGroupSpec(
+            ["swa"],
+            SlidingWindowSpec(
+                block_size=4,
+                num_kv_heads=1,
+                head_size=1,
+                dtype=torch.float32,
+                sliding_window=8,
+            ),
+        ),
+    ]
+    runner = request_runner(
+        block_size=4,
+        num_gpu_blocks=100,
+        async_scheduling=False,
+        kv_cache_groups=kv_cache_groups,
+    )
+    assert runner.connector_scheduler.config.alignment_tokens == 8
+
+
 @pytest.mark.parametrize("async_scheduling", [True, False])
 def test_two_groups_different_block_sizes(request_runner, async_scheduling: bool):
     tokens_per_hash = 4

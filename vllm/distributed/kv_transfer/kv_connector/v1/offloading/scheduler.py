@@ -195,6 +195,15 @@ class SchedulerOffloadConfig(NamedTuple):
         alignment_tokens: int | None = None
         if len(full_attn_tokens_per_chunk) == 1:
             alignment_tokens = full_attn_tokens_per_chunk.pop()
+        elif full_attn_tokens_per_chunk and all(
+            max(full_attn_tokens_per_chunk) % size == 0
+            for size in full_attn_tokens_per_chunk
+        ):
+            # Full-attention groups with nested chunk sizes (DeepSeek V4:
+            # compress ratio 1 -> 64 tokens, ratio 2 -> 128 tokens). A load
+            # hit must be chunk-aligned for every full-attention group, so
+            # the effective hit boundary is the largest chunk.
+            alignment_tokens = max(full_attn_tokens_per_chunk)
         elif not full_attn_tokens_per_chunk:
             all_tokens_per_chunk = [
                 tpb * spec.blocks_per_chunk for tpb in spec.tokens_per_block
