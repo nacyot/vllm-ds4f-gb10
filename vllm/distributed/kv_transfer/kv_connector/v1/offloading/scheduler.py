@@ -789,6 +789,13 @@ class OffloadingConnectorScheduler:
                 )
                 if max_hit_size_tokens - num_computed_tokens < tokens_per_chunk:
                     # We can only load less than a chunk, so skip.
+                    self._log_zero_hit(
+                        req_status,
+                        group_idx,
+                        "less than a chunk before lookup",
+                        max_hit=max_hit_size_tokens,
+                        keys=len(offload_keys),
+                    )
                     return 0
 
                 sliding_window_size_in_chunks = (
@@ -829,6 +836,17 @@ class OffloadingConnectorScheduler:
                         req_status.req_context,
                     )
                 if num_hit_chunks == 0:
+                    self._log_zero_hit(
+                        req_status,
+                        group_idx,
+                        "no hit chunks",
+                        max_hit=max_hit_size_tokens,
+                        keys=len(offload_keys),
+                        start=start_chunk_idx,
+                        queried=num_chunks - start_chunk_idx,
+                        window=sliding_window_size_in_chunks,
+                        eagle=is_eagle_unverified,
+                    )
                     return 0
 
                 if num_hit_chunks is None:
@@ -846,6 +864,17 @@ class OffloadingConnectorScheduler:
                 new_num_hit_tokens = max_hit_size_tokens - num_computed_tokens
                 if new_num_hit_tokens < tokens_per_chunk:
                     # We can only load less than a chunk, so skip.
+                    self._log_zero_hit(
+                        req_status,
+                        group_idx,
+                        "hit shrank below a chunk",
+                        max_hit=max_hit_size_tokens,
+                        keys=len(offload_keys),
+                        start=start_chunk_idx,
+                        hit_chunks=num_hit_chunks,
+                        window=sliding_window_size_in_chunks,
+                        eagle=is_eagle_unverified,
+                    )
                     return 0
 
                 if new_num_hit_tokens < num_hit_tokens:
@@ -911,6 +940,24 @@ class OffloadingConnectorScheduler:
     ) -> OffloadKey:
         hash_idx = boundary_tokens // self.config.tokens_per_hash - 1
         return make_offload_key(request.block_hashes[hash_idx], group_idx)
+
+    def _log_zero_hit(
+        self, req_status: RequestOffloadState, group_idx: int, why: str, **fields
+    ) -> None:
+        """Explain a zero-hit lookup of a long request (>= 64K tokens); short
+        requests miss all the time and stay quiet."""
+        req = req_status.req
+        if req.num_tokens < 65536:
+            return
+        logger.info(
+            "offload lookup 0 for %s (%d tokens, %d local): group %d, %s, %s",
+            req.request_id,
+            req.num_tokens,
+            req_status.num_locally_computed_tokens,
+            group_idx,
+            why,
+            ", ".join(f"{k}={v}" for k, v in fields.items()),
+        )
 
     def _lookup(self, req_status: RequestOffloadState) -> int | None:
         complete_hit = self._lookup_complete_chunks(req_status)
