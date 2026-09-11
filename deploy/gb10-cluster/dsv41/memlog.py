@@ -35,6 +35,7 @@ MODEL = os.path.expanduser("~/models/DeepSeek-V4.1-Flash")
 SHARDS = sorted(glob.glob(os.path.join(MODEL, "model-0004[78]-of-00048.safetensors")))
 
 libc = ctypes.CDLL("libc.so.6", use_errno=True)
+_LOW_BIT = bytes(b & 1 for b in range(256))
 libc.mincore.argtypes = [ctypes.c_void_p, ctypes.c_size_t, ctypes.c_char_p]
 
 
@@ -103,8 +104,9 @@ class Shard:
     def resident_mib(self) -> int:
         if libc.mincore(self.base, self.size, self.vec) != 0:
             return -1
-        # Bit 0 of each byte: resident.
-        n = sum(b & 1 for b in self.vec.raw)
+        # Bit 0 of each byte: resident. translate+count runs in C (a Python
+        # loop over 6M bytes cost a CPU core for a second per sample).
+        n = self.vec.raw.translate(_LOW_BIT).count(b"\x01")
         return n * mmap.PAGESIZE // (1024 * 1024)
 
 
