@@ -103,6 +103,17 @@ AC=""
 [ "${EMPTY_CACHE:-0}" = "1" ] && AC+='"empty_cache_after_prefill":true,'
 [ "${LOG_PARAM_BYTES:-0}" = "1" ] && AC+='"log_param_bytes":true,'
 [ -n "$AC" ] && ARGS+=(--additional-config "{${AC%,}}")
+# Kernel/parallel levers (issue #12). Dedicated knobs: JSON and flags do not
+# survive EXTRA_ARGS through `systemd-run --setenv` and the word split below.
+[ -n "${MOE_BACKEND:-}" ] && ARGS+=(--moe-backend "$MOE_BACKEND")
+[ -n "${LINEAR_BACKEND:-}" ] && ARGS+=(--linear-backend "$LINEAR_BACKEND")
+[ "${EP:-0}" = "1" ] && ARGS+=(--enable-expert-parallel)
+if [ -n "${PROFILER_DIR:-}" ]; then
+  # torch profiler armed at boot; /start_profile and /stop_profile on the head
+  # drive it, every rank writes its own trace under PROFILER_DIR on its node.
+  mkdir -p "$PROFILER_DIR"
+  ARGS+=(--profiler-config "{\"profiler\":\"torch\",\"torch_profiler_dir\":\"$PROFILER_DIR\",\"torch_profiler_with_stack\":false,\"ignore_frontend\":true}")
+fi
 if [ "${KVOFF_GIB:-0}" != "0" ]; then
   ARGS+=(--kv-offloading-size "$KVOFF_GIB")
   if [ -n "$KVFS_DIR" ]; then
