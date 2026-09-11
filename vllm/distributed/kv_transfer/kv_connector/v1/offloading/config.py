@@ -73,7 +73,7 @@ def build_offloading_config(
         # stands for (DeepSeek V4 MLA + indexer); a group's data never
         # exceeds the block it is packed into.
         num_bytes = _group_bytes_per_block(group)
-        if worker_kv_bytes_per_block > 0:
+        if packed_layout:
             num_bytes = min(num_bytes, worker_kv_bytes_per_block)
         return num_bytes
 

@@ -3344,8 +3344,9 @@ class TestEagle:
         Setup: 2 groups — group 0 is normal full-attention, group 1 is
         eagle full-attention. With a 3-block prompt, group 1 stores all 3
         prompt blocks at the end of prefill (the trailing prompt block is
-        stable), but skips block 3 once it fills with decoded tokens (its
-        draft-layer KV is volatile until the next block starts).
+        stable), skips block 3 once it fills with decoded tokens (its
+        draft-layer KV is volatile until the next block starts), and stores
+        it when the request finishes on EOS (no rejection can follow).
         """
         block_size = 4
         blocks_per_chunk = 1
@@ -3403,6 +3404,7 @@ class TestEagle:
                 (1, 0),
                 (1, 1),
                 (1, 2),
+                (1, 3),
             ),
         )
 
@@ -3410,8 +3412,9 @@ class TestEagle:
     def test_sw_store_excludes_trailing_decode_block(
         self, request_runner, async_scheduling: bool
     ):
-        """Eagle sliding-window group stores all prompt blocks but excludes
-        the trailing chunk while decoding."""
+        """Eagle sliding-window group stores all prompt blocks, excludes the
+        trailing chunk while decoding and stores it once the request has
+        finished."""
         block_size = 4
         sliding_window = 8
         num_gpu_blocks = 100
@@ -3449,7 +3452,7 @@ class TestEagle:
         # 4 decoded tokens fill block 3 entirely with decode tokens.
         runner.run(
             decoded_tokens=[1, 1, 1, 1, EOS_TOKEN_ID],
-            expected_stored=((0, 0), (0, 1), (0, 2)),
+            expected_stored=((0, 0), (0, 1), (0, 2), (0, 3)),
         )
 
     @pytest.mark.parametrize("async_scheduling", [True, False])
