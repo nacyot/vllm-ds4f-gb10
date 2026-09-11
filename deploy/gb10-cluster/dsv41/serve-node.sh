@@ -27,6 +27,12 @@ export NCCL_IB_HCA=$HCA NCCL_IB_GID_INDEX=3 NCCL_IB_GID_AUTO=0 NCCL_CROSS_NIC=1
 # open files" on the 512K/KV 12 GiB boot; opt in explicitly if needed.
 [ -n "${NCCL_CUMEM_ENABLE:-}" ] && export NCCL_CUMEM_ENABLE
 [ -n "${UCX_MEM_MMAP_HOOK_MODE:-}" ] && export UCX_MEM_MMAP_HOOK_MODE
+# NCCL_LEAN=1: MiaAI-Lab's DGX Spark TP=4 profile (default NCCL buffers measured
+# at 4.7 GiB per node there, 0.14 GB with these); benchmark before adopting.
+if [ "${NCCL_LEAN:-0}" = "1" ]; then
+  export NCCL_BUFFSIZE=${NCCL_BUFFSIZE:-1048576} NCCL_LL128_BUFFSIZE=${NCCL_LL128_BUFFSIZE:-262144}
+  export NCCL_PROTO=${NCCL_PROTO:-^LL128} NCCL_MAX_NCHANNELS=${NCCL_MAX_NCHANNELS:-8}
+fi
 # FlashInfer JIT needs nvcc on PATH (vLLM's has_flashinfer() probes for it).
 export CUDA_HOME=${CUDA_HOME:-/usr/local/cuda}
 export PATH=$CUDA_HOME/bin:$PATH
