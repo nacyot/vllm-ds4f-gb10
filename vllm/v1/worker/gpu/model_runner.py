@@ -181,6 +181,13 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             additional_config.get("mem_trace", False)
         )
         self._mem_trace_step = 0
+        # --additional-config '{"empty_cache_after_prefill": true}': hand the
+        # allocator's reservation back to the driver once a prefill chunk run
+        # ends (on unified memory it is host memory the OS could use).
+        self._empty_cache_after_prefill = isinstance(additional_config, dict) and bool(
+            additional_config.get("empty_cache_after_prefill", False)
+        )
+        self._prev_step_was_prefill = False
         self.model_config = vllm_config.model_config
         self.cache_config = vllm_config.cache_config
         self.compilation_config = vllm_config.compilation_config
@@ -1563,6 +1570,24 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             free / gib,
         )
 
+    def _maybe_empty_cache(self, scheduler_output: SchedulerOutput) -> None:
+        """Release cached allocator segments on the first non-prefill step
+        after a run of prefill chunks, when more than 1 GiB is reserved but
+        unallocated."""
+        is_prefill = scheduler_output.total_num_scheduled_tokens >= 1024
+        if self._prev_step_was_prefill and not is_prefill:
+            stats = torch.cuda.memory_stats()
+            slack = stats.get("reserved_bytes.all.current", 0) - stats.get(
+                "allocated_bytes.all.current", 0
+            )
+            if slack > (1 << 30):
+                torch.cuda.synchronize()
+                torch.cuda.empty_cache()
+                logger.info(
+                    "empty_cache after prefill: %.2f GiB released", slack / (1 << 30)
+                )
+        self._prev_step_was_prefill = is_prefill
+
     def execute_model(
         self,
         scheduler_output: SchedulerOutput,
@@ -1575,6 +1600,8 @@ class GPUModelRunner(LoRAModelRunnerMixin):
     ) -> ModelRunnerOutput | IntermediateTensors | None:
         if self._mem_trace and not dummy_run:
             self._trace_memory(scheduler_output)
+        if self._empty_cache_after_prefill and not dummy_run:
+            self._maybe_empty_cache(scheduler_output)
         if not dummy_run:
             # Update the request states.
             self.update_pp_decode_requests()
