@@ -78,7 +78,7 @@ else
   export VLLM_USE_BREAKABLE_CUDAGRAPH=${VLLM_USE_BREAKABLE_CUDAGRAPH:-1}
 fi
 if [ "$SPEC" = "dspark" ]; then
-  SC="{\"method\":\"dspark\",\"num_speculative_tokens\":$SPEC_K,\"draft_sample_method\":\"${SPEC_DRAFT:-probabilistic}\""
+  SC="{\"method\":\"dspark\",\"num_speculative_tokens\":$SPEC_K,\"draft_sample_method\":\"${SPEC_DRAFT:-probabilistic}\",\"rejection_sample_method\":\"${SPEC_REJECT:-standard}\""
   [ -n "$SPEC_EXTRA" ] && SC="$SC,$SPEC_EXTRA"
   ARGS+=(--speculative-config "$SC}")
 fi
