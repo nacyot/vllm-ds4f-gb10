@@ -105,8 +105,16 @@ class CPUOffloadingSpec(OffloadingSpec):
         self.kv_bytes_per_chunk = 0
         self.cpu_page_size_per_worker = 0
         self.replicated_layout = config.replicated_layout and self._uses_shared_region()
+        # Multi-node TP: only rank 0's CPU tier is visible to the scheduler-side
+        # tiers, so loads are broadcast from rank 0's GPU to the other ranks.
+        self.relay_from_rank0: bool = bool(
+            self.extra_config.get("relay_from_rank0", False)
+        )
+        # One host copy per block: either every rank's bytes are identical
+        # (replicated layout) or only rank 0 ever touches the host tier (relay).
+        self.single_copy = self.replicated_layout or self.relay_from_rank0
         if config.worker_kv_bytes_per_block > 0 and world_size > 0:
-            num_copies = 1 if self.replicated_layout else world_size
+            num_copies = 1 if self.single_copy else world_size
             kv_bytes_per_block = config.worker_kv_bytes_per_block * num_copies
             kv_bytes_per_chunk = kv_bytes_per_block * self.blocks_per_chunk
 
@@ -133,11 +141,6 @@ class CPUOffloadingSpec(OffloadingSpec):
         self._worker: CPUOffloadingWorker | None = None
 
         self.eviction_policy: str = self.extra_config.get("eviction_policy", "lru")
-        # Multi-node TP: only rank 0's CPU tier is visible to the scheduler-side
-        # tiers, so loads are broadcast from rank 0's GPU to the other ranks.
-        self.relay_from_rank0: bool = bool(
-            self.extra_config.get("relay_from_rank0", False)
-        )
         self.cache_policy_module_path: str | None = self.extra_config.get(
             "cache_policy_module_path"
         )
@@ -174,9 +177,10 @@ class CPUOffloadingSpec(OffloadingSpec):
         # num_blocks == 0 would size the region to zero bytes, which cannot be
         # mmap'd; fall back to the tensor path (empty tensors) as before.
         if self._uses_shared_region() and self.num_blocks > 0:
-            # Replicated layout puts all ranks on slot 0 (single MLA copy);
-            # otherwise each rank takes its own slot by physical device index.
-            if self.replicated_layout:
+            # A single host copy puts all ranks on slot 0 (replicated layout
+            # or relay); otherwise each rank takes its own slot by physical
+            # device index.
+            if self.single_copy:
                 rank = 0
             else:
                 world_size = self.config.parallel.world_size

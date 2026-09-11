@@ -56,6 +56,27 @@ def build_offloading_config(
     engine_id = kv_transfer_config.engine_id
 
     parallel_config = vllm_config.parallel_config
+    worker_kv_bytes_per_block = 0
+    packed_layout = False
+    if kv_cache_config.num_blocks > 0 and kv_cache_config.kv_cache_tensors:
+        # Every KVCacheTensor describes placement within the same backing allocation,
+        # so its size is the total, not a per-tensor share.
+        total_gpu_kv_bytes = kv_cache_config.kv_cache_tensors[0].size
+        worker_kv_bytes_per_block = total_gpu_kv_bytes // kv_cache_config.num_blocks
+        packed_layout = all(
+            tensor.block_stride == worker_kv_bytes_per_block
+            for tensor in kv_cache_config.kv_cache_tensors
+        )
+
+    def _bounded_group_bytes(group: KVCacheGroupSpec) -> int:
+        # A merged group spec can report a larger page than the layers it
+        # stands for (DeepSeek V4 MLA + indexer); a group's data never
+        # exceeds the block it is packed into.
+        num_bytes = _group_bytes_per_block(group)
+        if worker_kv_bytes_per_block > 0:
+            num_bytes = min(num_bytes, worker_kv_bytes_per_block)
+        return num_bytes
+
     groups = tuple(
         OffloadingGroupConfig(
             tokens_per_block=resolve_dcp_kv_block_size(
@@ -63,7 +84,7 @@ def build_offloading_config(
                 parallel_config.decode_context_parallel_size,
             ),
             layer_names=tuple(group.layer_names),
-            bytes_per_block=_group_bytes_per_block(group),
+            bytes_per_block=_bounded_group_bytes(group),
         )
         for group in kv_cache_config.kv_cache_groups
     )
@@ -112,18 +133,6 @@ def build_offloading_config(
         tokens_per_block = unique_tokens_per_block.pop()
         assert tokens_per_chunk_int % tokens_per_block == 0
         blocks_per_chunk = tokens_per_chunk_int // tokens_per_block
-
-    worker_kv_bytes_per_block = 0
-    packed_layout = False
-    if kv_cache_config.num_blocks > 0 and kv_cache_config.kv_cache_tensors:
-        # Every KVCacheTensor describes placement within the same backing allocation,
-        # so its size is the total, not a per-tensor share.
-        total_gpu_kv_bytes = kv_cache_config.kv_cache_tensors[0].size
-        worker_kv_bytes_per_block = total_gpu_kv_bytes // kv_cache_config.num_blocks
-        packed_layout = all(
-            tensor.block_stride == worker_kv_bytes_per_block
-            for tensor in kv_cache_config.kv_cache_tensors
-        )
 
     single_group_spec = (
         kv_cache_config.kv_cache_groups[0].kv_cache_spec
