@@ -115,22 +115,37 @@ def verify_checksums(
 ) -> None:
     """Compare each loaded block with its recorded CRC32. The first mismatching
     file is removed and an OSError carrying ``num_succeeded`` is raised so the
-    tier keeps the blocks before it and marks the rest as misses."""
+    tier keeps the blocks before it and marks the rest as misses.
+
+    The data and the xattr are read by path at different moments, so a
+    concurrent rewrite of the same key (temp file + rename) can pair the old
+    bytes with the new checksum. A mismatch is therefore confirmed by reading
+    the file again before it is declared corrupt; the re-read bytes replace the
+    stale ones."""
     for i, (path, offset, size) in enumerate(zip(paths, offsets, sizes)):
         try:
             recorded = os.getxattr(path, _XATTR_CRC)
         except OSError:
             continue
-        if int.from_bytes(recorded, "big") != _crc_of(view, offset, size):
-            try:
-                os.remove(path)
-            except OSError as cleanup_exc:
-                logger.warning(
-                    "Failed to remove corrupt file %s: %s", path, cleanup_exc
-                )
-            exc = OSError(f"Checksum mismatch for {path}")
-            exc.num_succeeded = i  # type: ignore[attr-defined]
-            raise exc
+        if int.from_bytes(recorded, "big") == _crc_of(view, offset, size):
+            continue
+        try:
+            _load_block(path, view, offset, size, use_o_direct=False)
+            recorded = os.getxattr(path, _XATTR_CRC)
+        except OSError:
+            recorded = None
+        if recorded is not None and int.from_bytes(recorded, "big") == _crc_of(
+            view, offset, size
+        ):
+            logger.debug("Re-read %s after a concurrent rewrite", path)
+            continue
+        try:
+            os.remove(path)
+        except OSError as cleanup_exc:
+            logger.warning("Failed to remove corrupt file %s: %s", path, cleanup_exc)
+        exc = OSError(f"Checksum mismatch for {path}")
+        exc.num_succeeded = i  # type: ignore[attr-defined]
+        raise exc
 
 
 def _block_sizes(block_size: int | list[int], count: int) -> list[int]:
@@ -218,6 +233,13 @@ def _load_block(
             os.close(fd)
 
 
+def _exists_with_size(path: str, size: int) -> bool:
+    try:
+        return os.stat(path).st_size == size
+    except OSError:
+        return False
+
+
 def batch_store_block(
     paths: list[str],
     view: memoryview,
@@ -225,6 +247,7 @@ def batch_store_block(
     block_size: int | list[int],
     use_o_direct: bool = True,
     checksums: bool = False,
+    skip_existing: bool = False,
 ) -> None:
     """
     Store a batch of KV blocks from a shared buffer to disk in one call.
@@ -232,9 +255,26 @@ def batch_store_block(
     Each block buffer[offsets[i] : offsets[i]+size_i] is written atomically
     to dest_paths[i] via a temp-file rename, where size_i is ``block_size``
     or ``block_size[i]`` when a per-block list is given. Raises on first error.
+    With ``skip_existing`` a block whose file is already present with the
+    expected size is not rewritten: the key is a content hash, and rewriting
+    a file that a concurrent load is reading pairs its bytes with the wrong
+    checksum.
     """
     sizes = _block_sizes(block_size, len(offsets))
     _validate_offsets(view, offsets, max(sizes, default=0))
+
+    if skip_existing:
+        keep = [
+            i
+            for i, (path, size) in enumerate(zip(paths, sizes))
+            if not _exists_with_size(path, size)
+        ]
+        if len(keep) < len(paths):
+            paths = [paths[i] for i in keep]
+            offsets = [offsets[i] for i in keep]
+            sizes = [sizes[i] for i in keep]
+        if not paths:
+            return
 
     if _HAS_FSIO_C:
         view_B = view.cast("B")

@@ -271,6 +271,7 @@ class FileSystemTierManager(SecondaryTierManager):
             self._key_sizes(keys),
             self._use_o_direct,
             self._checksums,
+            True,
         )
         self._pool.enqueue_store(job_metadata.job_id, 1, [task])
 

@@ -259,6 +259,53 @@ def test_store_then_load_roundtrip(fs_tier):
     ]
 
 
+def test_store_skips_existing_file(fs_tier):
+    """A key is a content hash: a second store of a key whose file already
+    exists with the right size leaves the file alone (no temp+rename that a
+    concurrent load could race with)."""
+    tier, tensor = fs_tier
+    tier.submit_store(make_job(1, [key(1)], [0]))
+    assert all(r.success for r in drain(tier))
+    dest = tier.file_mapper.get_file_name(key(1))
+    before = os.stat(dest)
+    tensor[1].fill_(7)  # a different block id with different bytes, same key
+    tier.submit_store(make_job(2, [key(1)], [1]))
+    assert all(r.success for r in drain(tier))
+    after = os.stat(dest)
+    assert (after.st_ino, after.st_mtime_ns) == (before.st_ino, before.st_mtime_ns)
+
+
+def test_checksum_mismatch_is_confirmed_by_reread(tmp_path):
+    """The data and the xattr are read by path at different times, so a
+    concurrent rewrite pairs stale bytes with a fresh checksum. The verifier
+    re-reads the file before condemning it and keeps the fresh bytes."""
+    from vllm.v1.kv_offload.tiering.fs.io import (
+        batch_load_block,
+        batch_store_block,
+        verify_checksums,
+    )
+
+    size = mmap.PAGESIZE
+    tensor = _page_aligned_zero_tensor(2, size, dtype=torch.uint8)
+    tensor[0].fill_(3)
+    view = memoryview(tensor.numpy())
+    path = str(tmp_path / "blk.bin")
+    batch_store_block([path], view, [0], size, use_o_direct=False, checksums=True)
+    # Simulate the race: the view holds bytes from an older version.
+    tensor[0].fill_(9)
+    verify_checksums([path], view, [0], [size])
+    assert os.path.exists(path)
+    assert bytes(view.cast("B")[:size]) == bytes([3]) * size
+    # A real corruption (bytes on disk no longer match the recorded CRC) is
+    # still caught and the file removed.
+    with open(path, "r+b") as f:
+        f.seek(0)
+        f.write(b"\x05" * size)
+    with pytest.raises(OSError, match="Checksum mismatch"):
+        batch_load_block([path], view, [0], size, use_o_direct=False, checksums=True)
+    assert not os.path.exists(path)
+
+
 def test_invalid_path_raises_at_construction():
     """Construction must fail immediately when the config file cannot be written."""
     tensor = _page_aligned_zero_tensor(32, _BLOCK_ELEMENTS)
