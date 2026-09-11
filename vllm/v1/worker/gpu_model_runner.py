@@ -4,7 +4,6 @@
 import functools
 import gc
 import itertools
-import os
 import threading
 import time
 from collections import defaultdict
@@ -259,9 +258,6 @@ if TYPE_CHECKING:
 
 logger = init_logger(__name__)
 
-# VLLM_MEM_TRACE=1 logs allocator state per prefill chunk (see _trace_memory).
-_MEM_TRACE = os.environ.get("VLLM_MEM_TRACE", "0") == "1"
-
 
 def _get_parameter_for_reload(model: nn.Module, name: str) -> nn.Parameter:
     """Resolve checkpoint names without changing the model's module tree."""
@@ -513,6 +509,13 @@ class GPUModelRunner(
         device: torch.device,
     ):
         self.vllm_config = vllm_config
+        # --additional-config '{"mem_trace": true}' logs allocator state per
+        # prefill chunk (see _trace_memory); an env var does not reach the
+        # engine core process.
+        additional_config = vllm_config.additional_config
+        self._mem_trace = isinstance(additional_config, dict) and bool(
+            additional_config.get("mem_trace", False)
+        )
         self.model_config = vllm_config.model_config
         self.cache_config = vllm_config.cache_config
         self.offload_config = vllm_config.offload_config
@@ -4304,7 +4307,7 @@ class GPUModelRunner(
 
     @torch.inference_mode()
     def _trace_memory(self, scheduler_output: "SchedulerOutput") -> None:
-        """VLLM_MEM_TRACE=1: log the allocator state on every prefill chunk
+        """mem_trace: log the allocator state on every prefill chunk
         (>= 1024 scheduled tokens) and every 200th step, to line host-side
         /proc/meminfo samples up with GPU-side reservations (GB10 unified
         memory has no nvidia-smi accounting)."""
@@ -4338,7 +4341,7 @@ class GPUModelRunner(
                 "State error: sample_tokens() must be called "
                 "after execute_model() returns None."
             )
-        if _MEM_TRACE:
+        if self._mem_trace:
             self._trace_memory(scheduler_output)
 
         # If ngram_gpu is used, we need to copy the scheduler_output to avoid

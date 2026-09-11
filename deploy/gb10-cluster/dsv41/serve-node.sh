@@ -55,7 +55,7 @@ ARGS=(
   --default-chat-template-kwargs "{\"thinking\":$THINKING}"
 )
 if [ "$ENGRAM_MMAP" = "1" ]; then
-  ARGS+=(--engram-config "{\"mmap\":true,\"mmap_prefault_threads\":$ENGRAM_THREADS}")
+  ARGS+=(--engram-config "{\"mmap\":true,\"mmap_prefault_threads\":$ENGRAM_THREADS,\"mmap_release_after_steps\":${ENGRAM_RELEASE:-3}}")
 else
   ARGS+=(--engram-config '{"cpu_offload":false}')
 fi
@@ -84,6 +84,7 @@ if [ "$SPEC" = "dspark" ]; then
 fi
 [ -n "${KV_RETENTION:-}" ] && export VLLM_PREFIX_CACHE_RETENTION_INTERVAL=$KV_RETENTION
 [ "${KV_TRACE:-0}" = "1" ] && export VLLM_KV_OFFLOAD_TRACE=1
+[ "${MEM_TRACE:-0}" = "1" ] && ARGS+=(--additional-config '{"mem_trace":true}')
 if [ "${KVOFF_GIB:-0}" != "0" ]; then
   ARGS+=(--kv-offloading-size "$KVOFF_GIB")
   if [ -n "$KVFS_DIR" ]; then
