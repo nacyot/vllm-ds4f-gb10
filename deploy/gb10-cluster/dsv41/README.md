@@ -185,6 +185,7 @@ with a live server for the torch-process rule. Details:
   during boot. Run the probe scripts from `~/vllm-dsv41/deploy/gb10-cluster/dsv41/`
   on the head, using `.venv/bin/python` from that repository; do not use
   old script copies in `~/dsv41-prep`. Python/Bash changes need no `.so` rebuild.
+  Matching script entries in `~/dsv41-prep/` are symlinks to `~/vllm-dsv41/deploy/gb10-cluster/dsv41/` since 2026-09-12 (#28).
 - Keep cluster operations in small foreground steps, monitor at 30–60 second
   intervals, and stop on anomalies. Do not chain background jobs. Use
   `mktemp -d` for fresh artifacts; do not use variable or glob paths with
