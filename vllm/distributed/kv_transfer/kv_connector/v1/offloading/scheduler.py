@@ -356,6 +356,9 @@ class RequestOffloadState:
     # time.monotonic() of this request's first deferred offload lookup;
     # None once consumed (observed) or while no lookup is pending.
     deferred_lookup_start_time: float | None = None
+    # manager.state_epoch at which the last lookup deferred on HIT_PENDING
+    # alone; the lookup is skipped while the epoch stays the same.
+    pending_lookup_epoch: int | None = None
     # Fine-grained token boundary selected beyond the last complete offload
     # chunk. It is consumed when the corresponding load is scheduled.
     partial_tail_boundary: int | None = None
@@ -597,10 +600,13 @@ class OffloadingConnectorScheduler:
         self._block_id_to_pending_jobs: dict[int, set[int]] = {}
 
         self._events_tracker = OffloadingEventsTracker(spec.kv_events_config)
+        # Set by the lookup helpers when a RETRY was seen during _lookup.
+        self._lookup_saw_retry = False
 
     def _maybe_observe_lookup_async_delay(
         self, req_status: RequestOffloadState
     ) -> None:
+        req_status.pending_lookup_epoch = None
         start_time = req_status.deferred_lookup_start_time
         if start_time is None:
             return
@@ -663,6 +669,7 @@ class OffloadingConnectorScheduler:
                     # Don't break: keep scanning to let manager kick off
                     # async lookups (until a miss is detected).
                     defer_lookup = True
+                    self._lookup_saw_retry = True
                 case LookupResult.MISS:
                     break
         return hit_count if not defer_lookup else None
@@ -694,6 +701,7 @@ class OffloadingConnectorScheduler:
                     # async lookups.
                     defer_lookup = True
                     consecutive_hits = 0
+                    self._lookup_saw_retry = True
                 case LookupResult.MISS:
                     consecutive_hits = 0
             if consecutive_hits == sliding_window_size:
@@ -960,6 +968,7 @@ class OffloadingConnectorScheduler:
         )
 
     def _lookup(self, req_status: RequestOffloadState) -> int | None:
+        self._lookup_saw_retry = False
         complete_hit = self._lookup_complete_chunks(req_status)
         req_status.partial_tail_boundary = None
         if complete_hit is None or not self.config.supports_partial_tail:
@@ -993,6 +1002,8 @@ class OffloadingConnectorScheduler:
                     break
                 if result in (LookupResult.HIT_PENDING, LookupResult.RETRY):
                     boundary_pending = True
+                if result is LookupResult.RETRY:
+                    self._lookup_saw_retry = True
 
             pending |= boundary_pending
             if not boundary_missed and not boundary_pending:
@@ -1055,11 +1066,21 @@ class OffloadingConnectorScheduler:
             return None, False
 
         req_status.update_offload_keys()
+        skip_lookup = (
+            req_status.pending_lookup_epoch is not None
+            and num_computed_tokens == req_status.num_locally_computed_tokens
+            and self.manager.state_epoch == req_status.pending_lookup_epoch
+        )
         req_status.num_locally_computed_tokens = num_computed_tokens
 
         num_hit_tokens: int | None
         if request.skip_reading_prefix_cache:
             num_hit_tokens = 0
+            req_status.pending_lookup_epoch = None
+        elif skip_lookup:
+            # Still waiting on the same HIT_PENDING blocks; nothing in the
+            # manager changed since the last scan, so its answer stands.
+            num_hit_tokens = None
         else:
             lookup_start = time.monotonic()
             num_hit_tokens = self._lookup(req_status)
@@ -1070,6 +1091,11 @@ class OffloadingConnectorScheduler:
             if num_hit_tokens is None:
                 if req_status.deferred_lookup_start_time is None:
                     req_status.deferred_lookup_start_time = lookup_start
+                # Read after the scan: lookup() may have folded finished
+                # jobs into the epoch before answering.
+                req_status.pending_lookup_epoch = (
+                    None if self._lookup_saw_retry else self.manager.state_epoch
+                )
             else:
                 self._maybe_observe_lookup_async_delay(req_status)
         req_status.update_num_hit_chunks(num_computed_tokens + (num_hit_tokens or 0))
@@ -1865,6 +1891,7 @@ class OffloadingConnectorScheduler:
                 group_state.next_stored_chunk_idx = 0
             status.transfer_jobs.clear()
             status.partial_tail_boundary = None
+            status.pending_lookup_epoch = None
 
         # Discard jobs and save job_counter to be able to discard worker responses
         self._stale_job_threshold = self._job_counter

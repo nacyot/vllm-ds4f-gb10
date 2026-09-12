@@ -481,6 +481,31 @@ def test_cpu_manager():
     )
 
 
+def test_state_epoch_advances_when_lookup_results_can_change():
+    cpu_manager = make_cpu_manager(num_blocks=2)
+    epoch = cpu_manager.state_epoch
+
+    # allocation alone changes nothing a lookup could see
+    assert cpu_manager.prepare_store(to_keys([1, 2]), _EMPTY_REQ_CTX) is not None
+    assert cpu_manager.state_epoch == epoch
+
+    cpu_manager.complete_store(to_keys([1]), _EMPTY_REQ_CTX)
+    assert cpu_manager.state_epoch == epoch + 1
+    cpu_manager.complete_store(to_keys([1]), _EMPTY_REQ_CTX)
+    assert cpu_manager.state_epoch == epoch + 1
+
+    cpu_manager.complete_store(to_keys([2]), _EMPTY_REQ_CTX, success=False)
+    assert cpu_manager.state_epoch == epoch + 2
+
+    # storing [3, 4] evicts the ready block 1
+    assert cpu_manager.prepare_store(to_keys([3, 4]), _EMPTY_REQ_CTX) is not None
+    assert cpu_manager.state_epoch == epoch + 3
+    assert cpu_manager.lookup(to_key(1), _EMPTY_REQ_CTX) is LookupResult.MISS
+
+    cpu_manager.reset_cache()
+    assert cpu_manager.state_epoch == epoch + 4
+
+
 def test_prepare_load_preserves_key_order():
     """block_ids[i] must correspond to keys[i] (co-indexed invariant)."""
     manager = make_cpu_manager(num_blocks=4, cache_policy="lru")

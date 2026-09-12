@@ -582,6 +582,70 @@ def test_max_offload_tokens_zero_does_not_record_pending_lookups(request_runner)
     assert list(runner.connector_scheduler.take_events()) == []
 
 
+def _pending_runner(request_runner, first_result: LookupResult):
+    runner = request_runner(
+        block_size=4,
+        num_gpu_blocks=10,
+        async_scheduling=False,
+    )
+    runner.manager.lookup.return_value = first_result
+    runner.manager.state_epoch = 1
+    runner.manager.prepare_store.side_effect = lambda keys, req_context: (
+        generate_store_output([])
+    )
+    runner.new_request(token_ids=[1] * 12)
+    return runner
+
+
+def test_pending_lookup_skipped_while_state_epoch_holds(request_runner):
+    """A request deferred on HIT_PENDING alone is not re-scanned until the
+    manager's state epoch moves, but it is still touched every step."""
+    runner = _pending_runner(request_runner, LookupResult.HIT_PENDING)
+
+    runner.run(decoded_tokens=[])
+    assert runner.manager.lookup.call_count == 3
+    assert runner.manager.touch.call_count == 1
+
+    runner.run(decoded_tokens=[])
+    assert runner.manager.lookup.call_count == 0
+    assert runner.manager.touch.call_count == 1
+    reduced = _reduce_kv_connector_stats(runner)
+    assert reduced[f"{_ConnectorMetricName.LOOKUP_SYNC_DELAY}_count"] == 1
+
+    runner.manager.state_epoch = 2
+    runner.manager.lookup.return_value = LookupResult.MISS
+    runner.run(decoded_tokens=[EOS_TOKEN_ID])
+    assert runner.manager.lookup.call_count == 1
+    reduced = _reduce_kv_connector_stats(runner)
+    assert reduced[f"{_ConnectorMetricName.LOOKUP_SYNC_DELAY}_count"] == 2
+    assert reduced[f"{_ConnectorMetricName.LOOKUP_ASYNC_DELAY}_count"] == 1
+
+
+def test_retry_lookup_is_repeated_every_step(request_runner):
+    """RETRY waits on an async lookup outside the manager's state epoch, so
+    it must be re-scanned each step."""
+    runner = _pending_runner(request_runner, LookupResult.RETRY)
+
+    runner.run(decoded_tokens=[])
+    assert runner.manager.lookup.call_count == 3
+    runner.run(decoded_tokens=[])
+    assert runner.manager.lookup.call_count == 3
+
+
+def test_abort_while_pending_lookup_is_skipped(request_runner):
+    runner = _pending_runner(request_runner, LookupResult.HIT_PENDING)
+    runner.run(decoded_tokens=[])
+    runner.run(decoded_tokens=[])
+    assert runner.manager.lookup.call_count == 0
+
+    req_id = str(runner.req_id)
+    runner.scheduler.finish_requests((req_id,), RequestStatus.FINISHED_ABORTED)
+    runner.run(decoded_tokens=[])
+
+    runner.manager.on_request_finished.assert_called_once()
+    assert req_id not in runner.connector_scheduler._req_status
+
+
 def test_abort_before_hit_uses_placeholder_then_later_hit_heals_removal(
     request_runner,
 ):
@@ -1599,6 +1663,7 @@ def _make_scheduler_with_lookup(
         return lookup_results.get(int(block_hash.decode()), default)
 
     manager.lookup.side_effect = lookup
+    manager.state_epoch = None
 
     scheduler = object.__new__(OffloadingConnectorScheduler)
     scheduler.manager = manager

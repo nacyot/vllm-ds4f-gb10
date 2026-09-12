@@ -372,6 +372,36 @@ class TestTieringOffloadingManager:
             self.manager._process_finished_jobs()
         completed.assert_called_once_with(to_keys([1]), _CTX, True)
 
+    def test_state_epoch_moves_when_a_promotion_completes(self, manager_setup):
+        from unittest.mock import patch
+
+        from vllm.v1.kv_offload.tiering.base import JobResult
+
+        self._start_request()
+        keys = to_keys([1])
+        write = self.primary_tier.prepare_write(keys, _CTX)
+        assert write is not None
+        job_id = self.manager._next_job_id()
+        self.manager._register_job(
+            TransferJob(
+                job_id=job_id,
+                keys=keys,
+                block_ids=write.store_spec.block_ids,
+                is_promotion=True,
+                req_context=_CTX,
+            ),
+            0,
+        )
+        epoch = self.manager.state_epoch
+        assert self.manager.lookup(keys[0], _CTX) is LookupResult.HIT_PENDING
+        assert self.manager.state_epoch == epoch
+
+        ok = JobResult(job_id=job_id, success=True)
+        with patch.object(self.secondary_tier1, "get_finished_jobs", return_value=[ok]):
+            self.manager._process_finished_jobs()
+        assert self.manager.state_epoch == epoch + 1
+        assert self.manager.lookup(keys[0], _CTX) is LookupResult.HIT
+
     def test_take_events_aggregates_tier_owned_events(self, manager_setup):
         primary_event = OffloadingEvent(to_keys([1]), Medium.CPU, removed=False)
         secondary_event1 = OffloadingEvent(to_keys([2]), Medium.STORAGE, removed=False)

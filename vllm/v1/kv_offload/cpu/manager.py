@@ -110,6 +110,7 @@ class CPUOffloadingManager(OffloadingManager):
         self._layout = slot_layout
         self._num_blocks: int = num_blocks
         self.events: list[OffloadingEvent] | None = [] if enable_events else None
+        self._state_epoch = 0
         policy_cls = CachePolicyFactory.get_cache_policy_cls(
             cache_policy, cache_policy_module_path
         )
@@ -225,6 +226,11 @@ class CPUOffloadingManager(OffloadingManager):
     def on_new_request(self, req_context: ReqContext) -> RequestOffloadingContext:
         return RequestOffloadingContext()
 
+    @property
+    @override
+    def state_epoch(self) -> int:
+        return self._state_epoch
+
     @override
     def lookup(self, key: OffloadKey, req_context: ReqContext) -> LookupResult:
         block = self._get_block(key)
@@ -331,6 +337,8 @@ class CPUOffloadingManager(OffloadingManager):
             # idle blocks might be in the protected list.
             evicted = pool.policy.evict(num_blocks_to_evict, protected)
             if evicted is None:
+                if to_evict:
+                    self._state_epoch += 1
                 if to_evict and self.events is not None:
                     # Earlier pools already dropped their blocks; report them.
                     self.events.append(
@@ -347,6 +355,8 @@ class CPUOffloadingManager(OffloadingManager):
                 del self._blocks[key]
                 to_evict.append(key)
 
+        if to_evict:
+            self._state_epoch += 1
         if to_evict and self.events is not None:
             self.events.append(
                 OffloadingEvent(
@@ -383,6 +393,7 @@ class CPUOffloadingManager(OffloadingManager):
         success: bool = True,
     ) -> None:
         stored_keys: list[OffloadKey] = []
+        changed = False
 
         if success:
             for key in keys:
@@ -394,6 +405,7 @@ class CPUOffloadingManager(OffloadingManager):
                     pool.num_evictable_cache_blocks += 1
                     pool.policy.mark_evictable(key)
                     stored_keys.append(key)
+            changed = bool(stored_keys)
         else:
             for key in keys:
                 pool = self._pool_of(key)
@@ -403,7 +415,10 @@ class CPUOffloadingManager(OffloadingManager):
                     pool.policy.remove(key)
                     del self._blocks[key]
                     pool.free(block)
+                    changed = True
 
+        if changed:
+            self._state_epoch += 1
         if stored_keys and self.events is not None:
             self.events.append(
                 OffloadingEvent(
@@ -424,6 +439,7 @@ class CPUOffloadingManager(OffloadingManager):
             pool.reset()
         self._blocks.clear()
         self._num_write_pending_blocks = 0
+        self._state_epoch += 1
 
     @override
     def take_events(self) -> Iterable[OffloadingEvent]:

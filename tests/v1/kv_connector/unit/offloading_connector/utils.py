@@ -131,6 +131,7 @@ class MockOffloadingSpec(OffloadingSpec):
         self.manager.lookup.return_value = LookupResult.MISS
         self.manager.get_stats.return_value = None
         self.manager.on_new_request.return_value = RequestOffloadingContext()
+        self.manager.state_epoch = None
         self.handler = MockOffloadingWorker()
 
     def get_manager(self) -> OffloadingManager:

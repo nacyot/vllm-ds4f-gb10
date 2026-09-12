@@ -376,6 +376,16 @@ class OffloadingManager(ABC):
         """
         return
 
+    @property
+    def state_epoch(self) -> int | None:
+        """Counter that advances whenever a lookup result may have changed.
+
+        While it holds the same value, a lookup answered HIT_PENDING keeps
+        that answer, so the scheduler may skip re-scanning a waiting
+        request. None means the manager does not track it.
+        """
+        return None
+
     def has_pending_work(self) -> bool:
         """Whether this manager needs the engine to keep stepping.
 

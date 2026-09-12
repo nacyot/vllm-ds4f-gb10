@@ -107,7 +107,9 @@ class CPUPrimaryTierOffloadingManager(CPUOffloadingManager):
             # Take the region's layout, else read the rows off a 2-D view.
             slot_layout = getattr(mmap_region, "layout", None)
             if not isinstance(slot_layout, SlotLayout):
-                assert kv_memoryview.ndim == 2 and kv_memoryview.strides is not None
+                assert kv_memoryview.ndim == 2
+                assert kv_memoryview.shape is not None
+                assert kv_memoryview.strides is not None
                 slot_layout = SlotLayout.uniform(
                     kv_memoryview.shape[0], kv_memoryview.strides[0]
                 )
@@ -846,6 +848,12 @@ class TieringOffloadingManager(OffloadingManager):
             self._metrics.on_request_allocated(state.req_context)
 
     @override
+    @property
+    @override
+    def state_epoch(self) -> int:
+        # Secondary-tier changes surface as RETRY, which never shortcuts.
+        return self.primary_tier.state_epoch
+
     def has_pending_work(self) -> bool:
         # In-flight primary<->secondary transfers (pending promotions are
         # translated to transfer jobs in on_schedule_end), plus any work the
