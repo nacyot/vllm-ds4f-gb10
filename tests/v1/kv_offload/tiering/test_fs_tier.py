@@ -345,10 +345,15 @@ def test_verify_checksums_reports_only_mismatched_blocks(
         pytest.skip("filesystem has no xattr support")
     assert io_mod.verify_checksums(paths, view, offsets, sizes) == []
 
+    # Block 1: the loaded bytes differ and the file on disk differs too, so
+    # the re-read cannot rescue it. Block 2: differs but has no checksum.
+    # Block 3: differs but is skipped (not loaded).
+    tensor[offsets[1]] ^= 0xFF
     with open(paths[1], "r+b") as f:
-        f.write(b"\x05" * sizes[1])  # corrupt on disk: re-read still differs
+        f.write(b"\x05" * sizes[1])
     os.removexattr(paths[2], io_mod._XATTR_CRC)
-    tensor[offsets[2]] ^= 0xFF  # differs, but unchecked without a checksum
+    tensor[offsets[2]] ^= 0xFF
+    tensor[offsets[3]] ^= 0xFF
     assert io_mod.verify_checksums(paths, view, offsets, sizes, skip={3}) == [1]
     assert not os.path.exists(paths[1])
     assert all(os.path.exists(p) for p in (paths[0], paths[2], paths[3]))
