@@ -154,6 +154,20 @@ class CPUOffloadingManager(OffloadingManager):
     def _get_num_free_blocks(self) -> int:
         return sum(pool.num_free_blocks for pool in self._pools)
 
+    def _allocate_blocks(self, keys: list[OffloadKey]) -> list[BlockStatus]:
+        """One block per key, from the pool of the key's class, in key order."""
+        if len(self._pools) == 1:
+            return self._pools[0].allocate(len(keys))
+        num_needed: dict[int, int] = {}
+        for key in keys:
+            pool_id = id(self._pool_of(key))
+            num_needed[pool_id] = num_needed.get(pool_id, 0) + 1
+        allocated: dict[int, deque[BlockStatus]] = {
+            id(pool): deque(pool.allocate(num_needed.get(id(pool), 0)))
+            for pool in self._pools
+        }
+        return [allocated[id(self._pool_of(key))].popleft() for key in keys]
+
     def _get_load_store_spec(
         self,
         keys: Iterable[OffloadKey],
@@ -318,16 +332,7 @@ class CPUOffloadingManager(OffloadingManager):
                 )
             )
 
-        blocks: list[BlockStatus] = []
-        if len(self._pools) == 1:
-            blocks = self._pools[0].allocate(len(keys_to_store))
-        else:
-            allocated: dict[int, deque[BlockStatus]] = {
-                id(pool): deque(pool.allocate(num_needed.get(id(pool), 0)))
-                for pool in self._pools
-            }
-            for key in keys_to_store:
-                blocks.append(allocated[id(self._pool_of(key))].popleft())
+        blocks = self._allocate_blocks(keys_to_store)
         assert len(blocks) == len(keys_to_store), (
             "Block pool did not allocate the expected number of blocks"
         )
