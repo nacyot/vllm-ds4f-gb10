@@ -42,6 +42,9 @@ class OffloadingCacheConfig:
     blocks_per_chunk: int
     # Longest request the engine admits, in tokens; 0 when unknown.
     max_model_len: int = 0
+    # Prefix-cache retention interval in tokens (sliding-window blocks are
+    # kept once per interval); None when retention is off.
+    retention_interval: int | None = None
 
 
 @dataclass(frozen=True)

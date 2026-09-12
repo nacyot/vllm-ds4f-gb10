@@ -256,6 +256,9 @@ def build_offloading_config(
             tokens_per_hash=tokens_per_hash,
             blocks_per_chunk=blocks_per_chunk,
             max_model_len=vllm_config.model_config.max_model_len,
+            retention_interval=(
+                vllm_config.cache_config.prefix_cache_retention_interval or None
+            ),
         ),
         parallel=OffloadingParallelConfig(
             rank=parallel_config.rank,

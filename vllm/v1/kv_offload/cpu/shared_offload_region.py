@@ -137,7 +137,17 @@ class SharedOffloadRegion:
                 self.fd = os.open(self.mmap_path, os.O_RDWR)
                 try:
                     _wait_for_file_size(self.fd, self.total_size_bytes)
-                except (TimeoutError, OSError):
+                    actual_size = os.fstat(self.fd).st_size
+                    if actual_size != self.total_size_bytes:
+                        # Every opener derives the size from the same config;
+                        # a mismatch means their slot layouts disagree.
+                        raise RuntimeError(
+                            f"mmap file {self.mmap_path} is {actual_size} bytes "
+                            f"but this process expects {self.total_size_bytes} "
+                            f"({layout.describe()}): the KV offload slot layout "
+                            "differs between the scheduler and the workers"
+                        )
+                except (TimeoutError, OSError, RuntimeError):
                     os.close(self.fd)
                     raise
                 logger.info("Opened existing mmap file %s", self.mmap_path)

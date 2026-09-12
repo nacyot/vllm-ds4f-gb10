@@ -406,6 +406,7 @@ class TieringOffloadingSpec(CPUOffloadingSpec):
             num_cpu_blocks = 1
             logger.info("KV offload relay receiver: no host tier region on this rank")
         else:
+            self.log_slot_layout()
             worker_mmap = SharedOffloadRegion(
                 engine_id=self._engine_id,
                 num_blocks=self.num_blocks,

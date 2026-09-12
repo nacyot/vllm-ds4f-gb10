@@ -5,7 +5,6 @@ from typing import Any
 import torch
 from typing_extensions import override
 
-import vllm.envs as envs
 from vllm.logger import init_logger
 from vllm.platforms import current_platform
 from vllm.utils.math_utils import round_up
@@ -171,7 +170,7 @@ class CPUOffloadingSpec(OffloadingSpec):
                     config.groups,
                     blocks_per_chunk=self.blocks_per_chunk,
                     max_model_len=config.cache.max_model_len,
-                    retention_interval=envs.VLLM_PREFIX_CACHE_RETENTION_INTERVAL,
+                    retention_interval=config.cache.retention_interval,
                     row_cap=aligned_kv_bytes_per_chunk,
                     shares=self.extra_config.get("cpu_slab_shares"),
                 )
@@ -246,6 +245,7 @@ class CPUOffloadingSpec(OffloadingSpec):
             else:
                 world_size = self.config.parallel.world_size
                 rank = torch.accelerator.current_device_index() % world_size
+            self.log_slot_layout()
             mmap_region = SharedOffloadRegion(
                 engine_id=self.config.engine_id,
                 num_blocks=self.num_blocks,
