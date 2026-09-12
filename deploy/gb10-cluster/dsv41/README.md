@@ -112,6 +112,33 @@ cd ~/vllm-dsv41 && PYTHON=~/vllm-dsv41-venv/bin/python csrc/build_fs_io.sh
 An extension without `batch_verify_crc32` falls back to the per-block
 Python verifier and logs a warning at boot.
 
+### Skipping the waiting request's re-scan (issue #27)
+
+While a promotion is in flight the request is deferred, and the core
+scheduler re-queries it every step. The connector used to re-scan all of
+the request's full-attention keys (11.6K for a 493K session) through
+`manager.lookup` each of those steps, on the EngineCore thread, so every
+other request decoding at the time paid for it. `CPUOffloadingManager`
+now keeps a state epoch that advances only when a lookup result can
+change (a write completing or failing, an eviction, a cache reset). The
+connector records the epoch when a lookup defers on HIT_PENDING alone and
+returns None without re-scanning while the epoch and the local
+computed-token count hold; `touch` and the hit-chunk update still run, so
+LRU order is unchanged, and a RETRY disables the shortcut. Measured
+2026-09-12 (TP=4, adopted configuration):
+
+- Per 493K cold restore, lookups in the 10-50 ms band (the per-step
+  HIT_PENDING re-scans) fall from 5 to 1; two concurrent restores 3 to 2.
+  The remaining longer lookups (first scan, promotion start, final HIT)
+  are one-per-request and out of scope.
+- TTFT (7-8 s), promotion job (0.34 s), hit (492,928 single / 985,856
+  concurrent) and the answer are unchanged; bench2 C1/C4 within 3% of the
+  issue #25 run, greedy code, count and ko-food identical.
+- The large decode stalls during a restore (~1.7 s) are the restoring
+  request's own prefill and 493K decode steps, not the lookups, so this
+  removes per-step Python load on concurrent decoders rather than the
+  wall-clock hiccup.
+
 ## Remote frontend (issue #24 spike, off by default)
 
 `FRONTEND_HOST=gx10-f323 FRONTEND_ADDR=10.100.0.32 dsv41_ctl.sh start` runs

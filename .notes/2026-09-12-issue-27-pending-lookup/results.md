@@ -52,3 +52,35 @@
 
 - 동시 재조회 몫은 단일보다 작게 준다(밴드 3→2): 두 세션의 첫 조회·프리필이 배치를 지배하고 승격 창(0.32 s×2)의 겹침이 짧기 때문. 단일 복원의 5→1 이 더 깨끗한 시연이다.
 - 디코드 tok/s·TTFT·hit 는 코드 전과 동일 — 정확성·성능 회귀 없음.
+
+## validate 단계 (22:05–22:20 KST, 채택 구성 :8889)
+
+리뷰(메인 직접): `git diff caadeffc95..HEAD` 대조. 목표 충족(HIT_PENDING-only 대기 재조회 생략, touch·hit-chunk 유지, RETRY 는 단축 제외, epoch 은 lookup 뒤 읽기). 최초 요청(## 요구사항) 충족(Step 0 측정 → 노이즈 밖 → 코드, touch 유지). 회귀 없음(base `state_epoch=None` 로 타 매니저 무영향, mock `state_epoch=None` 고정). 발견한 데코레이터 오배치(`state_epoch`/`has_pending_work` 의 `@override`)를 그 자리에서 수정 커밋(`0552479e2e`, 런타임 무변경).
+
+- 승격 완료가 skip 스텝에도 반영되는지 확인: `TieringOffloadingManager.on_schedule_end` 이 매 스텝 끝 `_maybe_process_finished_jobs()` 로 완료 job 을 처리(lookup 호출과 무관) → `complete_write`(=`complete_store`)가 epoch +1 → 다음 스텝 재조회. `primary_tier.complete_write`/`prepare_write` 는 CPU 매니저의 `complete_store`/`prepare_store` 별칭이라 계측 지점을 그대로 탄다.
+
+### 게이트 결과
+
+| 게이트 | 기준 | 결과 | 판정 |
+| --- | --- | --- | --- |
+| 단위 테스트(변경 범위) | 전부 통과 | 353 통과(cpu/tiering/async_lookup/fs_tier/offloading_connector) | 통과 |
+| bench2 C1 (i27f vs i25f, 평균) | ±3% | agg +2.1%, per-stream +2.0% | 통과 |
+| bench2 C4 (평균) | ±3% | agg −0.4%, per-stream −1.2% | 통과 |
+| bench2 pi 6종 greedy | ok | 전부 ok=True | 통과 |
+| divergence greedy (compare i25f i27f) | 동일 | ko-food·code·count 동일, ko-busan 토큰 24 argmax 수치편차(#25 와 동일 현상) | 통과(편차 기록) |
+| 단일/동시 복원 정확성 | hit·정답 불변 | hit 492,928 / 985,856, 정답 "12", 승격 job 0.34 s, TTFT 7~8 s | 통과 |
+| 재조회 절감(핵심 목표) | 재조회 감소 | 단일 10~50 ms 조회 5→1, 동시 3→2 | 통과 |
+| 493K 콜드 프리필 head 바닥 ≥ 3.0 GiB | 바닥 ≥ 3.0, earlyoom 0 | **미완료** — 아래 참조 | 미완료(비적용) |
+
+bench2 per-category C1 이상치(narrative +23%, coding +9%)는 C1 단일 배치(200 토큰, wall ~3.5 s) 소표본 편차다. 이 변경은 복원이 없는 정상 디코드에는 개입하지 않아 정상상태 성능에 영향이 없고, 게이트 기준인 C1/C4 평균은 ±3% 안이다.
+
+### earlyoom 이벤트 기록 (안전 규칙)
+
+- 22:14:10 KST, gx10-6040(head). earlyoom 이 `VLLM::Worker_TP`(pid 3510700, VmRSS 7216 MiB, badness 834)에 SIGTERM → 헤드 EngineCore 사망(health 000, GPU 유휴 208 MHz 다운클럭; cap 서비스는 계속 active).
+- 원인: **테스트 방법 오류**. 앞선 동시 복원(P13+S2)이 CPU 티어에 상주한 상태의 웜 서버(head 유휴 4.52 GiB)에서 새 salt 493K 콜드 프리필을 시작. 프리필의 스토어 버퍼+워킹셋이 head MemAvailable 을 2.92 GiB(30 s 샘플)→earlyoom 임계 2.43 GiB 아래로 끌어내렸다. 코드 변경과 무관(스케줄러 조회 생략은 프리필 메모리 경로에 개입하지 않음). (직전 시도는 salt "S27a" 가 526,010 토큰으로 MAXLEN 524,288 초과 → HTTP 400, 크래시 아님.)
+- 복구: 전체 정지 → 채택 구성 재기동(health 200, 150 s) → 82K 웜업. 골든룰 준수.
+
+### 493K 콜드 프리필 게이트 — 미완료 사유와 비적용 근거
+
+- 재기동+웜업 후 head 유휴 **4.59 GiB**(≥ 4.5 시작 게이트는 충족하나 여유가 얕음). 크래시 때 프리필이 head 를 약 1.6 GiB 끌어내린 실측을 감안하면 4.59 에서 재시도 시 바닥이 ~3.0 GiB 경계 또는 그 아래로 내려가 **2차 earlyoom·프로덕션 다운** 위험이 크다. `KV budget: no side effects`·소단계 원칙에 따라 재시도하지 않았다.
+- **비적용 근거**: 이 변경은 `RequestOffloadState` 에 int 1개(`pending_lookup_epoch`), `CPUOffloadingManager` 에 int 1개(`_state_epoch`)를 더하고 할당 경로를 바꾸지 않는다. 493K 콜드 프리필의 메모리 바닥은 이 변경이 영향을 줄 수 있는 인과 경로에 없다(#25 는 fs 승격 C 확장·job 분할을 바꿔 이 게이트가 필요했음). 따라서 미완료지만 회귀 위험 0 으로 판단해 머지를 막지 않는다. 후속으로 head 유휴가 넉넉한 신규 부팅에서 확인 권장.
