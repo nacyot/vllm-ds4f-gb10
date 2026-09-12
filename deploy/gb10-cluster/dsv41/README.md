@@ -78,6 +78,39 @@ each slab, so every slab holds about 2.1 such sessions.
   are unchanged by the slab layout; a new namespace directory under
   `KVFS_DIR` after a boot means the store identity changed and is a bug.
 
+### Promotion from the filesystem tier (issue #25)
+
+A promotion (fs → CPU) used to reacquire the GIL twice per block while
+the scheduler thread re-scanned the waiting request's 11.6K keys every
+step, so a 493K restore's 11,584-block job took 19 s and two concurrent
+restores 46 s to the first token. `batch_verify_crc32` in `fs_io_C` now
+checks every block's recorded CRC32 under one GIL release, and a load job
+is split across the 16 read threads. Measured 2026-09-12 (TP=4, adopted
+configuration, KV_TRACE=1 for the job lines):
+
+- P13 493K cold restore, three boots: promotion job 0.321 / 0.322 / 0.325 s
+  (before 19.2 s), TTFT 7.31 / 6.98 / 7.22 s (before 23.5 s); hit 492,928,
+  answer unchanged.
+- Two concurrent 493K cold restores (P13 + S2): first token 10.5 / 11.3 s
+  (before 46.9 / 46.2 s), both correct, earlyoom 0.
+- bench2 C1 52.2 / 47.1, C4 34.0 / 121.0 tok/s (within 3% of i15-c1b and
+  i15); greedy code, count and ko-food identical to i2f, ko-busan differs
+  run to run on the same boot (execution variance, also seen in #2 and #15).
+- 493K cold prefill (S4) on a fresh boot after the 82K warm-up: 392 s,
+  head MemAvailable floor 4.82 GiB, earlyoom 0; boots 144–159 s.
+
+The node checkouts are installed with `VLLM_USE_PRECOMPILED=1`, which takes
+the wheel's `fs_io_C.abi3.so` and never compiles `csrc/`. After a change to
+`csrc/fs_io.cpp`, rebuild on each node with the server stopped:
+
+```bash
+cd ~/vllm-dsv41 && PYTHON=~/vllm-dsv41-venv/bin/python csrc/build_fs_io.sh
+~/vllm-dsv41-venv/bin/python -c "import vllm.fs_io_C as m; print(hasattr(m, 'batch_verify_crc32'))"
+```
+
+An extension without `batch_verify_crc32` falls back to the per-block
+Python verifier and logs a warning at boot.
+
 ## Operating rules
 
 - Clocks and persistence mode belong to the owner. Automation workers must
