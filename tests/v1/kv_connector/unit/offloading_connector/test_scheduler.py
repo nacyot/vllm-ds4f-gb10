@@ -1294,9 +1294,10 @@ def test_full_attention_hole_truncates_hit_before_sliding_window(
     runner.run(
         decoded_tokens=[EOS_TOKEN_ID],
         # Group 0: prefix hit stops at the hole -> blocks 0,1,2.
-        # Group 1 (window 2): looked up within those 3 chunks -> blocks 1,2;
-        # blocks 4,5 after the hole are neither loaded nor recomputed early.
+        # Group 1 (window 2): looked up within those 3 chunks -> blocks 1,2.
         expected_loaded=((0, 0), (0, 1), (0, 2), (1, 1), (1, 2)),
+        # Everything from the hole on is recomputed and stored again.
+        expected_stored=(3, 4, 5),
     )
 
 
