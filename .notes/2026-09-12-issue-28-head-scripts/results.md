@@ -383,3 +383,27 @@ MemAvailable_GiB 9.28081
 ## Repository checks
 
 `pre-commit install` installed the configured hooks using the existing uv-managed pre-commit tool. Both `pre-commit run markdownlint-cli2 --files <three changed Markdown files>` and `pre-commit run typos --files <three changed Markdown files>` passed. `git diff --check` passed. Dynamic smoke and final operational verification remain assigned to validate.
+
+## Validation round 1 — operational gate pending
+
+Reviewed `6118253cd98cfff49a8b2f3e5592488654702ec2..22470fc067` against both the original request and approved plan. The 22 node symlinks, 23 preserved originals, README sentence and movement evidence meet the file-change scope. No application implementation changed; the existing bench output path and head's adjacent prompt JSON remain intact. The explicitly approved summary archival and worker repo-version limitation are recorded above.
+
+Commands on head (2026-09-12 23:22 KST), from `/home/nacyot/dsv41-prep`:
+
+- `/home/nacyot/vllm-dsv41/.venv/bin/python -B prefill_probe.py --help`: exit 0.
+- Same interpreter imported `HeadroomError, metrics, run_prompt` from `kvoff_probe`; asserted its realpath equals the repo file and `torch` is absent from `sys.modules`: exit 0.
+- `/home/nacyot/vllm-dsv41/.venv/bin/python -B kvoff_probe.py i28-smoke S28 700`: exit 0, one request, correct answer. Actual size was 9,115 tokens (the recipe's nominal 8K); no extra inference was run.
+
+```json
+{"salt": "S28", "prompt_tokens": 9115, "ttft_s": 5.043, "answer": "12", "expected": "12", "ok": true, "mem_avail_start_gib": null, "mem_avail_min_gib": null, "tag": "i28-smoke", "delta": {"kv_offload_store_bytes": 27112320.0, "external_prefix_cache_queries": 9115.0, "external_prefix_cache_hits": 0.0, "prefix_cache_hits": 0.0, "kv_offload_lookup_sync_delay_seconds_sum": 0.026078477851115167, "prefix_cache_queries": 9115.0}}
+```
+
+The short probe does not enable the long-request memory monitor, hence its null memory fields; these are not measured minima. Shell observations: before request 4.58975 GiB, afterward 3.23519 GiB at 23:22:38, then 3.42737 GiB and 3.41165 GiB at 23:23:48 after another 30-second idle observation. **Head MemAvailable remains below the required 4.5 GiB, so validation has not passed and no merge transition is authorized by this result.** Further inference was stopped. No restart or configuration change was attempted.
+
+At 23:22:38–40, all four serving units and cap services were active, with 1989 MHz observed and head health 200. Symlink recheck passed with 10/4/4/4 links and zero duplicate regular scripts; all node checkouts remained clean. Head health 200 and cap active/1989 MHz persisted at 23:23:48. Serving units' activation timestamps remain 22:58:04 on head and 22:57:57–58 on workers, before this task's operations.
+
+Read-only inspection of head's existing service process confirmed `--tensor-parallel-size 4 --nnodes 4 --port 8889`, `ENGRAM_PREFETCH=1`, `EMPTY_CACHE=1`, and `EMPTY_CACHE_MIN_TOKENS=65536`; its command line has the matching empty-cache and prefetch settings. The requested adopted configuration remains active. The short request is below the configured 65,536-token release threshold; retained allocator memory is a possible explanation, not a measured allocation diagnosis. Do not run a larger request or change settings to force release under this task.
+
+`pre-commit run --from-ref 6118253cd98cfff49a8b2f3e5592488654702ec2 --to-ref HEAD` passed all applicable hooks; non-applicable code hooks skipped. `git diff --check 6118253cd98cfff49a8b2f3e5592488654702ec2..HEAD` passed. No build is needed for Markdown and filesystem symlinks. Initial read-only discovery queried nonexistent unit `dsv41-r0` and found no remote `rg`; corrected to the existing `dsv41-serve` unit and `grep`, without state changes.
+
+Remaining gate: manager/owner coordination for head memory recovery under the existing prohibition on this worker stopping/restarting the server. Once recovery is reported, recheck memory, health and caps; do not repeat the successful inference merely to re-establish its result. Keep the workflow in validate until the end-state requirement is satisfied or the owner explicitly revises it.
