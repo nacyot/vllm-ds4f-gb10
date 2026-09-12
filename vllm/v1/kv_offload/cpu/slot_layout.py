@@ -22,8 +22,9 @@ from vllm.v1.kv_offload.config import OffloadingGroupConfig
 
 # Slot rows are page aligned so O_DIRECT tiers can read and write them.
 SLOT_ALIGNMENT = 4096
-# Every slab keeps at least this share of the budget, so a class whose
-# demand estimate is off still caches something.
+# Every slab keeps about this share of the budget (applied before the shares
+# are renormalized), so a class whose demand estimate is off still caches
+# something.
 MIN_CLASS_SHARE = 0.02
 
 

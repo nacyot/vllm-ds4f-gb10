@@ -995,3 +995,65 @@ def test_barrier_release_failure_keeps_original_error(iid, monkeypatch):
         _make_region(iid, barrier=MagicMock(side_effect=TimeoutError("barrier")))
 
     assert not os.path.exists(f"/dev/shm/vllm_offload_{iid}.mmap")
+
+
+# ---------------------------------------------------------------------------
+# Slab layouts
+# ---------------------------------------------------------------------------
+
+
+def _slab_layout(rows_per_class: tuple[int, ...], blocks_per_class: tuple[int, ...]):
+    from vllm.v1.kv_offload.cpu.slot_layout import SlotClass, SlotLayout
+
+    classes = []
+    first_block = 0
+    base_offset = 0
+    for cls_idx, (row, num) in enumerate(zip(rows_per_class, blocks_per_class)):
+        classes.append(SlotClass(row, num, first_block, base_offset, (cls_idx,)))
+        first_block += num
+        base_offset += num * row
+    return SlotLayout(
+        classes=tuple(classes), group_class=tuple(range(len(rows_per_class)))
+    )
+
+
+def test_slab_region_size_and_offsets(iid):
+    """A slab layout sizes the file to the slabs back to back and addresses
+    block b at slot_offsets[b], not b * row_stride."""
+    layout = _slab_layout((2 * PAGE_SIZE, PAGE_SIZE), (3, 5))
+    with _region(
+        iid,
+        num_blocks=8,
+        cpu_page_size=2 * PAGE_SIZE,
+        layout=layout,
+    ) as r:
+        assert r.total_size_bytes == 3 * 2 * PAGE_SIZE + 5 * PAGE_SIZE
+        assert os.fstat(r.fd).st_size == r.total_size_bytes
+        expected = [0, 2 * PAGE_SIZE, 4 * PAGE_SIZE] + [
+            6 * PAGE_SIZE + i * PAGE_SIZE for i in range(5)
+        ]
+        assert r.slot_offsets.tolist() == expected
+        view = r.create_kv_memoryview()
+        assert view.ndim == 1
+        assert view.nbytes == r.total_size_bytes
+        # The flat view and the base tensor alias the same bytes.
+        r.base_tensor[int(r.slot_offsets[4])] = 7
+        assert view[int(r.slot_offsets[4])] == 7
+        del view
+        with pytest.raises(AssertionError, match="slab layouts"):
+            r.create_next_worker_view(PAGE_SIZE)
+
+
+def test_slab_region_populates_every_slab(iid):
+    layout = _slab_layout((2 * PAGE_SIZE, PAGE_SIZE), (2, 4))
+    with _region(iid, num_blocks=6, cpu_page_size=2 * PAGE_SIZE, layout=layout) as r:
+        assert r.mmap_obj is not None
+        residency = _page_residency(r.mmap_obj, r.total_size_bytes)
+        assert all(residency)
+
+
+def test_uniform_region_offsets_match_row_stride(iid):
+    with _region(iid, num_blocks=4, cpu_page_size=PAGE_SIZE, num_workers=2) as r:
+        assert r.layout.is_uniform
+        assert r.slot_offsets.tolist() == [i * 2 * PAGE_SIZE for i in range(4)]
+        assert r.create_kv_memoryview().nbytes == 4 * 2 * PAGE_SIZE

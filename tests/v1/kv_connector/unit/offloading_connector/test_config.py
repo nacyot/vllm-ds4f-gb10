@@ -907,3 +907,36 @@ def test_blocks_per_chunk_must_be_positive():
 
     with pytest.raises(ValueError, match="greater than 0"):
         build_offloading_config(config, _make_kv_cache_config())
+
+
+def test_groups_carry_window_and_cacheability_and_cache_carries_max_model_len():
+    """The slab planner sizes each host slab from these: a full-attention
+    group keeps every chunk, a sliding-window group one window per retention
+    interval, a scratch group nothing."""
+    num_blocks = 4
+    specs = {"l0": _full_attention_spec(), "l1": _SWA_SPEC}
+    kv_cache_config = KVCacheConfig(
+        num_blocks=num_blocks,
+        kv_cache_tensors=[
+            KVCacheTensor(
+                size=spec.page_size_bytes * num_blocks,
+                layers=[name],
+                layer_stride=spec.page_size_bytes,
+                block_stride=spec.page_size_bytes,
+            )
+            for name, spec in specs.items()
+        ],
+        kv_cache_groups=_groups(*specs.values()),
+    )
+    config = _make_vllm_config()
+    config.model_config.max_model_len = 4096
+    offloading_config = build_offloading_config(config, kv_cache_config)
+
+    assert offloading_config.cache.max_model_len == 4096
+    assert [g.window_tokens for g in offloading_config.groups] == [None, 128]
+    assert all(group.prefix_cacheable for group in offloading_config.groups)
+    # Defaults keep the config buildable without either field.
+    from vllm.v1.kv_offload.config import OffloadingGroupConfig
+
+    assert OffloadingGroupConfig(16, ("layer",)).window_tokens is None
+    assert OffloadingGroupConfig(16, ("layer",)).prefix_cacheable

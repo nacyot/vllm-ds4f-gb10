@@ -1101,3 +1101,115 @@ def test_touch_forwards_req_context_to_policy(monkeypatch):
     assert len(received) == 1
     assert received[0][0] == keys
     assert received[0][1] is ctx
+
+
+# ---------------------------------------------------------------------------
+# Slab layouts: one block pool per row-size class
+# ---------------------------------------------------------------------------
+
+
+def _two_slab_layout(num_wide: int = 2, num_narrow: int = 3):
+    """Group 0 -> wide rows (block ids [0, num_wide)), group 1 -> narrow rows
+    (block ids [num_wide, num_wide + num_narrow))."""
+    from vllm.v1.kv_offload.cpu.slot_layout import SlotClass, SlotLayout
+
+    return SlotLayout(
+        classes=(
+            SlotClass(8192, num_wide, 0, 0, (0,)),
+            SlotClass(4096, num_narrow, num_wide, num_wide * 8192, (1,)),
+        ),
+        group_class=(0, 1),
+    )
+
+
+def _gkey(group_idx: int, int_hash: int) -> OffloadKey:
+    return make_offload_key(str(int_hash).encode(), group_idx)
+
+
+def _slab_manager(**kwargs) -> CPUOffloadingManager:
+    layout = _two_slab_layout()
+    return CPUOffloadingManager(
+        num_blocks=layout.num_blocks, slot_layout=layout, enable_events=True, **kwargs
+    )
+
+
+def _store(manager: CPUOffloadingManager, keys: list[OffloadKey]) -> list[int]:
+    out = manager.prepare_store(keys, _EMPTY_REQ_CTX)
+    assert out is not None
+    assert out.keys_to_store == keys
+    manager.complete_store(keys, _EMPTY_REQ_CTX)
+    assert isinstance(out.store_spec, CPULoadStoreSpec)
+    return out.store_spec.block_ids.tolist()
+
+
+def test_slab_manager_allocates_each_group_from_its_own_class():
+    manager = _slab_manager()
+    assert _store(manager, [_gkey(0, 1), _gkey(0, 2)]) == [0, 1]
+    assert _store(manager, [_gkey(1, 1), _gkey(1, 2), _gkey(1, 3)]) == [2, 3, 4]
+    # A mixed batch keeps key order and takes each block from the key's class.
+    manager.reset_cache()
+    out = manager.prepare_store([_gkey(1, 7), _gkey(0, 7), _gkey(1, 8)], _EMPTY_REQ_CTX)
+    assert out is not None
+    assert isinstance(out.store_spec, CPULoadStoreSpec)
+    assert out.store_spec.block_ids.tolist() == [2, 0, 3]
+
+
+def test_slab_manager_evicts_only_within_the_storing_keys_class():
+    manager = _slab_manager()
+    _store(manager, [_gkey(0, 1), _gkey(0, 2)])
+    _store(manager, [_gkey(1, 1), _gkey(1, 2), _gkey(1, 3)])
+    list(manager.take_events())
+
+    # The wide class is full: a new wide key evicts the LRU wide key, and the
+    # narrow keys, older or not, stay.
+    manager.touch([_gkey(0, 1)], _EMPTY_REQ_CTX)
+    out = manager.prepare_store([_gkey(0, 3)], _EMPTY_REQ_CTX)
+    assert out is not None
+    assert out.evicted_keys == [_gkey(0, 2)]
+    assert isinstance(out.store_spec, CPULoadStoreSpec)
+    assert out.store_spec.block_ids.tolist() == [1]
+    for h in (1, 2, 3):
+        assert manager.lookup(_gkey(1, h), _EMPTY_REQ_CTX) is LookupResult.HIT
+    assert manager.lookup(_gkey(0, 2), _EMPTY_REQ_CTX) is LookupResult.MISS
+    verify_events(manager.take_events(), expected_evictions=({2},))
+
+
+def test_slab_manager_fails_the_whole_batch_when_one_class_cannot_evict():
+    manager = _slab_manager()
+    _store(manager, [_gkey(0, 1), _gkey(0, 2)])
+    _store(manager, [_gkey(1, 1), _gkey(1, 2), _gkey(1, 3)])
+    # Pin every narrow block; the wide class still has evictable blocks.
+    manager.prepare_load([_gkey(1, 1), _gkey(1, 2), _gkey(1, 3)], _EMPTY_REQ_CTX)
+
+    assert manager.prepare_store([_gkey(1, 4)], _EMPTY_REQ_CTX) is None
+    # All or nothing: the wide key is not stored and nothing wide is evicted.
+    assert manager.prepare_store([_gkey(0, 9), _gkey(1, 4)], _EMPTY_REQ_CTX) is None
+    assert manager.lookup(_gkey(0, 1), _EMPTY_REQ_CTX) is LookupResult.HIT
+    assert manager.lookup(_gkey(0, 2), _EMPTY_REQ_CTX) is LookupResult.HIT
+    assert manager.lookup(_gkey(0, 9), _EMPTY_REQ_CTX) is LookupResult.MISS
+
+    # Releasing one narrow block lets a narrow store evict it.
+    manager.complete_load([_gkey(1, 1)], _EMPTY_REQ_CTX)
+    out = manager.prepare_store([_gkey(1, 4)], _EMPTY_REQ_CTX)
+    assert out is not None
+    assert out.evicted_keys == [_gkey(1, 1)]
+
+
+def test_slab_manager_reports_usage_per_slab():
+    manager = _slab_manager()
+    _store(manager, [_gkey(0, 1)])
+    _store(manager, [_gkey(1, 1), _gkey(1, 2), _gkey(1, 3)])
+    stats = manager.get_stats()
+    assert stats is not None
+    slab_usage = stats.data["data"][CPUOffloadingMetrics.CPU_SLAB_USAGE_PERC]
+    assert slab_usage[("8192",)] == pytest.approx(0.5)
+    assert slab_usage[("4096",)] == pytest.approx(1.0)
+    # Blocks holding data count even when evictable; the pinned-usage gauge
+    # is unchanged in meaning (nothing is pinned here).
+    check_split_usage_stats(manager, write=0.0, read=0.0, total=0.0)
+    manager.reset_cache()
+    stats = manager.get_stats()
+    assert stats is not None
+    slab_usage = stats.data["data"][CPUOffloadingMetrics.CPU_SLAB_USAGE_PERC]
+    assert slab_usage[("8192",)] == 0.0
+    assert slab_usage[("4096",)] == 0.0

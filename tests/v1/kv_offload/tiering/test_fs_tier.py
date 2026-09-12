@@ -1156,3 +1156,72 @@ def test_fs_tier_cross_tp_round_trip(tmp_path):
         assert torch.allclose(reader_tensor[1], expected)
     finally:
         reader.shutdown()
+
+
+def test_fs_tier_addresses_slab_rows_through_the_layout(tmp_path):
+    """With per-group row sizes (slabs) the primary view is flat and block b
+    lives at the layout's offset; files still hold exactly a group's bytes."""
+    from dataclasses import replace
+
+    from vllm.v1.kv_offload.config import OffloadingGroupConfig
+    from vllm.v1.kv_offload.cpu.slot_layout import SlotClass, SlotLayout
+
+    page = mmap.PAGESIZE
+    # Two wide rows (2 pages, group 0) then three narrow rows (1 page, group 1).
+    layout = SlotLayout(
+        classes=(
+            SlotClass(2 * page, 2, 0, 0, (0,)),
+            SlotClass(page, 3, 2, 4 * page, (1,)),
+        ),
+        group_class=(0, 1),
+    )
+    tensor = _page_aligned_zero_tensor(7, page, dtype=torch.uint8)
+    tensor.random_()
+    original = tensor.clone()
+    spec = _make_offloading_spec()
+    spec.slot_layout = layout
+    spec.config = replace(
+        spec.config,
+        groups=(
+            OffloadingGroupConfig(16, ("wide",), 2 * page),
+            OffloadingGroupConfig(16, ("narrow",), page),
+        ),
+        extra_config={"relay_from_rank0": True},
+        packed_layout=True,
+    )
+    tier = FileSystemTierManager(
+        offloading_spec=spec,
+        primary_kv_view=memoryview(tensor.numpy()),
+        tier_type="fs",
+        root_dir=str(tmp_path),
+        n_read_threads=1,
+        n_write_threads=1,
+    )
+    try:
+        assert tier._group_bytes == [2 * page, page]
+        keys = [
+            make_offload_key(b"wide-key", 0),
+            make_offload_key(b"narrow-key", 1),
+        ]
+        block_ids = [1, 4]  # offsets 2 pages and 4 + 2 = 6 pages
+        tier.submit_store(make_job(1, keys, block_ids))
+        assert all(r.success for r in drain(tier))
+        for key, block_id, size in zip(keys, block_ids, tier._group_bytes):
+            path = tier.file_mapper.get_file_name(key)
+            assert os.path.getsize(path) == size
+            offset = int(layout.offset_table()[block_id])
+            with open(path, "rb") as f:
+                assert f.read() == bytes(
+                    memoryview(original.numpy()).cast("B")[offset : offset + size]
+                )
+
+        tensor.zero_()
+        tier.submit_load(make_job(2, keys, block_ids, is_promotion=True))
+        assert all(r.success for r in drain(tier))
+        assert torch.equal(tensor[2:4], original[2:4])
+        assert torch.equal(tensor[6], original[6])
+        # Rows the job did not name stay zero: nothing landed at b * row.
+        assert not tensor[0:2].any()
+        assert not tensor[4:6].any()
+    finally:
+        tier.shutdown()

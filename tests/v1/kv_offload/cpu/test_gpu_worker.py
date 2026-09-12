@@ -682,3 +682,98 @@ def test_load_waits_for_pending_compute_stream_writes(default_vllm_config) -> No
                 torch.testing.assert_close(gpu_tensor[block_id].cpu(), expected)
     finally:
         worker.shutdown()
+
+
+@pytest.mark.parametrize("gpu_to_cpu", [True, False])
+@pytest.mark.parametrize("device", DEVICES)
+@torch.inference_mode()
+def test_transfer_slab_layout(default_vllm_config, gpu_to_cpu: bool, device: str):
+    """A packed block on the GPU whose two groups own different prefixes of
+    it: each group's blocks land in (or come from) its own slab, copying only
+    the group's bytes, addressed through the region's offset table."""
+    from vllm.v1.kv_offload.cpu.slot_layout import SlotClass, SlotLayout
+
+    page = SharedOffloadRegion.BLOCK_SIZE_ALIGNMENT
+    block_stride = 3 * page
+    group_bytes = [3 * page, page]  # group 0 fills the block, group 1 a third
+    num_gpu_blocks = 16
+    num_wide, num_narrow = 4, 6
+    layout = SlotLayout(
+        classes=(
+            SlotClass(3 * page, num_wide, 0, 0, (0,)),
+            SlotClass(page, num_narrow, num_wide, num_wide * 3 * page, (1,)),
+        ),
+        group_class=(0, 1),
+    )
+    set_random_seed(0)
+    gpu_tensor = torch.zeros(
+        (num_gpu_blocks, block_stride), dtype=torch.int8, device=device
+    )
+    kv_caches = CanonicalKVCaches(
+        tensors=[CanonicalKVCacheTensor(gpu_tensor, block_stride)],
+        group_data_refs=[[CanonicalKVCacheRef(0, n)] for n in group_bytes],
+    )
+    region = SharedOffloadRegion(
+        engine_id=str(uuid.uuid4()),
+        num_blocks=layout.num_blocks,
+        rank=0,
+        kv_bytes_per_block=block_stride,
+        cpu_page_size=block_stride,
+        layout=layout,
+    )
+    worker = CPUOffloadingWorker(
+        kv_caches=kv_caches,
+        blocks_per_chunk=1,
+        num_cpu_blocks=layout.num_blocks,
+        mmap_region=region,
+    )
+    host = region.base_tensor
+    offsets = region.slot_offsets
+
+    # Two GPU blocks per group; group 0 -> wide slots, group 1 -> narrow slots.
+    gpu_blocks = [3, 5, 8, 13]
+    cpu_blocks = [1, 2, num_wide + 4, num_wide + 0]
+    gpu_spec = GPULoadStoreSpec(gpu_blocks, group_sizes=(2, 2), block_indices=(0, 0))
+    cpu_spec = CPULoadStoreSpec(cpu_blocks)
+
+    gpu_tensor.random_()
+    host.random_()
+    gpu_before = gpu_tensor.clone()
+    host_before = host.clone()
+
+    handler = worker._store_handler if gpu_to_cpu else worker._load_handler
+    if gpu_to_cpu:
+        assert worker.submit_store(1, gpu_spec, cpu_spec)
+    else:
+        assert worker.submit_load(1, cpu_spec, gpu_spec)
+    deadline = time.time() + 10
+    finished: list[TransferResult] = []
+    while time.time() < deadline and not finished:
+        finished = worker.get_finished()
+        time.sleep(0.05)
+    assert finished and finished[0].success
+    assert finished[0].transfer_size == 2 * group_bytes[0] + 2 * group_bytes[1]
+    assert not handler._transfers
+
+    for i, (gpu_block, cpu_block) in enumerate(zip(gpu_blocks, cpu_blocks)):
+        n = group_bytes[0 if i < 2 else 1]
+        off = int(offsets[cpu_block])
+        host_row = host[off : off + n]
+        gpu_prefix = gpu_tensor[gpu_block, :n].cpu()
+        if gpu_to_cpu:
+            torch.testing.assert_close(host_row, gpu_before[gpu_block, :n].cpu())
+        else:
+            torch.testing.assert_close(gpu_prefix, host_before[off : off + n])
+        # The rest of the packed GPU block is not the group's data: untouched.
+        torch.testing.assert_close(
+            gpu_tensor[gpu_block, n:].cpu(), gpu_before[gpu_block, n:].cpu()
+        )
+    # Host rows that were not addressed keep their bytes.
+    untouched = [b for b in range(layout.num_blocks) if b not in cpu_blocks]
+    for b in untouched:
+        off = int(offsets[b])
+        n = int(layout.row_bytes_table()[b])
+        torch.testing.assert_close(host[off : off + n], host_before[off : off + n])
+
+    del host, host_row, gpu_prefix
+    worker.shutdown()
