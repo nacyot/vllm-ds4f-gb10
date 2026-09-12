@@ -25,7 +25,7 @@ gx10-f323, gx10-37cc, and gx10-27c4. It requires Bash 4 or newer; on macOS:
 | `smoke.py` | Basic API and deterministic-output smoke checks. |
 | `kvoff_probe.py`, `kvoff_concurrent.py` | Cold and concurrent KV offload restore probes. |
 | `kvfs_gc.sh` | KV filesystem retention and size management. |
-| `memlog.py`, `memtrace_summary.py` | Memory sampling and allocator-log summaries. |
+| `memlog.py`, `memtrace_summary.py` | Memory sampling (meminfo, worker/EngineCore/API anon and swap, reclaim and compaction counters, free order≥9 blocks; no torch) and allocator-log summaries. |
 | `clock_summary.py` | Summarize sampled clock CSVs. |
 | `prof_summary.py` | Summarize GPU profiler traces. |
 
@@ -246,6 +246,43 @@ before running another long cold prefill. Fresh-boot headroom varies from
 `headroom` before 493K cold prefill and do not start below 5.2 GiB.
 Keep earlyoom at 2.43 GiB.
 
+Why fresh-boot headroom varies (issue #30, measured 2026-09-13): the three
+head processes do not grow. Their cold anonymous memory is the same on every
+boot (Worker_TP0 RssAnon+VmSwap 2.84 GiB, EngineCore 0.8 GiB, API server
+0.9 GiB; SUnreclaim is 2.1–2.2 GiB on all four nodes). What differs is
+whether that cold anon was swapped out. A boot consumes the free order≥9
+(2 MiB) blocks of the Normal zone (14,957 before the load, 44 at health 200)
+and does no reclaim itself. The first cold long prefill (the 82K warm-up)
+then regrows the torch allocator by 2.9 GiB in 2 MiB chunks, hits order≥9 =
+0 within seconds, and forces direct compaction and kswapd reclaim (measured
+warm-up: compact_stall +1,183, pgscan_kswapd +516k pages, MemFree minimum
+1.5 GiB, MemAvailable minimum 3.0 GiB, TTFT 51–63 s). The kernel either
+reclaims file cache and leaves the anon resident (this boot and #19: swap 0,
+idle 4.6–5.2 GiB afterwards) or swaps the cold anon out and drops the file
+cache (#25 b5 and #27 b2: 1.7–2.5 GiB swapped out in the last 15 s of the
+warm-up, idle 7.1–7.8 GiB afterwards). Which one happens is the kernel's
+anon/file cost balance at that moment (swappiness 60, prior page-cache
+churn), not a setting of ours, so the idle value after a fresh boot cannot
+be predicted. The head free pool stays fragmented while the server runs
+(order≥9 blocks 5–55; the owner's `uvm-stall-sentinel` compacts only when PSI
+full ≥ 50). Owner levers are proposed in the #30 decision issue; nothing was
+changed. `memlog.py` records the counters that tell the two cases apart
+(`pswpout`, `compact_stall`, `free_order9plus`, `e_/a_VmSwap`).
+
+| Boot (KST) | Idle after boot | Warm-up minimum | Swapped out in warm-up | Idle after warm-up |
+| --- | ---: | ---: | ---: | ---: |
+| #25 b4, 09-12 19:22 | 6.19 | 3.34 | 0 | 5.43 → 4.7 |
+| #25 b5, 09-12 19:30 | 6.37 | 3.88 then swap | 1.75 GiB | 7.11 |
+| #27 b2, 09-12 21:48 | 6.92 | 4.28 then swap | 2.50 GiB | 7.3–7.8 |
+| #19, 09-12 22:58 | 5.11 | 2.99 | 0 | 4.72 |
+| #30, 09-13 00:37 | 4.97 | 2.99 | 0 (3 MiB) | 5.21 |
+
+Source: head node-metrics-exporter series in VictoriaMetrics (15 s), sar,
+`journalctl --user -u dsv41-serve`, `dsv41-r0.log`, and the #30 1-second
+memlog `~/dsv41-prep/bench/i30-boot-memlog.csv`. Use a **new salt** for the
+warm-up as well: a salt already in the kvfs store restores instead of
+prefilling (W30 restored 750 MB in 1.7 s on 2026-09-13).
+
 | Run | Server state | Start GiB | Floor GiB | Drop GiB | Outcome |
 | --- | --- | ---: | ---: | ---: | --- |
 | #25 S4 | Fresh boot + 82K warm-up | 6.95 | 4.82 | 2.13 | Completed, 392 s |
@@ -253,6 +290,7 @@ Keep earlyoom at 2.43 GiB.
 | #15 P20 | Warm, restore + 32K | 3.05 | 2.54 at 60 s | ≥0.51 | Client stopped; server survived |
 | #27 | Warm, after concurrent restore | 4.48–4.52 | 2.92 at 30 s, then <2.43 | >2.05 | earlyoom killed EngineCore |
 | #19, 2026-09-12 23:01 KST | Fresh adopted boot + 82K warm-up | 4.61 | Not run | Not measured | Guard exit 3; 493K not started. Idle headroom −2.5 GiB vs #25 S4 7.11 GiB; swap usage difference 1.5 GiB, AnonPages +1.7 GiB |
+| #30, 2026-09-13 00:41 KST | Fresh adopted boot + cold 82K warm-up | 5.11 | Not run | Expected 2.9–3.0 | Guard exit 3; 493K not started. Warm-up reclaimed file cache, not anon (swap 0), so the 7.1 GiB state did not occur; expected floor = start − 2.1–2.2 |
 
 Source: issue #19 manager investigation `icmt-15ef874f`, citing the #25
 1-second memlog and #15/#27 results. The #19 row and memory comparison
