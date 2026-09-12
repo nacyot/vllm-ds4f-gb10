@@ -187,7 +187,16 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         self._empty_cache_after_prefill = isinstance(additional_config, dict) and bool(
             additional_config.get("empty_cache_after_prefill", False)
         )
+        # "empty_cache_min_prefill_tokens": only release after a prefill run
+        # of at least this many tokens; shorter requests keep their segments
+        # instead of re-growing them (cuMemCreate stalls) under the next one.
+        self._empty_cache_min_prefill_tokens = (
+            int(additional_config.get("empty_cache_min_prefill_tokens", 0))
+            if isinstance(additional_config, dict)
+            else 0
+        )
         self._prev_step_was_prefill = False
+        self._prefill_run_tokens = 0
         self.model_config = vllm_config.model_config
         self.cache_config = vllm_config.cache_config
         self.compilation_config = vllm_config.compilation_config
@@ -1606,19 +1615,34 @@ class GPUModelRunner(LoRAModelRunnerMixin):
     def _maybe_empty_cache(self, scheduler_output: SchedulerOutput) -> None:
         """Release cached allocator segments on the first non-prefill step
         after a run of prefill chunks, when more than 1 GiB is reserved but
-        unallocated."""
-        is_prefill = scheduler_output.total_num_scheduled_tokens >= 1024
-        if self._prev_step_was_prefill and not is_prefill:
-            stats = torch.cuda.memory_stats()
-            slack = stats.get("reserved_bytes.all.current", 0) - stats.get(
-                "allocated_bytes.all.current", 0
-            )
-            if slack > (1 << 30):
-                torch.cuda.synchronize()
-                torch.cuda.empty_cache()
-                logger.info(
-                    "empty_cache after prefill: %.2f GiB released", slack / (1 << 30)
+        unallocated and the run scheduled at least
+        `empty_cache_min_prefill_tokens` tokens."""
+        num_tokens = scheduler_output.total_num_scheduled_tokens
+        is_prefill = num_tokens >= 1024
+        if is_prefill:
+            self._prefill_run_tokens += num_tokens
+        elif self._prev_step_was_prefill:
+            run_tokens = self._prefill_run_tokens
+            self._prefill_run_tokens = 0
+            if run_tokens < self._empty_cache_min_prefill_tokens:
+                logger.debug(
+                    "empty_cache skipped: prefill run of %d tokens < %d",
+                    run_tokens,
+                    self._empty_cache_min_prefill_tokens,
                 )
+            else:
+                stats = torch.cuda.memory_stats()
+                slack = stats.get("reserved_bytes.all.current", 0) - stats.get(
+                    "allocated_bytes.all.current", 0
+                )
+                if slack > (1 << 30):
+                    torch.cuda.synchronize()
+                    torch.cuda.empty_cache()
+                    logger.info(
+                        "empty_cache after prefill run of %d tokens: %.2f GiB released",
+                        run_tokens,
+                        slack / (1 << 30),
+                    )
         self._prev_step_was_prefill = is_prefill
 
     def execute_model(

@@ -213,3 +213,51 @@ def test_append_block_ids_rejects_write_past_row_capacity():
         )
 
     assert block_tables.num_blocks.np[0, 1] == 3
+
+
+def _empty_cache_runner(min_prefill_tokens: int) -> GPUModelRunner:
+    runner = GPUModelRunner.__new__(GPUModelRunner)
+    runner._empty_cache_min_prefill_tokens = min_prefill_tokens
+    runner._prefill_run_tokens = 0
+    runner._prev_step_was_prefill = False
+    return runner
+
+
+def _run_prefill_chunks(runner, monkeypatch, num_chunks, chunk_tokens=4096):
+    """Feed a run of prefill chunks and one short decode step; return how
+    many times the allocator cache was released (slack is fixed at 2 GiB)."""
+    releases = []
+    monkeypatch.setattr(
+        model_runner_module.torch.cuda,
+        "memory_stats",
+        lambda: {
+            "reserved_bytes.all.current": 3 << 30,
+            "allocated_bytes.all.current": 1 << 30,
+        },
+    )
+    monkeypatch.setattr(model_runner_module.torch.cuda, "synchronize", lambda: None)
+    monkeypatch.setattr(
+        model_runner_module.torch.cuda, "empty_cache", lambda: releases.append(1)
+    )
+    for _ in range(num_chunks):
+        runner._maybe_empty_cache(
+            SimpleNamespace(total_num_scheduled_tokens=chunk_tokens)
+        )
+    runner._maybe_empty_cache(SimpleNamespace(total_num_scheduled_tokens=46))
+    return len(releases)
+
+
+@pytest.mark.parametrize(
+    "min_tokens,num_chunks,expected_releases",
+    [(65536, 8, 0), (65536, 17, 1), (0, 1, 1)],
+)
+def test_empty_cache_after_prefill_honors_min_run_tokens(
+    monkeypatch, min_tokens, num_chunks, expected_releases
+):
+    """A prefill run shorter than empty_cache_min_prefill_tokens keeps its
+    segments; a longer run, or an unset threshold, releases them. The run
+    counter resets on the transition either way."""
+    runner = _empty_cache_runner(min_tokens)
+    assert _run_prefill_chunks(runner, monkeypatch, num_chunks) == expected_releases
+    assert runner._prefill_run_tokens == 0
+    assert not runner._prev_step_was_prefill
