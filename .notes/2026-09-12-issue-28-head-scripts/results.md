@@ -384,7 +384,7 @@ MemAvailable_GiB 9.28081
 
 `pre-commit install` installed the configured hooks using the existing uv-managed pre-commit tool. Both `pre-commit run markdownlint-cli2 --files <three changed Markdown files>` and `pre-commit run typos --files <three changed Markdown files>` passed. `git diff --check` passed. Dynamic smoke and final operational verification remain assigned to validate.
 
-## Validation round 1 — operational gate pending
+## Validation round 1 — passed with manager-owned memory recovery
 
 Reviewed `6118253cd98cfff49a8b2f3e5592488654702ec2..22470fc067` against both the original request and approved plan. The 22 node symlinks, 23 preserved originals, README sentence and movement evidence meet the file-change scope. No application implementation changed; the existing bench output path and head's adjacent prompt JSON remain intact. The explicitly approved summary archival and worker repo-version limitation are recorded above.
 
@@ -398,7 +398,7 @@ Commands on head (2026-09-12 23:22 KST), from `/home/nacyot/dsv41-prep`:
 {"salt": "S28", "prompt_tokens": 9115, "ttft_s": 5.043, "answer": "12", "expected": "12", "ok": true, "mem_avail_start_gib": null, "mem_avail_min_gib": null, "tag": "i28-smoke", "delta": {"kv_offload_store_bytes": 27112320.0, "external_prefix_cache_queries": 9115.0, "external_prefix_cache_hits": 0.0, "prefix_cache_hits": 0.0, "kv_offload_lookup_sync_delay_seconds_sum": 0.026078477851115167, "prefix_cache_queries": 9115.0}}
 ```
 
-The short probe does not enable the long-request memory monitor, hence its null memory fields; these are not measured minima. Shell observations: before request 4.58975 GiB, afterward 3.23519 GiB at 23:22:38, then 3.42737 GiB and 3.41165 GiB at 23:23:48 after another 30-second idle observation. **Head MemAvailable remains below the required 4.5 GiB, so validation has not passed and no merge transition is authorized by this result.** Further inference was stopped. No restart or configuration change was attempted.
+The short probe does not enable the long-request memory monitor, hence its null memory fields; these are not measured minima. Shell observations: before request 4.58975 GiB, afterward 3.23519 GiB at 23:22:38, then 3.42737 GiB and 3.41165 GiB at 23:23:48 after another 30-second idle observation. Validation initially paused because head MemAvailable was below 4.5 GiB. Further inference was stopped. No restart or configuration change was attempted. The manager subsequently authorized completing validation and proceeding to merge with memory recovery assigned as described below; this does not claim that memory has recovered.
 
 At 23:22:38–40, all four serving units and cap services were active, with 1989 MHz observed and head health 200. Symlink recheck passed with 10/4/4/4 links and zero duplicate regular scripts; all node checkouts remained clean. Head health 200 and cap active/1989 MHz persisted at 23:23:48. Serving units' activation timestamps remain 22:58:04 on head and 22:57:57–58 on workers, before this task's operations.
 
@@ -406,4 +406,10 @@ Read-only inspection of head's existing service process confirmed `--tensor-para
 
 `pre-commit run --from-ref 6118253cd98cfff49a8b2f3e5592488654702ec2 --to-ref HEAD` passed all applicable hooks; non-applicable code hooks skipped. `git diff --check 6118253cd98cfff49a8b2f3e5592488654702ec2..HEAD` passed. No build is needed for Markdown and filesystem symlinks. Initial read-only discovery queried nonexistent unit `dsv41-r0` and found no remote `rg`; corrected to the existing `dsv41-serve` unit and `grep`, without state changes.
 
-Remaining gate: manager/owner coordination for head memory recovery under the existing prohibition on this worker stopping/restarting the server. Once recovery is reported, recheck memory, health and caps; do not repeat the successful inference merely to re-establish its result. Keep the workflow in validate until the end-state requirement is satisfied or the owner explicitly revises it.
+### Manager decision resolving the remaining gate
+
+The manager's instruction in this task attributes the approximately 3.4 GiB head availability to the adopted #15 policy, not the #28 symlink changes: `EMPTY_CACHE_MIN_TOKENS=65536` retains the 9K probe's approximately 1.2 GiB of segments until a subsequent prefill run of at least 64K tokens. With availability at 3.46 GiB in the manager's observation, such a run could reach approximately 2.5 GiB and is prohibited. This explanation and estimate are the manager's assessment; no additional allocation experiment was run here.
+
+**Head recovery to at least 4.5 GiB is owned by the manager at the next server restart**, specifically the adopted-configuration restart coordinated for #20 validation. The manager explicitly instructed this worker to record that handoff, finish validate and proceed to merge. The worker must not stop/restart the server, run a larger prefill, or alter the adopted settings to force recovery. Issue `done` remains manager-owned.
+
+Validation passes for #28 under this explicit handoff: file integrity, symlink targets, head imports, the single short probe and scoped lint passed; head memory recovery is deferred, not reported as achieved. No further inference or node mutation is needed for this transition.
