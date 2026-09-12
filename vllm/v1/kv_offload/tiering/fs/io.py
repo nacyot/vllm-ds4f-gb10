@@ -77,7 +77,9 @@ def _ensure_dirs(path: str) -> None:
     os.makedirs(os.path.dirname(path), exist_ok=True)
 
 
-def _validate_offsets(view: memoryview, offsets: list[int], block_size: int) -> None:
+def _validate_offsets(
+    view: memoryview, offsets: list[int], block_sizes: list[int]
+) -> None:
     """Raise if any block would read/write past the bounds of `view`.
 
     Without this, an out-of-range offset silently clips to a shorter (or
@@ -85,7 +87,7 @@ def _validate_offsets(view: memoryview, offsets: list[int], block_size: int) -> 
     Python's slice-clamping semantics rather than raising.
     """
     total_len = len(view.cast("B"))
-    for offset in offsets:
+    for offset, block_size in zip(offsets, block_sizes):
         if offset < 0 or offset + block_size > total_len:
             raise ValueError(
                 f"block offset {offset} (block_size {block_size}) is out of "
@@ -274,7 +276,7 @@ def batch_store_block(
     checksum.
     """
     sizes = _block_sizes(block_size, len(offsets))
-    _validate_offsets(view, offsets, max(sizes, default=0))
+    _validate_offsets(view, offsets, sizes)
 
     if skip_existing:
         keep = [
@@ -381,7 +383,7 @@ def batch_load_block(
     _load_block for the delete-on-short-read policy.
     """
     sizes = _block_sizes(block_size, len(offsets))
-    _validate_offsets(view, offsets, max(sizes, default=0))
+    _validate_offsets(view, offsets, sizes)
 
     failed = _load_blocks(paths, view, offsets, sizes, use_o_direct)
     if checksums:

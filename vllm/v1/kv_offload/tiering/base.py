@@ -168,7 +168,11 @@ class SecondaryTierManager(ABC):
         self.locality: Locality | None = None
 
     def _slot_offset(self, block_id: int) -> int:
-        return int(self._slot_offsets[block_id])
+        if 0 <= block_id < len(self._slot_offsets):
+            return int(self._slot_offsets[block_id])
+        # Out of range: hand the I/O layer an offset it rejects as such
+        # instead of failing here on the scheduler thread.
+        return block_id * self._primary_row_bytes
 
     def _slot_bytes(self, block_id: int) -> int:
         return int(self._slot_row_bytes[block_id])
