@@ -269,6 +269,18 @@ full ≥ 50). Owner levers are proposed in the #30 decision issue; nothing was
 changed. `memlog.py` records the counters that tell the two cases apart
 (`pswpout`, `compact_stall`, `free_order9plus`, `e_/a_VmSwap`).
 
+Head processes on the 2026-09-13 boot (MiB; `VmSwap` stayed 0 at every
+point, `MemorySwapPeak=0`):
+
+| Process | After boot RssAnon | After warm-up RssAnon | After 8K RssAnon | VmSwap |
+| --- | ---: | ---: | ---: | ---: |
+| VLLM::Worker_TP0 | 2,819 | 2,837 | 2,838 | 0 |
+| VLLM::EngineCore | 805 | 831 | 830 | 0 |
+| API server (`vllm serve`) | 865 | 918 | 918 | 0 |
+
+For comparison, at the #25 S4 start (7.11 GiB idle) the worker held RssAnon
+2,172 + VmSwap 665 = 2,837, the same total.
+
 | Boot (KST) | Idle after boot | Warm-up minimum | Swapped out in warm-up | Idle after warm-up |
 | --- | ---: | ---: | ---: | ---: |
 | #25 b4, 09-12 19:22 | 6.19 | 3.34 | 0 | 5.43 → 4.7 |

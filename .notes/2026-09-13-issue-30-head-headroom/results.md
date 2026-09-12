@@ -29,7 +29,15 @@
 | 00:41:5x | `dsv41_ctl.sh headroom` | **5.11 GiB → exit 3** | | | | | | |
 | 00:42:34 | 8K 프로브 `Rp4`(정답, TTFT 5.1 s) | 3,980 | 2,622 | | 10 | 0 | 0 | 0 |
 
-3 프로세스 RssAnon(MiB): 부팅 직후 W 2,819 / E 805 / A 865 → 웜업 뒤 2,837 / 831 / 918 → 8K 뒤 2,838 / 830 / 918. VmSwap 전부 0. `MemorySwapPeak=0`. 작업 창 earlyoom 0. 웜업 중 pgscan_kswapd +516k, pgscan_direct +4,223, allocstall_normal +1,062.
+3 프로세스(MiB, VmSwap 은 모든 시점 0, `MemorySwapPeak=0`; 493K 는 Not run):
+
+| 프로세스 | 부팅 직후 RssAnon | 웜업 뒤 RssAnon | 8K 뒤 RssAnon | VmSwap |
+| --- | ---: | ---: | ---: | ---: |
+| VLLM::Worker_TP0 | 2,819 | 2,837 | 2,838 | 0 |
+| VLLM::EngineCore | 805 | 831 | 830 | 0 |
+| API 서버(`vllm serve`) | 865 | 918 | 918 | 0 |
+
+비교: #25 S4 시작(유휴 7.11) 의 worker 는 RssAnon 2,172 + VmSwap 665 = 2,837 로 합이 같다. 작업 창 earlyoom 0. 웜업 중 pgscan_kswapd +516k, pgscan_direct +4,223, allocstall_normal +1,062.
 
 해석: 부팅 자체는 회수 없이 끝나고(compact/pswpout 증분 0) order≥9 블록만 14,957 → 44 로 소진한다. 콜드 웜업의 2 MiB 청크 재성장이 곧바로 order≥9 = 0 에 부딪혀 직접 컴팩션 1,183 회·kswapd 회수를 일으킨다 — 여기까지는 b5 와 같은 경로다. 이번에는 커널이 **파일 캐시 ~1.6 GiB 를 회수하고 anon 은 두었다**(파일 LRU 2.3 GiB 가 있었고 swappiness 60 의 비용 균형이 파일 쪽이었음). b5 는 같은 자리에서 anon 1.75 GiB 를 내보내고 파일 캐시를 0.7 GiB 까지 비웠다(둘 다 회수). 어느 쪽을 택하는지는 그 순간의 파일 LRU 크기와 anon/file 재폴트 비용(직전 부팅들의 kvfs 복원·bench 로 인한 파일 churn)에 달린 커널 결정이라 부팅마다 다르며, 사용자 코드가 정하지 않는다. 이것이 4.6~7.1 편차의 전부다.
 
