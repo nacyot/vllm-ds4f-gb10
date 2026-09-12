@@ -36,6 +36,9 @@ ARGS=(
   --default-chat-template-kwargs "{\"thinking\":$THINKING}"
 )
 [ "$TEXT_ONLY" = "1" ] && ARGS+=(--language-model-only)
+# The engine's OffloadingConnector reports kv_connector_stats; the frontend's
+# KVConnectorLogging needs the connector class to decode them (no size, no tiers).
+[ "${KVOFF_GIB:-0}" != "0" ] && ARGS+=(--kv-transfer-config '{"kv_connector":"OffloadingConnector","kv_role":"kv_both"}')
 # shellcheck disable=SC2206
 [ -n "$FRONTEND_EXTRA_ARGS" ] && ARGS+=($FRONTEND_EXTRA_ARGS)
 
