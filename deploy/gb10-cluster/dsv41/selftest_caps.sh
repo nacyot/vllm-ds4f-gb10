@@ -3,6 +3,7 @@
 set -euo pipefail
 HERE=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 TEST_DIR=$(mktemp -d)
+TEST_DIR=$(cd "$TEST_DIR" && pwd -P)
 printf 'Caps selftest artifacts: %s\n' "$TEST_DIR"
 export DSV41_CAP_FIXTURE="$TEST_DIR/fixture-current"
 export CAP_MHZ=2000 SKIP_CAP_CHECK=0
@@ -31,6 +32,7 @@ esac
 STUB
 cat > "$TEST_DIR/sleep" <<'STUB'
 #!/usr/bin/env bash
+printf 'sleep %s\n' "$*" >> "$CAP_TEST_CALLS"
 exit 0
 STUB
 chmod +x "$TEST_DIR/ssh" "$TEST_DIR/sleep"
@@ -99,6 +101,28 @@ SKIP_CAP_CHECK=1 run_case caps-not-bypassed 3
 fixture
 run_case normal-start 0 start
 assert_order
+assert_no_glob_rm() {
+  if grep -Eq 'rm -f /dev/shm/[^;]*\*' "$CAP_TEST_CALLS"; then
+    echo 'FAIL: remote glob deletion' >&2; exit 1
+  fi
+}
+assert_no_glob_rm
+run_case stop 0 stop
+assert_no_glob_rm
+[ "$(grep -c 'shm_cleanup clean$' "$CAP_TEST_CALLS")" -eq 4 ]
+awk '/sleep 6/ { waited=1 } /pkill -KILL/ { if (!waited) exit 1; kills++ }
+  END { if (kills != 4) exit 1 }' "$CAP_TEST_CALLS"
+DSV41_SHM_DRYRUN=1 run_case dry-stop 0 stop
+[ "$(grep -c 'shm_cleanup list$' "$CAP_TEST_CALLS")" -eq 4 ]
+DSV41_SHM_DRYRUN=1 run_case dry-start 0 start
+[ "$(grep -c 'shm_cleanup list$' "$CAP_TEST_CALLS")" -eq 4 ]
+run_case shm-all 0 shm
+[ "$(grep -c 'shm_cleanup list$' "$CAP_TEST_CALLS")" -eq 4 ]
+run_case shm-host 0 shm gx10-6040
+[ "$(wc -l < "$CAP_TEST_CALLS")" -eq 1 ]
+grep -q 'nacyot@gx10-6040' "$CAP_TEST_CALLS"
+run_case shm-invalid 2 shm invalid
+assert_no_ssh
 run_case status 0 status
 [ "$(grep -c 'cap active 1989MHz' "$TEST_DIR/status.out")" -eq 4 ]
 grep -q 'health: 200' "$TEST_DIR/status.out"
@@ -146,3 +170,56 @@ assert_no_ssh
 unset DSV41_MEM_FIXTURE
 CAP_TEST_SSH_EXIT=255 run_case memory-ssh-failure 3 headroom
 printf 'All headroom selftests passed. Artifacts retained: %s\n' "$TEST_DIR"
+
+# Execute the same cleanup body against a private fixture root. rm is a recorder;
+# neither SSH commands nor actual /dev/shm files are touched.
+mkdir "$TEST_DIR/shm"
+sed -n '/^shm_cleanup()/,/^}/p' "$HERE/dsv41_ctl.sh" |
+  sed "s|/dev/shm|$TEST_DIR/shm|g" > "$TEST_DIR/shm-function.sh"
+# shellcheck disable=SC2329 # These stubs are called by the sourced remote function.
+(
+  # shellcheck disable=SC1091
+  source "$TEST_DIR/shm-function.sh"
+  systemctl() { printf '%s\n' "$SHM_STATE"; }
+  fuser() {
+    case "$SHM_USE" in
+      busy) printf '1234\n'; return 0;;
+      error) printf 'inspection failed\n' >&2; return 1;;
+      *) return 1;;
+    esac
+  }
+  # GNU stat is remote-only. The fixture preserves real path/type/owner checks.
+  stat() { printf '1:2:%s:4\n' "$(id -u)"; }
+  realpath() { command realpath "${@: -1}"; }
+  rm() { printf '%s\n' "$*" >> "$TEST_DIR/deletions"; }
+  printf 'test' > "$TEST_DIR/shm/psm_fixture"
+  printf 'keep' > "$TEST_DIR/shm/unrelated"
+  ln -s "$TEST_DIR/shm/unrelated" "$TEST_DIR/shm/psm_link"
+  SHM_USE=unused
+  for SHM_STATE in active activating deactivating unknown; do
+    : > "$TEST_DIR/deletions"
+    shm_cleanup clean > "$TEST_DIR/shm-$SHM_STATE.out"
+    [ ! -s "$TEST_DIR/deletions" ]
+    grep -q "skip: dsv41-serve $SHM_STATE" "$TEST_DIR/shm-$SHM_STATE.out"
+  done
+  SHM_STATE=inactive SHM_USE=busy
+  shm_cleanup clean > "$TEST_DIR/shm-busy.out"
+  [ ! -s "$TEST_DIR/deletions" ]
+  grep -q 'skip: in use' "$TEST_DIR/shm-busy.out"
+  SHM_USE=error
+  if shm_cleanup clean > "$TEST_DIR/shm-error.out"; then exit 1; fi
+  [ ! -s "$TEST_DIR/deletions" ]
+  SHM_USE=unused
+  shm_cleanup list > "$TEST_DIR/shm-list.out"
+  [ ! -s "$TEST_DIR/deletions" ]
+  shm_cleanup clean > "$TEST_DIR/shm-clean.out"
+  printf '%s\n' "-f -- $TEST_DIR/shm/psm_fixture" > "$TEST_DIR/expected-deletions"
+  diff -u "$TEST_DIR/expected-deletions" "$TEST_DIR/deletions"
+  grep -q 'deleted:' "$TEST_DIR/shm-clean.out"
+  # An unexpected enumerator result must not extend the permitted directory.
+  find() { printf '%s\0' "$TEST_DIR/shm/../shm/psm_fixture"; }
+  : > "$TEST_DIR/deletions"
+  if shm_cleanup clean > "$TEST_DIR/shm-unsafe.out"; then exit 1; fi
+  [ ! -s "$TEST_DIR/deletions" ]
+)
+printf 'All shm selftests passed. Artifacts retained: %s\n' "$TEST_DIR"

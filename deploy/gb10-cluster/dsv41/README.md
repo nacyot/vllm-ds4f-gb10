@@ -12,7 +12,7 @@ gx10-f323, gx10-37cc, and gx10-27c4. It requires Bash 4 or newer; on macOS:
 
 | File | Role |
 | --- | --- |
-| `dsv41_ctl.sh` | Workstation start, stop, status, caps, and log commands. |
+| `dsv41_ctl.sh` | Workstation start, stop, shm inspection, status, caps, and log commands. |
 | `serve-node.sh` | Launch one TP rank as the `dsv41-serve` user service. |
 | `serve-frontend.sh`, `kv_transfer_json.sh` | API server without an engine on `FRONTEND_HOST` (issue #24 spike, off by default); the shared `--kv-transfer-config` builder. |
 | `dsv41.env` | Adopted server defaults, overridable through the environment. |
@@ -55,9 +55,19 @@ API health. Use `caps` for the pass/fail exit status.
 Neither variable is forwarded to node services. Automation workers must
 not use the override to bypass an observed failure.
 
-Existing `start`/`stop` shared-memory cleanup uses glob deletion; issue #20
-tracks bringing that cleanup into compliance with the worker safety rules.
-Workers must not execute those paths while that conflict remains.
+`start`/`stop` first list shared-memory candidates with their sizes, then delete
+only explicitly listed, unused files owned by the remote user directly under
+`/dev/shm`: `sem.mp-*`, `psm_*`, and `vllm_offload_*.mmap`. Symlinks and changed
+files are rejected. Active or transitioning `dsv41-serve` services protect all
+candidates; files still used by a process are skipped. Inspection failures
+prevent deletion and are reported. Nodes need GNU Bash 4.4+ and `fuser`.
+
+Use `dsv41_ctl.sh shm [host]` to inspect all four nodes or one named cluster
+node, including while serving. It lists candidates and whether they are in use
+without stopping services or deleting files. `DSV41_SHM_DRYRUN=1` makes start/stop
+cleanup read-only too: **dry-run stop still stops the services**, but leaves
+cleanup candidates in place. Stop retains its six-second wait before the final
+process termination and cleanup. The KV filesystem store is never a candidate.
 
 ## KV offload host tier (issue #2)
 
@@ -189,7 +199,9 @@ with a live server for the torch-process rule. Details:
 - Keep cluster operations in small foreground steps, monitor at 30–60 second
   intervals, and stop on anomalies. Do not chain background jobs. Use
   `mktemp -d` for fresh artifacts; do not use variable or glob paths with
-  `rm`. Inspect actual targets before accepting a safety prompt.
+  `rm`. The start/stop cleanup function alone may delete validated, explicitly
+  listed shared-memory files; workers must not run ad hoc `rm` commands.
+  Inspect actual targets before accepting a safety prompt.
 - After experiments, restore port 8889 to the adopted `dsv41.env` defaults,
   including `ENGRAM_PREFETCH=1`, `EMPTY_CACHE=1`, and
   `EMPTY_CACHE_MIN_TOKENS=65536`. End with health 200, all four cap services

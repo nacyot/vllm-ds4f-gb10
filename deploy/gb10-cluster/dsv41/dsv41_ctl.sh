@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# dsv41_ctl.sh start|stop|status|caps|headroom [min_gib]|frontend|log [host|frontend] [n] -- run from a workstation with SSH to the four nodes.
+# dsv41_ctl.sh start|stop|shm [host]|status|caps|headroom [min_gib]|frontend|log [host|frontend] [n] -- run from a workstation with SSH to the four nodes.
 # Starts DeepSeek-V4.1-Flash TP=4 (workers 3,2,1 first, then head 0) as the user unit
 # `dsv41-serve` on each node, via deploy/gb10-cluster/dsv41/serve-node.sh in ~/vllm-dsv41.
 # With FRONTEND_HOST/FRONTEND_ADDR set (issue #24) the API server runs on FRONTEND_HOST
@@ -108,6 +108,76 @@ check_headroom() {
   fi
 }
 
+shm_cleanup() { # Runs on the node; mode is list or clean.
+  local mode=$1 state path resolved metadata current users rc uid cleanup_error=0
+  local files=() identities=()
+  uid=$(id -u) || return 1
+  state=$(systemctl --user show dsv41-serve.service -p ActiveState --value) || return 1
+  printf 'dsv41-serve: %s\n' "$state"
+  command -v fuser >/dev/null || { echo 'Cannot inspect shm: fuser unavailable' >&2; return 1; }
+  mapfile -d '' -t files < <(find /dev/shm -mindepth 1 -maxdepth 1 -type f -uid "$uid" \
+    \( -name 'sem.mp-*' -o -name 'psm_*' -o -name 'vllm_offload_*.mmap' \) -print0)
+  wait "$!" || return 1
+  printf 'shm files: %s\n' "${#files[@]}"
+  for path in "${files[@]}"; do
+    metadata=$(stat -c '%d:%i:%u:%s' -- "$path") || return 1
+    identities+=("$metadata")
+    printf 'candidate: %q %s bytes\n' "$path" "${metadata##*:}"
+  done
+  if [ "$mode" = clean ]; then
+    case "$state" in
+      inactive|failed) ;;
+      *) printf 'skip: dsv41-serve %s\n' "$state"; return 0;;
+    esac
+  fi
+  local i
+  for i in "${!files[@]}"; do
+    path=${files[$i]}
+    resolved=$(realpath -e -- "$path") || { cleanup_error=1; continue; }
+    case "$path" in
+      /dev/shm/sem.mp-*|/dev/shm/psm_*|/dev/shm/vllm_offload_*.mmap) ;;
+      *) printf 'skip: unsafe path %q\n' "$path"; cleanup_error=1; continue;;
+    esac
+    if [ "$resolved" != "$path" ] || [ "${path%/*}" != /dev/shm ] ||
+       [ -L "$path" ] || [ ! -f "$path" ] || [ ! -O "$path" ]; then
+      printf 'skip: unsafe path %q\n' "$path"; cleanup_error=1; continue
+    fi
+    rc=0
+    users=$(fuser -- "$path" 2>&1) || rc=$?
+    if [ "$rc" -eq 0 ]; then
+      printf 'skip: in use %q (%s)\n' "$path" "$users"; continue
+    elif [ "$rc" -ne 1 ] || [ -n "$users" ]; then
+      printf 'skip: cannot inspect %q (%s)\n' "$path" "$users"; cleanup_error=1; continue
+    fi
+    if [ "$mode" = list ]; then
+      printf 'unused: %q\n' "$path"; continue
+    fi
+    state=$(systemctl --user show dsv41-serve.service -p ActiveState --value) || return 1
+    case "$state" in
+      inactive|failed) ;;
+      *) printf 'skip: dsv41-serve %s\n' "$state"; return 0;;
+    esac
+    current=$(stat -c '%d:%i:%u:%s' -- "$path") || { cleanup_error=1; continue; }
+    if [ -L "$path" ] || [ ! -f "$path" ] || [ ! -O "$path" ] ||
+       [ "$current" != "${identities[$i]}" ]; then
+      printf 'skip: changed file %q\n' "$path"; cleanup_error=1; continue
+    fi
+    if rm -f -- "$path"; then
+      printf 'deleted: %q\n' "$path"
+    else
+      cleanup_error=1
+    fi
+  done
+  return "$cleanup_error"
+}
+
+shm_remote() { # host, optional list mode
+  local h=$1 mode=${2:-clean}
+  [ "${DSV41_SHM_DRYRUN:-0}" != 1 ] || mode=list
+  printf '== %s shm (%s)\n' "$h" "$mode"
+  $SSH "nacyot@$h" "export XDG_RUNTIME_DIR=/run/user/\$(id -u); $(declare -f shm_cleanup); shm_cleanup $mode"
+}
+
 FE=${FRONTEND_HOST:-}
 start_frontend() {
   $SSH "nacyot@$FE" "$PRE; systemctl --user stop dsv41-frontend.service 2>/dev/null;
@@ -117,7 +187,9 @@ start_frontend() {
 }
 start_rank() { # host
   local h=$1 r=${RANK[$1]}
-  $SSH "nacyot@$h" "$PRE; systemctl --user stop dsv41-serve.service 2>/dev/null; rm -f /dev/shm/sem.mp-* /dev/shm/psm_* 2>/dev/null;
+  $SSH "nacyot@$h" "$PRE; systemctl --user stop dsv41-serve.service 2>/dev/null; true" || return 1
+  shm_remote "$h" || return 1
+  $SSH "nacyot@$h" "$PRE;
     sudo -n sh -c 'sync; echo 3 > /proc/sys/vm/drop_caches' 2>/dev/null || true;
     systemd-run --user --collect --unit=dsv41-serve -p LimitNOFILE=65536 $KNOBS \
       -p StandardOutput=append:/home/nacyot/dsv41-prep/logs/dsv41-r${r}.log -p StandardError=append:/home/nacyot/dsv41-prep/logs/dsv41-r${r}.log \
@@ -126,12 +198,12 @@ start_rank() { # host
 case $CMD in
   start)
     [ "${SKIP_CAP_CHECK:-0}" = "1" ] || check_caps || exit 3
-    for w in "${WORKERS[@]}"; do echo "== $w rank ${RANK[$w]}"; start_rank "$w"; done
+    for w in "${WORKERS[@]}"; do echo "== $w rank ${RANK[$w]}"; start_rank "$w" || exit 1; done
     if [ -n "$FE" ]; then
       [ -n "${FRONTEND_ADDR:-}" ] || { echo "FRONTEND_HOST is set but FRONTEND_ADDR is empty" >&2; exit 2; }
       sleep 5; echo "== $FE frontend"; start_frontend
     fi
-    sleep 5; echo "== $HEAD rank 0"; start_rank "$HEAD"
+    sleep 5; echo "== $HEAD rank 0"; start_rank "$HEAD" || exit 1
     if [ -n "$FE" ]; then echo "dsv41 TP=4 launched (frontend $FE :${PORT:-8889}, head $HEAD headless)"
     else echo "dsv41 TP=4 launched (head $HEAD :${PORT:-8889})"; fi;;
   frontend)
@@ -139,8 +211,25 @@ case $CMD in
     echo "== $FE frontend (restart)"; start_frontend;;
   stop)
     for h in "${ALL[@]}"; do $SSH "nacyot@$h" "$PRE; systemctl --user stop dsv41-serve.service dsv41-frontend.service 2>/dev/null; pkill -TERM -f 'serve-node.sh|[v]llm serve.*DeepSeek-V4.1' 2>/dev/null; true"; done
-    sleep 6; for h in "${ALL[@]}"; do $SSH "nacyot@$h" "pkill -KILL -f '[v]llm serve.*DeepSeek-V4.1|[V]LLM::|[E]ngineCore' 2>/dev/null; rm -f /dev/shm/sem.mp-* /dev/shm/psm_* /dev/shm/vllm_offload_*.mmap 2>/dev/null; true"; done
+    sleep 6; cleanup_failed=0
+    for h in "${ALL[@]}"; do
+      $SSH "nacyot@$h" "pkill -KILL -f '[v]llm serve.*DeepSeek-V4.1|[V]LLM::|[E]ngineCore' 2>/dev/null; true" || cleanup_failed=1
+      shm_remote "$h" || cleanup_failed=1
+    done
+    [ "$cleanup_failed" = 0 ] || exit 1
     echo "dsv41 stopped";;
+  shm)
+    hosts=("${ALL[@]}")
+    if [ "$#" -gt 2 ]; then echo 'usage: dsv41_ctl.sh shm [host]' >&2; exit 2; fi
+    if [ "$#" -eq 2 ]; then
+      case "$2" in
+        gx10-6040|gx10-f323|gx10-37cc|gx10-27c4) hosts=("$2");;
+        *) echo "Unknown shm host: $2" >&2; exit 2;;
+      esac
+    fi
+    cleanup_failed=0
+    for h in "${hosts[@]}"; do shm_remote "$h" list || cleanup_failed=1; done
+    exit "$cleanup_failed";;
   caps) check_caps;;
   headroom) check_headroom "${2:-${MIN_AVAIL_GIB:-5.2}}";;
   status)
@@ -164,5 +253,5 @@ case $CMD in
     else
       $SSH "nacyot@${2:-$HEAD}" "tail -n ${3:-40} ~/dsv41-prep/logs/dsv41-r${RANK[${2:-$HEAD}]}.log"
     fi;;
-  *) echo "usage: dsv41_ctl.sh start|stop|status|caps|headroom [min_gib]|frontend|log [host|frontend] [n]"; exit 2;;
+  *) echo "usage: dsv41_ctl.sh start|stop|shm [host]|status|caps|headroom [min_gib]|frontend|log [host|frontend] [n]"; exit 2;;
 esac
