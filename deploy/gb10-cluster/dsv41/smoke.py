@@ -1,5 +1,8 @@
 #!/usr/bin/env python3
-"""First-boot checks against the V4.1 head (default http://127.0.0.1:8889).
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+
+"""First-boot checks against the V4.1 head (default http://127.0.0.1:8888).
 
 Greedy, thinking off. Prints each answer, token counts and tok/s, whether the
 1..100 count is exact, and whether a repeated prompt is deterministic. This is
@@ -10,7 +13,7 @@ import sys
 import time
 import urllib.request
 
-base = sys.argv[1] if len(sys.argv) > 1 else "http://127.0.0.1:8889"
+base = sys.argv[1] if len(sys.argv) > 1 else "http://127.0.0.1:8888"
 models = json.load(urllib.request.urlopen(base + "/v1/models", timeout=30))
 model = models["data"][0]["id"]
 

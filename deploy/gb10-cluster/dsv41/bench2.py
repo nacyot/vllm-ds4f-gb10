@@ -1,4 +1,7 @@
 #!/usr/bin/env python3
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+
 """Category bench for the V4.1 server: Tech2Wild's public prompt set v1
 (bench_prompts_v1.json, from github.com/tonyd2wild/DeepSeek-V4.1-Flash-vLLM-DGX-Spark,
 same prompts so the numbers compare) plus a pi-style set (Korean chat, code, a
@@ -25,7 +28,7 @@ from concurrent.futures import ThreadPoolExecutor
 HERE = os.path.dirname(os.path.abspath(__file__))
 ap = argparse.ArgumentParser()
 ap.add_argument("tag")
-ap.add_argument("--base", default="http://127.0.0.1:8889")
+ap.add_argument("--base", default="http://127.0.0.1:8888")
 ap.add_argument("--levels", default="1,4")
 ap.add_argument("--out", default=os.path.expanduser("~/dsv41-prep/bench"))
 ap.add_argument("--skip-public", action="store_true")

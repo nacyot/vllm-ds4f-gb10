@@ -1,4 +1,7 @@
 #!/usr/bin/env python3
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+
 """Before/after bench for the V4.1 server: same prompts, greedy, thinking off.
 
 Measures TTFT and decode tok/s from streamed chat completions (single stream,
@@ -18,7 +21,7 @@ import urllib.request
 from concurrent.futures import ThreadPoolExecutor
 
 tag = sys.argv[1]
-base = sys.argv[2] if len(sys.argv) > 2 else "http://127.0.0.1:8889"
+base = sys.argv[2] if len(sys.argv) > 2 else "http://127.0.0.1:8888"
 out_dir = sys.argv[3] if len(sys.argv) > 3 else os.path.expanduser("~/dsv41-prep/bench")
 os.makedirs(out_dir, exist_ok=True)
 model = json.load(urllib.request.urlopen(base + "/v1/models", timeout=30))["data"][0][

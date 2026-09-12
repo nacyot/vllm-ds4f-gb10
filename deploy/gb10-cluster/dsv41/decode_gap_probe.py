@@ -21,7 +21,7 @@ import urllib.request
 ap = argparse.ArgumentParser()
 ap.add_argument("tag")
 ap.add_argument("--tokens", type=int, default=1500)
-ap.add_argument("--base", default="http://127.0.0.1:8889")
+ap.add_argument("--base", default="http://127.0.0.1:8888")
 ap.add_argument("--out", default=os.path.expanduser("~/dsv41-prep/bench"))
 args = ap.parse_args()
 os.makedirs(args.out, exist_ok=True)

@@ -1,4 +1,7 @@
 #!/usr/bin/env python3
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+
 """Record greedy completions with per-token top-2 logprobs for a few prompts,
 or compare two recordings and report the first differing token: whether the
 target's argmax at that position differs (numerical drift) or the committed
@@ -96,7 +99,7 @@ def compare(a, b):
 
 if __name__ == "__main__":
     if sys.argv[1] == "record":
-        base = sys.argv[3] if len(sys.argv) > 3 else "http://127.0.0.1:8889"
+        base = sys.argv[3] if len(sys.argv) > 3 else "http://127.0.0.1:8888"
         record(sys.argv[2], base)
     else:
         compare(sys.argv[2], sys.argv[3])

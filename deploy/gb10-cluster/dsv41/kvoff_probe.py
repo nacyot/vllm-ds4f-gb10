@@ -19,7 +19,7 @@ import time
 import urllib.parse
 import urllib.request
 
-base = "http://127.0.0.1:8889"
+base = "http://127.0.0.1:8888"
 MIN_AVAIL_GIB = float(os.environ.get("DSV41_MIN_AVAIL_GIB", "5.2"))
 ABORT_BELOW_GIB = float(os.environ.get("DSV41_ABORT_BELOW_GIB", "2.8"))
 LONG_PROMPT_RECORDS = int(os.environ.get("DSV41_LONG_PROMPT_RECORDS", "18000"))
