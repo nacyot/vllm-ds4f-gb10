@@ -7,7 +7,9 @@ import mmap
 import os
 import random
 import threading
+import time
 import zlib
+from collections.abc import Collection
 
 try:
     from vllm.fs_io_C import (  # pyright: ignore[reportMissingImports]
@@ -28,6 +30,9 @@ O_DIRECT = getattr(os, "O_DIRECT", 0)
 
 # Thread-local storage for unique temporary file suffixes
 _thread_local = threading.local()
+
+# Pause before the single retry of a block whose read failed.
+_RETRY_DELAY_S = 0.01
 
 
 def _get_tmp_suffix() -> str:
@@ -111,18 +116,26 @@ def write_checksums(
 
 
 def verify_checksums(
-    paths: list[str], view: memoryview, offsets: list[int], sizes: list[int]
-) -> None:
-    """Compare each loaded block with its recorded CRC32. The first mismatching
-    file is removed and an OSError carrying ``num_succeeded`` is raised so the
-    tier keeps the blocks before it and marks the rest as misses.
+    paths: list[str],
+    view: memoryview,
+    offsets: list[int],
+    sizes: list[int],
+    skip: Collection[int] = (),
+) -> list[int]:
+    """Compare each loaded block with its recorded CRC32 and return the indices
+    of the blocks that do not match. A mismatching file is removed and the
+    check continues with the next block, so one corrupt file costs only its
+    own key. Indices in ``skip`` (blocks that were not loaded) are not checked.
 
     The data and the xattr are read by path at different moments, so a
     concurrent rewrite of the same key (temp file + rename) can pair the old
     bytes with the new checksum. A mismatch is therefore confirmed by reading
     the file again before it is declared corrupt; the re-read bytes replace the
     stale ones."""
+    failed: list[int] = []
     for i, (path, offset, size) in enumerate(zip(paths, offsets, sizes)):
+        if i in skip:
+            continue
         try:
             recorded = os.getxattr(path, _XATTR_CRC)
         except OSError:
@@ -143,9 +156,9 @@ def verify_checksums(
             os.remove(path)
         except OSError as cleanup_exc:
             logger.warning("Failed to remove corrupt file %s: %s", path, cleanup_exc)
-        exc = OSError(f"Checksum mismatch for {path}")
-        exc.num_succeeded = i  # type: ignore[attr-defined]
-        raise exc
+        logger.warning("Checksum mismatch for %s; file removed", path)
+        failed.append(i)
+    return failed
 
 
 def _block_sizes(block_size: int | list[int], count: int) -> list[int]:
@@ -288,6 +301,67 @@ def batch_store_block(
         write_checksums(paths, view, offsets, sizes)
 
 
+def _retry_block(
+    path: str,
+    view: memoryview,
+    offset: int,
+    size: int,
+    use_o_direct: bool,
+    exc: OSError,
+) -> bool:
+    """Read one block again after a short pause; True if it loaded."""
+    time.sleep(_RETRY_DELAY_S)
+    try:
+        _load_block(path, view, offset, size, use_o_direct)
+    except OSError as retry_exc:
+        logger.warning(
+            "Block %s failed to load after a retry: %s (first error: %s)",
+            path,
+            retry_exc,
+            exc,
+        )
+        return False
+    logger.debug("Block %s loaded on retry after: %s", path, exc)
+    return True
+
+
+def _load_blocks(
+    paths: list[str],
+    view: memoryview,
+    offsets: list[int],
+    sizes: list[int],
+    use_o_direct: bool,
+) -> list[int]:
+    """Load every block, retrying each failed one once; return the indices
+    that still failed. The C loader stops at its first failure and reports the
+    index, so it is resumed after each failed block."""
+    failed: list[int] = []
+    n = len(paths)
+    if _HAS_FSIO_C:
+        view_B = view.cast("B")
+        view_slices = [view_B[x : x + n_] for x, n_ in zip(offsets, sizes)]
+        start = 0
+        while start < n:
+            try:
+                batch_load_block_C(paths[start:], view_slices[start:], use_o_direct)
+                break
+            except OSError as exc:
+                i = start + getattr(exc, "num_succeeded", 0)
+                if not _retry_block(
+                    paths[i], view, offsets[i], sizes[i], use_o_direct, exc
+                ):
+                    failed.append(i)
+                start = i + 1
+        return failed
+    for i, (path, offset, size) in enumerate(zip(paths, offsets, sizes)):
+        try:
+            _load_block(path, view, offset, size, use_o_direct)
+        except OSError as exc:
+            if not _retry_block(path, view, offset, size, use_o_direct, exc):
+                failed.append(i)
+    return failed
+
+
 def batch_load_block(
     paths: list[str],
     view: memoryview,
@@ -295,31 +369,23 @@ def batch_load_block(
     block_size: int | list[int],
     use_o_direct: bool = True,
     checksums: bool = False,
-) -> None:
+) -> list[int]:
     """
     Load a batch of KV blocks from disk into a shared buffer in one call.
 
     Block i is read from source_paths[i] into view[offsets[i] : offsets[i]+size_i]
-    (``block_size`` or ``block_size[i]``).
-    Raises on first error (see _load_block for the delete-on-short-read policy).
-    On failure the raised OSError carries ``num_succeeded`` = the number of
-    blocks loaded before the failing one, so the tier can keep them.
+    (``block_size`` or ``block_size[i]``). A block that fails to read is
+    retried once; one that still fails (or whose checksum does not match) is
+    skipped and the rest of the batch is still loaded. Returns the sorted
+    indices of the blocks that were not loaded (empty when all loaded). See
+    _load_block for the delete-on-short-read policy.
     """
     sizes = _block_sizes(block_size, len(offsets))
     _validate_offsets(view, offsets, max(sizes, default=0))
 
-    if _HAS_FSIO_C:
-        view_B = view.cast("B")
-        view_slices = [view_B[x : x + n] for x, n in zip(offsets, sizes)]
-        batch_load_block_C(paths, view_slices, use_o_direct)
-    else:
-        for i, (path, offset, n) in enumerate(zip(paths, offsets, sizes)):
-            try:
-                _load_block(path, view, offset, n, use_o_direct)
-            except OSError as exc:
-                # Blocks 0..i-1 loaded fine; record the count for partial keep.
-                # The C path sets the same attribute via PyObject_SetAttrString.
-                exc.num_succeeded = i  # type: ignore[attr-defined]
-                raise
+    failed = _load_blocks(paths, view, offsets, sizes, use_o_direct)
     if checksums:
-        verify_checksums(paths, view, offsets, sizes)
+        failed = sorted(
+            failed + verify_checksums(paths, view, offsets, sizes, skip=set(failed))
+        )
+    return failed

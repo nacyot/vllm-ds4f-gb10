@@ -159,13 +159,14 @@ class FileSystemTierManager(SecondaryTierManager):
         # Keys of in-flight load (promotion) jobs, so a failed load can mark
         # its own cached lookup verdicts False (see get_finished_jobs).
         self._load_job_keys: dict[JobId, list[OffloadKey]] = {}
-        # Per load job: how many blocks loaded before a failure (partial keep).
-        # Written by the pool worker inside the load task before it raises (so
-        # before task_done publishes the job); read on the scheduler thread in
-        # get_finished_jobs only for job ids the finished queue returned. Under
-        # the GIL that read cannot observe the finished job without the prior
-        # write, so no extra lock is needed (get_finished is itself lock-free).
-        self._load_progress: dict[JobId, int] = {}
+        # Per load job: indices of the blocks that failed to load (the rest
+        # were loaded). Written by the pool worker inside the load task before
+        # it raises (so before task_done publishes the job); read on the
+        # scheduler thread in get_finished_jobs only for job ids the finished
+        # queue returned. Under the GIL that read cannot observe the finished
+        # job without the prior write, so no extra lock is needed
+        # (get_finished is itself lock-free).
+        self._load_failures: dict[JobId, list[int]] = {}
 
         # Extract block size from primary view
         assert primary_kv_view.strides is not None, (
@@ -287,32 +288,25 @@ class FileSystemTierManager(SecondaryTierManager):
         sizes = self._key_sizes(keys)
 
         def load_task() -> None:
-            try:
-                batch_load_block(
-                    paths,
-                    self._primary_kv_view,
-                    offsets,
-                    sizes,
-                    self._use_o_direct,
-                    self._checksums,
+            # Runs on the pool worker thread. Every block is loaded except the
+            # ones that failed twice (see batch_load_block); record those so
+            # get_finished_jobs keeps the rest. This write precedes task_done,
+            # so the scheduler reads it safely under the GIL once the finished
+            # queue hands back this job. Raising marks the job as failed.
+            failed = batch_load_block(
+                paths,
+                self._primary_kv_view,
+                offsets,
+                sizes,
+                self._use_o_direct,
+                self._checksums,
+            )
+            if failed:
+                self._load_failures[job_id] = failed
+                raise OSError(
+                    f"{len(failed)} of {len(paths)} blocks failed to load "
+                    f"(first: {paths[failed[0]]})"
                 )
-            except OSError as exc:
-                # Runs on the pool worker thread. Record how many blocks loaded
-                # before the failure so get_finished_jobs can keep them; this
-                # write precedes task_done, so the scheduler reads it safely
-                # under the GIL once the finished queue hands back this job.
-                num_succeeded = getattr(exc, "num_succeeded", 0)
-                self._load_progress[job_id] = num_succeeded
-                # Surfaces errno (e.g. EMFILE "Too many open files") for both
-                # the C and Python load paths.
-                logger.debug(
-                    "Load of %d blocks for job %s failed at block %d: %s",
-                    len(paths),
-                    job_id,
-                    num_succeeded,
-                    exc,
-                )
-                raise
 
         self._pool.enqueue_load(job_id, 1, [load_task])
 
@@ -334,14 +328,22 @@ class FileSystemTierManager(SecondaryTierManager):
                         )
                     )
             load_keys = self._load_job_keys.pop(job_id, None)
-            num_succeeded = self._load_progress.pop(job_id, 0)
+            failed_indices = self._load_failures.pop(job_id, None)
             if load_keys is not None and not success:
-                # A batched load stops at the first bad block and reports how
-                # many loaded before it. Those earlier blocks are kept in the
-                # primary tier (reported via successful_keys); only this block
-                # and the ones after it are marked a miss and recomputed.
-                successful = load_keys[:num_succeeded]
-                failed = load_keys[num_succeeded:]
+                # A batched load skips only the blocks that failed twice. The
+                # loaded blocks are kept in the primary tier (reported via
+                # successful_keys); only the failed keys are marked a miss and
+                # recomputed. Without a failure record the job died before
+                # loading (e.g. a bad offset), so every key failed.
+                if failed_indices is None:
+                    successful: list[OffloadKey] = []
+                    failed = load_keys
+                else:
+                    failed_set = set(failed_indices)
+                    successful = [
+                        key for i, key in enumerate(load_keys) if i not in failed_set
+                    ]
+                    failed = [load_keys[i] for i in failed_indices]
                 self._lookup_manager.mark_miss(failed)
                 results.append(
                     JobResult(

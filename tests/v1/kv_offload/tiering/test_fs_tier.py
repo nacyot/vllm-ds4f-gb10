@@ -8,6 +8,7 @@ The tier manager writes KV cache blocks to disk and reads them back, verifying
 data integrity throughout the process.
 """
 
+import errno
 import mmap
 import os
 import threading
@@ -301,8 +302,9 @@ def test_checksum_mismatch_is_confirmed_by_reread(tmp_path):
     with open(path, "r+b") as f:
         f.seek(0)
         f.write(b"\x05" * size)
-    with pytest.raises(OSError, match="Checksum mismatch"):
-        batch_load_block([path], view, [0], size, use_o_direct=False, checksums=True)
+    assert batch_load_block(
+        [path], view, [0], size, use_o_direct=False, checksums=True
+    ) == [0]
     assert not os.path.exists(path)
 
 
@@ -707,12 +709,12 @@ def test_batched_partial_load_failure_keeps_loaded_blocks(
 
 
 @pytest.mark.parametrize("use_c_ext", [True, False])
-def test_batched_load_first_block_fails_marks_whole_batch(
+def test_batched_load_first_block_fails_keeps_later_blocks(
     fs_tier, monkeypatch, use_c_ext
 ):
-    """When the FIRST block fails, nothing loaded before it: the job reports no
-    successful_keys (None) and the whole batch is marked a miss for the
-    request."""
+    """When the FIRST block fails the loader still reads the rest: the job
+    reports the later keys as successful and only the first key is a miss for
+    the request."""
     import vllm.v1.kv_offload.tiering.fs.io as io_mod
 
     if use_c_ext and not io_mod._HAS_FSIO_C:
@@ -732,10 +734,148 @@ def test_batched_load_first_block_fails_marks_whole_batch(
     tier.submit_load(make_job(2, keys, [0, 1, 2], is_promotion=True))
     results = drain(tier)
     assert len(results) == 1 and not results[0].success
-    # Nothing loaded before the failure -> no partial success reported.
-    assert results[0].successful_keys is None
-    # The whole batch is a miss for this request.
-    assert [tier.lookup(k, ctx) for k in keys] == [LookupResult.MISS] * 3
+    assert tuple(results[0].successful_keys) == (key(2), key(3))
+    assert [tier.lookup(k, ctx) for k in keys] == [
+        LookupResult.MISS,
+        LookupResult.HIT,
+        LookupResult.HIT,
+    ]
+
+
+@pytest.mark.parametrize("use_c_ext", [True, False])
+def test_batched_load_middle_block_fails_keeps_both_sides(
+    fs_tier, monkeypatch, use_c_ext
+):
+    """One bad block in the middle of a batched promotion costs only its own
+    key (#3). A request promotes every group's keys as one job, so marking
+    the whole tail after the failure a miss used to turn one corrupt file into
+    a zero-hit restore. The blocks on both sides load, stay HIT for the same
+    request without a re-probe, and only the corrupt block is a MISS (its file
+    was removed)."""
+    import vllm.v1.kv_offload.tiering.fs.io as io_mod
+
+    if use_c_ext and not io_mod._HAS_FSIO_C:
+        pytest.skip("fs_io_C extension not built")
+    monkeypatch.setattr(io_mod, "_HAS_FSIO_C", use_c_ext)
+
+    tier, _ = fs_tier
+    keys = [key(1), key(2), key(3)]
+    tier.submit_store(make_job(1, keys, [0, 1, 2]))
+    assert all(r.success for r in drain(tier))
+    bad_path = tier.file_mapper.get_file_name(key(2))
+
+    ctx = ReqContext(req_id="batch-middle-fail")
+    assert lookup_and_wait(tier, keys, ctx=ctx) == [LookupResult.HIT] * 3
+
+    with open(bad_path, "wb") as f:
+        f.write(b"x" * 10)
+    tier.submit_load(make_job(2, keys, [0, 1, 2], is_promotion=True))
+    results = drain(tier)
+    assert len(results) == 1 and not results[0].success
+    assert tuple(results[0].successful_keys) == (key(1), key(3))
+
+    lm = tier._lookup_manager
+    assert [tier.lookup(k, ctx) for k in keys] == [
+        LookupResult.HIT,
+        LookupResult.MISS,
+        LookupResult.HIT,
+    ]
+    assert lm._lookup_batch == []
+    assert not os.path.exists(bad_path)
+
+    tier.on_request_finished(ctx)
+    fresh = ReqContext(req_id="fresh-middle-fail")
+    assert lookup_and_wait(tier, keys, ctx=fresh) == [
+        LookupResult.HIT,
+        LookupResult.MISS,
+        LookupResult.HIT,
+    ]
+
+
+@pytest.mark.parametrize("use_c_ext", [True, False])
+def test_transient_load_failure_is_retried_once(fs_tier, monkeypatch, use_c_ext):
+    """A read that fails once with a transient errno (EAGAIN) is retried and
+    the job succeeds with every key HIT, instead of the tail of the batch
+    being marked a miss."""
+    import vllm.v1.kv_offload.tiering.fs.io as io_mod
+
+    if use_c_ext and not io_mod._HAS_FSIO_C:
+        pytest.skip("fs_io_C extension not built")
+    monkeypatch.setattr(io_mod, "_HAS_FSIO_C", use_c_ext)
+
+    tier, _ = fs_tier
+    keys = [key(1), key(2), key(3)]
+    tier.submit_store(make_job(1, keys, [0, 1, 2]))
+    assert all(r.success for r in drain(tier))
+    ctx = ReqContext(req_id="transient-retry")
+    assert lookup_and_wait(tier, keys, ctx=ctx) == [LookupResult.HIT] * 3
+
+    calls = {"n": 0}
+    if use_c_ext:
+        real_c = io_mod.batch_load_block_C
+
+        def flaky_c(paths, slices, use_o_direct):
+            calls["n"] += 1
+            if calls["n"] == 1:
+                exc = OSError(errno.EAGAIN, os.strerror(errno.EAGAIN), paths[1])
+                exc.num_succeeded = 1
+                raise exc
+            return real_c(paths, slices, use_o_direct)
+
+        monkeypatch.setattr(io_mod, "batch_load_block_C", flaky_c)
+    else:
+        real_py = io_mod._load_block
+
+        def flaky_py(path, view, offset, size, use_o_direct=True):
+            calls["n"] += 1
+            if calls["n"] == 2:
+                raise OSError(errno.EAGAIN, os.strerror(errno.EAGAIN), path)
+            real_py(path, view, offset, size, use_o_direct)
+
+        monkeypatch.setattr(io_mod, "_load_block", flaky_py)
+
+    tier.submit_load(make_job(2, keys, [0, 1, 2], is_promotion=True))
+    results = drain(tier)
+    assert len(results) == 1 and results[0].success
+    assert [tier.lookup(k, ctx) for k in keys] == [LookupResult.HIT] * 3
+    assert all(os.path.exists(tier.file_mapper.get_file_name(k)) for k in keys)
+
+
+@pytest.mark.parametrize("use_c_ext", [True, False])
+def test_checksum_mismatch_in_middle_keeps_other_blocks(
+    fs_tier, monkeypatch, use_c_ext
+):
+    """A confirmed checksum mismatch removes that file and fails only its key;
+    the blocks before and after it are kept."""
+    import vllm.v1.kv_offload.tiering.fs.io as io_mod
+
+    if use_c_ext and not io_mod._HAS_FSIO_C:
+        pytest.skip("fs_io_C extension not built")
+    monkeypatch.setattr(io_mod, "_HAS_FSIO_C", use_c_ext)
+
+    tier, _ = fs_tier
+    keys = [key(1), key(2), key(3)]
+    tier.submit_store(make_job(1, keys, [0, 1, 2]))
+    assert all(r.success for r in drain(tier))
+    bad_path = tier.file_mapper.get_file_name(key(2))
+    try:
+        os.getxattr(bad_path, io_mod._XATTR_CRC)
+    except OSError:
+        pytest.skip("filesystem has no xattr support")
+    os.setxattr(bad_path, io_mod._XATTR_CRC, b"\x00\x00\x00\x00")
+
+    ctx = ReqContext(req_id="batch-crc-fail")
+    assert lookup_and_wait(tier, keys, ctx=ctx) == [LookupResult.HIT] * 3
+    tier.submit_load(make_job(2, keys, [0, 1, 2], is_promotion=True))
+    results = drain(tier)
+    assert len(results) == 1 and not results[0].success
+    assert tuple(results[0].successful_keys) == (key(1), key(3))
+    assert [tier.lookup(k, ctx) for k in keys] == [
+        LookupResult.HIT,
+        LookupResult.MISS,
+        LookupResult.HIT,
+    ]
+    assert not os.path.exists(bad_path)
 
 
 @pytest.mark.parametrize("use_c_ext", [True, False])
