@@ -11,6 +11,7 @@ from tests.v1.kv_connector.unit.offloading_connector.test_config import (
     _make_vllm_config,
 )
 from tests.v1.kv_connector.unit.offloading_connector.utils import (
+    GPUBlock,
     MockOffloadingSpec,
     generate_store_output,
     to_keys,
@@ -1224,6 +1225,78 @@ def test_two_groups_full_and_sliding_window(request_runner, async_scheduling: bo
         # Group 1 (sliding window, window=2): only the last 2 blocks
         #   are within the window → loads blocks 1,2
         expected_loaded=((0, 3), (1, 3)),
+    )
+
+
+@pytest.mark.parametrize("async_scheduling", [True, False])
+def test_full_attention_hole_truncates_hit_before_sliding_window(
+    request_runner, async_scheduling: bool
+):
+    """A miss in the middle of a full-attention group cuts the hit at that
+    chunk, and the sliding-window group is then looked up only inside that
+    prefix: its window before the hole is loaded, the blocks after it are not.
+    This is the scheduler invariant the fs tier relies on when it keeps the
+    loaded blocks around a failed one (#3)."""
+    block_size = 4
+    sliding_window = 8  # 2 offloaded chunks
+
+    kv_cache_groups = [
+        KVCacheGroupSpec(
+            ["layer0"],
+            FullAttentionSpec(
+                block_size=block_size,
+                num_kv_heads=1,
+                head_size=1,
+                dtype=torch.float32,
+            ),
+        ),
+        KVCacheGroupSpec(
+            ["layer1"],
+            SlidingWindowSpec(
+                block_size=block_size,
+                num_kv_heads=1,
+                head_size=1,
+                dtype=torch.float32,
+                sliding_window=sliding_window,
+            ),
+        ),
+    ]
+    runner = request_runner(
+        block_size=block_size,
+        num_gpu_blocks=100,
+        async_scheduling=async_scheduling,
+        kv_cache_groups=kv_cache_groups,
+    )
+
+    # Fill seven blocks and store them all.
+    runner.new_request(token_ids=[0] * block_size * 3)
+    runner.manager.prepare_store.side_effect = lambda keys, req_context: (
+        generate_store_output(keys)
+    )
+    runner.run(decoded_tokens=[0])
+    runner.run(
+        decoded_tokens=[0] * (block_size * 3 + 2),
+        expected_stored=(0, 1, 2, 3, 4, 5),
+    )
+    runner.run(decoded_tokens=[EOS_TOKEN_ID], expected_stored=(6,))
+    runner.scheduler.reset_prefix_cache()
+
+    # Everything is offloaded except block 3 of the full-attention group.
+    hole = GPUBlock(group_idx=0, request_block_offset=3)
+
+    def lookup(key, req_context):
+        if runner.offloaded.get((key, 0)) == hole:
+            return LookupResult.MISS
+        return LookupResult.HIT
+
+    runner.manager.lookup.side_effect = lookup
+    runner.new_request(token_ids=[0] * (block_size * 6 + 1))
+    runner.run(
+        decoded_tokens=[EOS_TOKEN_ID],
+        # Group 0: prefix hit stops at the hole -> blocks 0,1,2.
+        # Group 1 (window 2): looked up within those 3 chunks -> blocks 1,2;
+        # blocks 4,5 after the hole are neither loaded nor recomputed early.
+        expected_loaded=((0, 0), (0, 1), (0, 2), (1, 1), (1, 2)),
     )
 
 
