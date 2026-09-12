@@ -1,4 +1,7 @@
 #!/usr/bin/env python3
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+
 """Fire N unique long prompts at once (distinct salts) and report per-request
 TTFT, answer correctness and the prefix-cache / kv_offload counter deltas.
 Used for the concurrent cold-restore test after a server restart.
@@ -14,15 +17,19 @@ import sys
 import time
 from concurrent.futures import ThreadPoolExecutor
 
-from kvoff_probe import metrics, run_prompt
+from kvoff_probe import HeadroomError, metrics, run_prompt
 
 tag, n, nrec = sys.argv[1], int(sys.argv[2]), int(sys.argv[3])
 prefix = sys.argv[4] if len(sys.argv) > 4 else "S"
 salts = prefix.split(",")[:n] if "," in prefix else [f"{prefix}{i}" for i in range(n)]
 m0 = metrics()
 t0 = time.perf_counter()
-with ThreadPoolExecutor(len(salts)) as ex:
-    results = list(ex.map(lambda salt: run_prompt(salt, nrec), salts))
+try:
+    with ThreadPoolExecutor(len(salts)) as ex:
+        results = list(ex.map(lambda salt: run_prompt(salt, nrec), salts))
+except HeadroomError as exc:
+    exc.report(tag)
+    sys.exit(3)
 wall = time.perf_counter() - t0
 time.sleep(2)
 m1 = metrics()
@@ -39,3 +46,4 @@ print(
         ensure_ascii=False,
     )
 )
+sys.exit(3 if any(r.get("aborted") for r in results) else 0)

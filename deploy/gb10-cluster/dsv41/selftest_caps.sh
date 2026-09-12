@@ -18,7 +18,7 @@ printf '%s\n' "${call//$'\n'/ }" >> "$CAP_TEST_CALLS"
 case "$*" in
   *systemd-run*) printf 'started\n';;
   *curl*) printf '200';;
-  *free*) printf 'active used 100 GiB avail 5 GiB ';;
+  *systemctl*meminfo*) printf 'active used 100.00 GiB avail 5.00 GiB ';;
   *) printf '%s\n' "${CAP_TEST_RAW:-active
 Enabled
 1989
@@ -45,7 +45,7 @@ fixture() {
 run_case() {
   local name=$1 expected=$2 command=${3:-caps} rc=0
   : > "$CAP_TEST_CALLS"
-  "$BASH" "$HERE/dsv41_ctl.sh" "$command" > "$TEST_DIR/$name.out" \
+  "$BASH" "$HERE/dsv41_ctl.sh" "$command" "${@:4}" > "$TEST_DIR/$name.out" \
     2> "$TEST_DIR/$name.err" || rc=$?
   if [ "$rc" -ne "$expected" ]; then
     printf 'FAIL %s: expected %s, got %s\n' "$name" "$expected" "$rc" >&2
@@ -116,3 +116,33 @@ export CAP_TEST_RAW=$'active\nEnabled\nN/A\n1989\n1989\n1989\n1989'
 run_case invalid-sample 3
 CAP_TEST_SSH_EXIT=255 run_case ssh-failure 3
 printf 'All caps selftests passed. Artifacts retained: %s\n' "$TEST_DIR"
+
+export DSV41_MEM_FIXTURE="$TEST_DIR/memory-fixture"
+mem_fixture() {
+  printf '%s\n' "gx10-6040 $1" 'gx10-f323 7.00' \
+    'gx10-37cc 7.00' 'gx10-27c4 7.00' > "$DSV41_MEM_FIXTURE"
+}
+mem_fixture 6.95
+run_case memory-normal 0 headroom
+assert_no_ssh
+mem_fixture 4.52
+run_case memory-low 3 headroom
+assert_no_ssh
+grep -q 'gx10-6040.*restart' "$TEST_DIR/memory-low.err"
+MIN_AVAIL_GIB=4.5 run_case memory-override 0 headroom
+MIN_AVAIL_GIB=6 run_case memory-argument 0 headroom 4.5
+mem_fixture 5.2
+run_case memory-boundary 0 headroom
+mem_fixture invalid
+run_case memory-invalid 3 headroom
+printf '%s\n' 'gx10-f323 6.95' > "$DSV41_MEM_FIXTURE"
+run_case memory-missing 3 headroom
+mem_fixture 6.95
+printf '%s\n' 'gx10-6040 6.95' >> "$DSV41_MEM_FIXTURE"
+run_case memory-duplicate 3 headroom
+mem_fixture 6.95
+MIN_AVAIL_GIB=invalid run_case memory-invalid-limit 3 headroom
+assert_no_ssh
+unset DSV41_MEM_FIXTURE
+CAP_TEST_SSH_EXIT=255 run_case memory-ssh-failure 3 headroom
+printf 'All headroom selftests passed. Artifacts retained: %s\n' "$TEST_DIR"

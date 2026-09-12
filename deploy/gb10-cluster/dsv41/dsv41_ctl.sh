@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# dsv41_ctl.sh start|stop|status|caps|frontend|log [host|frontend] [n] -- run from a workstation with SSH to the four nodes.
+# dsv41_ctl.sh start|stop|status|caps|headroom [min_gib]|frontend|log [host|frontend] [n] -- run from a workstation with SSH to the four nodes.
 # Starts DeepSeek-V4.1-Flash TP=4 (workers 3,2,1 first, then head 0) as the user unit
 # `dsv41-serve` on each node, via deploy/gb10-cluster/dsv41/serve-node.sh in ~/vllm-dsv41.
 # With FRONTEND_HOST/FRONTEND_ADDR set (issue #24) the API server runs on FRONTEND_HOST
@@ -74,6 +74,40 @@ check_caps() {
   return 0
 }
 
+mem_probe() { # host
+  local h=$1
+  if [ -n "${DSV41_MEM_FIXTURE:-}" ]; then
+    awk -v host="$h" '
+      $1 == host { count++; if (NF == 2) value = $2 }
+      END { if (count == 1 && value != "") print value; else exit 1 }
+    ' "$DSV41_MEM_FIXTURE"
+  else
+    $SSH "nacyot@$h" "awk '/^MemAvailable:/{printf \"%.6f\\n\", \$2/1048576; found=1} END {exit !found}' /proc/meminfo"
+  fi
+}
+
+check_headroom() {
+  local limit=${1:-${MIN_AVAIL_GIB:-5.2}} h value head_value="" memory_failed=0
+  if [[ ! "$limit" =~ ^[0-9]+([.][0-9]+)?$ ]]; then
+    echo "Invalid MIN_AVAIL_GIB: expected a nonnegative number." >&2
+    return 3
+  fi
+  printf '%-12s %s\n' HOST MEMAVAIL_GIB
+  for h in "${ALL[@]}"; do
+    if ! value=$(mem_probe "$h") || [[ ! "$value" =~ ^[0-9]+([.][0-9]+)?$ ]]; then
+      printf '%-12s %s\n' "$h" unknown
+      if [ "$h" = "$HEAD" ]; then memory_failed=1; fi
+    else
+      awk -v host="$h" -v value="$value" 'BEGIN {printf "%-12s %.2f\n", host, value}'
+      if [ "$h" = "$HEAD" ]; then head_value=$value; fi
+    fi
+  done
+  if [ "$memory_failed" = 1 ] || ! awk -v value="$head_value" -v limit="$limit" 'BEGIN {exit !(value >= limit)}'; then
+    echo "493K cold prefill needs $HEAD head MemAvailable ≥ $limit GiB (available ${head_value:-unknown}; measured floor = start − 2.1 GiB, earlyoom 2.43); restart the adopted configuration first" >&2
+    return 3
+  fi
+}
+
 FE=${FRONTEND_HOST:-}
 start_frontend() {
   $SSH "nacyot@$FE" "$PRE; systemctl --user stop dsv41-frontend.service 2>/dev/null;
@@ -108,10 +142,11 @@ case $CMD in
     sleep 6; for h in "${ALL[@]}"; do $SSH "nacyot@$h" "pkill -KILL -f '[v]llm serve.*DeepSeek-V4.1|[V]LLM::|[E]ngineCore' 2>/dev/null; rm -f /dev/shm/sem.mp-* /dev/shm/psm_* /dev/shm/vllm_offload_*.mmap 2>/dev/null; true"; done
     echo "dsv41 stopped";;
   caps) check_caps;;
+  headroom) check_headroom "${2:-${MIN_AVAIL_GIB:-5.2}}";;
   status)
     for h in "${ALL[@]}"; do
       printf "%s r%s: " "$h" "${RANK[$h]}"
-      $SSH "nacyot@$h" "export XDG_RUNTIME_DIR=/run/user/\$(id -u); systemctl --user is-active dsv41-serve.service 2>/dev/null | tr '\n' ' '; free -g | awk 'NR==2{printf \"used %s GiB avail %s GiB \",\$3,\$7}'"
+      $SSH "nacyot@$h" "export XDG_RUNTIME_DIR=/run/user/\$(id -u); systemctl --user is-active dsv41-serve.service 2>/dev/null | tr '\n' ' '; awk '/^MemTotal:/{total=\$2} /^MemAvailable:/{avail=\$2} END{printf \"used %.2f GiB avail %.2f GiB \",(total-avail)/1048576,avail/1048576}' /proc/meminfo"
       read -r host state persistence mhz <<< "$(cap_probe "$h")"
       printf 'cap %s %sMHz\n' "$state" "$mhz"
     done
@@ -129,5 +164,5 @@ case $CMD in
     else
       $SSH "nacyot@${2:-$HEAD}" "tail -n ${3:-40} ~/dsv41-prep/logs/dsv41-r${RANK[${2:-$HEAD}]}.log"
     fi;;
-  *) echo "usage: dsv41_ctl.sh start|stop|status|caps|frontend|log [host|frontend] [n]"; exit 2;;
+  *) echo "usage: dsv41_ctl.sh start|stop|status|caps|headroom [min_gib]|frontend|log [host|frontend] [n]"; exit 2;;
 esac

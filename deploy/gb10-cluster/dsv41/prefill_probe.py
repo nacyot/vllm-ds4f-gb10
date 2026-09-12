@@ -1,4 +1,7 @@
 #!/usr/bin/env python3
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+
 """Prefill throughput probe: unique long prompts (no prefix-cache hits), one at a
 time, streaming; reports prompt tokens, TTFT and prompt tok/s per run and the
 median. Send one warm-up request after a boot before using this (JIT).
@@ -61,7 +64,15 @@ for i in range(args.runs):
     salt = f"P{i}{int(time.time()) % 100000:05d}"
     nrec = records_for(salt, args.tokens)
     m0 = kvoff_probe.metrics()
-    r = kvoff_probe.run_prompt(salt, nrec, max_tokens=4)
+    try:
+        r = kvoff_probe.run_prompt(salt, nrec, max_tokens=4)
+    except kvoff_probe.HeadroomError as exc:
+        exc.report(args.tag)
+        sys.exit(3)
+    if r.get("aborted"):
+        r["tag"] = args.tag
+        print(json.dumps(r), flush=True)
+        sys.exit(3)
     m1 = kvoff_probe.metrics()
     r["prefix_hits"] = m1.get("prefix_cache_hits", 0) - m0.get("prefix_cache_hits", 0)
     r["tok_s"] = round((r["prompt_tokens"] or 0) / r["ttft_s"], 1)

@@ -182,7 +182,9 @@ with a live server for the torch-process rule. Details:
 - Do not run pytest or processes importing torch (including vLLM probes)
   on a node with a live server. The earlyoom threshold is 2.43 GiB.
 - Transfer node code with `git format-patch | git am`; do not replace files
-  during boot. These workstation script changes require no node deployment.
+  during boot. Run the probe scripts from `~/vllm-dsv41/deploy/gb10-cluster/dsv41/`
+  on the head, using `.venv/bin/python` from that repository; do not use
+  old script copies in `~/dsv41-prep`. Python/Bash changes need no `.so` rebuild.
 - Keep cluster operations in small foreground steps, monitor at 30–60 second
   intervals, and stop on anomalies. Do not chain background jobs. Use
   `mktemp -d` for fresh artifacts; do not use variable or glob paths with
@@ -190,13 +192,61 @@ with a live server for the torch-process rule. Details:
 - After experiments, restore port 8889 to the adopted `dsv41.env` defaults,
   including `ENGRAM_PREFETCH=1`, `EMPTY_CACHE=1`, and
   `EMPTY_CACHE_MIN_TOKENS=65536`. End with health 200, all four cap services
-  active at 1989 MHz, and head `MemAvailable` at least 4.5 GiB. Read
-  `/proc/meminfo` for that threshold; `status` rounds memory to whole GiB.
+  active at 1989 MHz, and head `MemAvailable` at least 4.5 GiB. `status` reports
+  memory from `/proc/meminfo` to two decimal places.
+
+### Long cold prefill headroom
+
+Long cold prefill (operationally, ≥256K tokens) starts only with head
+`MemAvailable` ≥5.2 GiB. Run `dsv41_ctl.sh headroom` first: it prints all four
+nodes and returns exit 3 if the head is below the threshold or its reading
+is missing/invalid. `headroom [min_gib]` overrides `MIN_AVAIL_GIB` (default 5.2).
+This is a prefill check, not a server-start gate. Leave test fixtures unset
+when checking the cluster.
+
+The probes enforce the check in `kvoff_probe.run_prompt`, shared by
+`kvoff_concurrent.py` and `prefill_probe.py`. The exact trigger is ≥18000
+records (roughly 269K tokens with a three-character salt), not a tokenizer
+count. The CLI refuses inference with a `skipped: "headroom"` JSON line and
+exit 3. During streaming, one shared monitor samples every 2 seconds and
+interrupts active long requests below 2.8 GiB. Interrupted results contain
+`aborted: "headroom"`, `ok: false`, and exit 3; they are not successful
+throughput samples. Results include `mem_avail_start_gib` and
+`mem_avail_min_gib` (null when not monitored).
+
+Probe settings are `DSV41_MIN_AVAIL_GIB=5.2`, `DSV41_ABORT_BELOW_GIB=2.8`,
+and `DSV41_LONG_PROMPT_RECORDS=18000`. Zero disables the corresponding
+threshold; zero records disables both guards. Non-Linux/missing meminfo
+or a base URL outside localhost/127.0.0.1 skips the guards with a warning:
+local memory would not measure that server. Model discovery, metrics and
+prefill token calibration can still run before an inference refusal.
+
+Measured head memory drop during 493K prefill is about 2.1–2.2 GiB. The old
+4.5 GiB start rule was insufficient; 4.5 GiB remains the **end-state** rule.
+In practice, restart the adopted configuration after a restore session
+before running another long cold prefill. Keep earlyoom at 2.43 GiB.
+
+| Run | Server state | Start GiB | Floor GiB | Drop GiB | Outcome |
+| --- | --- | ---: | ---: | ---: | --- |
+| #25 S4 | Fresh boot + 82K warm-up | 6.95 | 4.82 | 2.13 | Completed, 392 s |
+| #15 P19 | Warm, after restore | 4.9 | 2.76 | 2.14 | Completed, 387 s |
+| #15 P20 | Warm, restore + 32K | 3.05 | 2.54 at 60 s | ≥0.51 | Client stopped; server survived |
+| #27 | Warm, after concurrent restore | 4.48–4.52 | 2.92 at 30 s, then <2.43 | >2.05 | earlyoom killed EngineCore |
+
+Source: issue #19 manager investigation `icmt-15ef874f`, citing the #25
+1-second memlog and #15/#27 results. For the #27 outstanding ≥3.0 GiB floor
+gate, use a fresh adopted boot, one 82K warm-up (5600 records), then verify
+headroom ≥5.2 GiB before one 493K request (33000 records, **new three-character
+salt**; four characters exceed MAXLEN). Record both a 1-second memlog minimum
+and the probe minimum, answer, elapsed time and earlyoom events. Check the
+EMPTY_CACHE release, then one 8K probe and the normal end state. Never test
+the 2.8 GiB abort deliberately on the cluster; use local tests.
 
 ## Local selftest
 
 ```bash
 /opt/homebrew/bin/bash deploy/gb10-cluster/dsv41/selftest_caps.sh
+.venv/bin/python -m pytest deploy/gb10-cluster/dsv41/test_headroom.py -v
 ```
 
 `DSV41_CAP_FIXTURE=<file>` replaces cap SSH queries with rows of
@@ -206,6 +256,13 @@ caps, invalid inputs, thresholds, start blocking and order, the owner
 bypass, status output, and sampled SSH responses. Its SSH stub records
 commands without executing them. Temporary fixtures and logs are retained
 in the printed directory; no cleanup deletion is performed.
+
+`DSV41_MEM_FIXTURE=<file>` replaces headroom SSH queries with `host gib`
+rows. The same selftest covers memory thresholds, overrides, malformed or
+missing head readings and transport failure. Python tests use fake responses
+and a local HTTP server to check refusal without inference, CLI exit 3,
+remote bypass, and shared cancellation while waiting for the first token.
+Run them only on the workstation, without importing vLLM or torch.
 
 ## Proposals for the owner (not implemented)
 
