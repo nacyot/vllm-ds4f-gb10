@@ -119,6 +119,16 @@ class CPUOffloadingManager(OffloadingManager):
             )
             for c in slot_layout.classes
         ]
+        # Every cached block by key, whichever pool owns it: lookups are the
+        # scheduler's hottest path (all keys of a waiting request, every
+        # step) and must not pay for routing. The pool of a key is found by
+        # the 4-byte group suffix of the key.
+        self._blocks: dict[OffloadKey, BlockStatus] = {}
+        self._suffix_pool: dict[bytes, _SlotPool] = {
+            group_idx.to_bytes(4, "big"): self._pools[cls]
+            for group_idx, cls in enumerate(slot_layout.group_class)
+            if cls >= 0
+        }
         # Track blocks with an in-flight store (ref_cnt -1, not yet completed).
         self._num_write_pending_blocks: int = 0
 
@@ -154,10 +164,15 @@ class CPUOffloadingManager(OffloadingManager):
     def _pool_of(self, key: OffloadKey) -> _SlotPool:
         if len(self._pools) == 1:
             return self._pools[0]
-        return self._pools[self._layout.class_of_group(get_offload_group_idx(key))]
+        try:
+            return self._suffix_pool[key[-4:]]
+        except KeyError:
+            raise AssertionError(
+                f"KV cache group {get_offload_group_idx(key)} is not offloaded"
+            ) from None
 
     def _get_block(self, key: OffloadKey) -> BlockStatus | None:
-        return self._pool_of(key).policy.get(key)
+        return self._blocks.get(key)
 
     def _get_num_free_blocks(self) -> int:
         return sum(pool.num_free_blocks for pool in self._pools)
@@ -329,6 +344,7 @@ class CPUOffloadingManager(OffloadingManager):
 
             for key, block in evicted:
                 pool.free(block)
+                del self._blocks[key]
                 to_evict.append(key)
 
         if to_evict and self.events is not None:
@@ -347,6 +363,7 @@ class CPUOffloadingManager(OffloadingManager):
 
         for key, block in zip(keys_to_store, blocks):
             self._pool_of(key).policy.insert(key, block)
+            self._blocks[key] = block
         self._num_write_pending_blocks += len(keys_to_store)
 
         # build store specs for allocated blocks
@@ -384,6 +401,7 @@ class CPUOffloadingManager(OffloadingManager):
                 if block is not None and not block.is_ready:
                     self._num_write_pending_blocks -= 1
                     pool.policy.remove(key)
+                    del self._blocks[key]
                     pool.free(block)
 
         if stored_keys and self.events is not None:
@@ -404,6 +422,7 @@ class CPUOffloadingManager(OffloadingManager):
         # can begin, preventing a cross-direction data race on reused offload block IDs.
         for pool in self._pools:
             pool.reset()
+        self._blocks.clear()
         self._num_write_pending_blocks = 0
 
     @override
