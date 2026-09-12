@@ -2,7 +2,7 @@
 # clock_ctl.sh — GPU clock helpers for the 4-node DSv41 cluster (issue #14).
 #   show                     cap service state, SM clock, power, temp, throttle bits, MemAvailable per node
 #   cap                      re-apply the owner's cap (systemctl restart gpu-clock-cap.service) on all nodes
-#   lock <mhz>               nvidia-smi -lgc 300,<mhz> on all nodes (temporary; `cap` restores 2000)
+# Clock changes go through the owner's gpu-clock-cap.service only; never call nvidia-smi -pm/-lgc/-rgc here.
 #   sample start <tag> <s>   per-node nvidia-smi CSV sampler (500 ms) that exits after <s> seconds
 #   sample stop              stop any sampler still running
 #   sample fetch <tag> <dir> copy the samplers' CSVs into <dir>
@@ -22,12 +22,6 @@ case $cmd in
     for h in "${ALL[@]}"; do
       printf "%s: " "$h"
       $SSH "$h" 'sudo -n systemctl restart gpu-clock-cap.service && sleep 1 && nvidia-smi --query-gpu=clocks.sm --format=csv,noheader' 2>&1 | grep -v setlocale
-    done;;
-  lock)
-    mhz=${1:?mhz}
-    for h in "${ALL[@]}"; do
-      printf "%s: " "$h"
-      $SSH "$h" "sudo -n nvidia-smi -lgc 300,$mhz | tail -1; nvidia-smi --query-gpu=clocks.sm --format=csv,noheader" 2>&1 | grep -v setlocale | tr "\n" " "; echo
     done;;
   sample)
     sub=${1:?start|stop|fetch}; shift
@@ -50,5 +44,5 @@ case $cmd in
       $SSH "$h" 'nvidia-smi -q -d PERFORMANCE | grep -E "SW Power Capping|SW Thermal Slowdown|HW Thermal Slowdown|HW Power Braking"' 2>&1 | grep -v setlocale > "$dir/counters-$tag-$h.txt"
       printf "%s: " "$h"; tr -s ' ' < "$dir/counters-$tag-$h.txt" | tr '\n' ';'; echo
     done;;
-  *) echo "usage: clock_ctl.sh show|cap|lock <mhz>|sample start <tag> <s>|sample stop|sample fetch <tag> <dir>|counters <tag> <dir>"; exit 2;;
+  *) echo "usage: clock_ctl.sh show|cap|sample start <tag> <s>|sample stop|sample fetch <tag> <dir>|counters <tag> <dir>"; exit 2;;
 esac
