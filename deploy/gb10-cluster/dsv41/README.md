@@ -42,7 +42,8 @@ model names `deepseek-v4.1-flash` and, for the old DS4F clients,
 `dsv41.env`).
 
 Production settings since 2026-09-13: the vision tower is loaded
-(`TEXT_ONLY=0`; image inputs accepted, encoder attention on FLASH_ATTN, boot
+(`TEXT_ONLY=0`; image inputs accepted, up to `MM_IMAGES=512` images per
+prompt and 1,024 tokens per image, encoder attention on FLASH_ATTN, boot
 160 s, head MemAvailable 4.9 GiB after boot) and the filesystem KV tier lives
 on the external 3.6 TB USB SSD at `/mnt/kvdisk/kv/dsv41` (`KVFS_DIR`), the
 disk the DS4F production used, with retention by `systemd/kvfs-gc.timer`

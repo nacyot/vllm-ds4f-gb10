@@ -41,6 +41,7 @@ ARGS=(
   --default-chat-template-kwargs "{\"thinking\":$THINKING}"
 )
 [ "$TEXT_ONLY" = "1" ] && ARGS+=(--language-model-only)
+[ "$TEXT_ONLY" != "1" ] && [ -n "${MM_IMAGES:-}" ] && ARGS+=(--limit-mm-per-prompt "{\"image\":$MM_IMAGES}")
 # The engine's OffloadingConnector reports kv_connector_stats; the frontend's
 # loggers decode them with the connector class and build their Prometheus
 # metric definitions from the same extra config (spec and tiers), so pass the
