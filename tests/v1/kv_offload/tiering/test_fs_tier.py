@@ -308,6 +308,120 @@ def test_checksum_mismatch_is_confirmed_by_reread(tmp_path):
     assert not os.path.exists(path)
 
 
+def _xattr_supported(path: str) -> bool:
+    import vllm.v1.kv_offload.tiering.fs.io as io_mod
+
+    try:
+        os.getxattr(path, io_mod._XATTR_CRC)
+    except OSError:
+        return False
+    return True
+
+
+@pytest.mark.parametrize("use_c_ext", [True, False])
+def test_verify_checksums_reports_only_mismatched_blocks(
+    tmp_path, monkeypatch, use_c_ext
+):
+    """The C verifier and the Python loop agree: a block whose bytes differ
+    from its recorded CRC32 (and stays different on re-read) is reported and
+    removed; a matching block and a block without a recorded checksum are not
+    touched. The C CRC32 must equal zlib's, which the store path records."""
+    import vllm.v1.kv_offload.tiering.fs.io as io_mod
+
+    if use_c_ext and not io_mod._HAS_VERIFY_C:
+        pytest.skip("fs_io_C extension has no batch_verify_crc32")
+    monkeypatch.setattr(io_mod, "_HAS_VERIFY_C", use_c_ext)
+
+    sizes = [mmap.PAGESIZE, 3 * mmap.PAGESIZE, mmap.PAGESIZE, 2 * mmap.PAGESIZE]
+    offsets = [sum(sizes[:i]) for i in range(len(sizes))]
+    tensor = _page_aligned_zero_tensor(sum(sizes), 1, dtype=torch.uint8)
+    tensor[:] = torch.randint(0, 256, (sum(sizes), 1), dtype=torch.uint8)
+    view = memoryview(tensor.numpy())
+    paths = [str(tmp_path / f"blk{i}.bin") for i in range(len(sizes))]
+    io_mod.batch_store_block(
+        paths, view, offsets, sizes, use_o_direct=False, checksums=True
+    )
+    if not _xattr_supported(paths[0]):
+        pytest.skip("filesystem has no xattr support")
+    assert io_mod.verify_checksums(paths, view, offsets, sizes) == []
+
+    with open(paths[1], "r+b") as f:
+        f.write(b"\x05" * sizes[1])  # corrupt on disk: re-read still differs
+    os.removexattr(paths[2], io_mod._XATTR_CRC)
+    tensor[offsets[2]] ^= 0xFF  # differs, but unchecked without a checksum
+    assert io_mod.verify_checksums(paths, view, offsets, sizes, skip={3}) == [1]
+    assert not os.path.exists(paths[1])
+    assert all(os.path.exists(p) for p in (paths[0], paths[2], paths[3]))
+
+
+def test_split_load_job_reports_only_the_failed_chunk_keys(fs_tier, monkeypatch):
+    """A long load runs as several tasks; a failure inside one task fails the
+    job but keeps every other block (including those of other tasks)."""
+    import vllm.v1.kv_offload.tiering.fs.manager as mgr_mod
+
+    monkeypatch.setattr(mgr_mod, "_MIN_BLOCKS_PER_TASK", 1)
+    tier, _ = fs_tier
+    assert tier._n_read_threads == 4
+    keys = [key(i) for i in range(1, 7)]
+    tier.submit_store(make_job(1, keys, list(range(6))))
+    assert all(r.success for r in drain(tier))
+    ctx = ReqContext(req_id="split-load")
+    assert lookup_and_wait(tier, keys, ctx=ctx) == [LookupResult.HIT] * 6
+
+    os.remove(tier.file_mapper.get_file_name(key(2)))
+    os.remove(tier.file_mapper.get_file_name(key(5)))
+    tier.submit_load(make_job(2, keys, list(range(6)), is_promotion=True))
+    results = drain(tier)
+    assert len(results) == 1 and not results[0].success
+    assert tuple(results[0].successful_keys) == (key(1), key(3), key(4), key(6))
+    assert [tier.lookup(k, ctx) for k in keys] == [
+        LookupResult.HIT,
+        LookupResult.MISS,
+        LookupResult.HIT,
+        LookupResult.HIT,
+        LookupResult.MISS,
+        LookupResult.HIT,
+    ]
+    assert not tier._load_failures
+
+
+def test_split_load_job_uses_every_read_thread(fs_tier, monkeypatch):
+    """With enough blocks the job is enqueued as n_read_threads tasks."""
+    import vllm.v1.kv_offload.tiering.fs.manager as mgr_mod
+
+    monkeypatch.setattr(mgr_mod, "_MIN_BLOCKS_PER_TASK", 2)
+    tier, _ = fs_tier
+    seen: list[int] = []
+
+    def fake_enqueue(job_id, n_tasks, tasks):
+        seen.append(n_tasks)
+        assert len(list(tasks)) == n_tasks
+
+    monkeypatch.setattr(tier._pool, "enqueue_load", fake_enqueue)
+    tier.submit_load(make_job(1, [key(i) for i in range(8)], is_promotion=True))
+    tier.submit_load(make_job(2, [key(0), key(1), key(2)], is_promotion=True))
+    tier.submit_load(make_job(3, [key(0)], is_promotion=True))
+    assert seen == [4, 2, 1]
+
+
+def test_job_transfer_time_is_wall_time_across_parallel_tasks():
+    """Two tasks of one job running in parallel on two threads report the
+    job's wall time, not the sum of the task times."""
+    pool = DualQueueThreadPool(n_read_threads=2, n_write_threads=0)
+    try:
+        pool.enqueue_load(
+            job_id=7,
+            n_tasks=2,
+            tasks=[lambda: time.sleep(0.2), lambda: time.sleep(0.2)],
+        )
+        pool.wait_idle()
+        [(job_id, success, transfer_time)] = pool.get_finished()
+    finally:
+        pool.shutdown(wait=True)
+    assert (job_id, success) == (7, True)
+    assert 0.2 <= transfer_time < 0.35
+
+
 def test_invalid_path_raises_at_construction():
     """Construction must fail immediately when the config file cannot be written."""
     tensor = _page_aligned_zero_tensor(32, _BLOCK_ELEMENTS)
