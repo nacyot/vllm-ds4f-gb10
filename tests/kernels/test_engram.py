@@ -970,12 +970,19 @@ def test_mmap_table_background_prefetch_and_release(tmp_path):
 
     table.prefault(step_a)
     assert all(resident(pages_a))
-    # Step b enters the ring; step a's pages leave it through the background.
+    assert table.last_sync_pages == pages_a.size
+    # Step b enters the ring without populating again (its pages were
+    # prefetched); step a's pages leave the ring through the background.
     table.prefault(step_b)
+    assert table.last_sync_pages == 0
     assert table._pending is not None
     table.drain()
     assert not any(resident(pages_a))
     assert all(resident(pages_b))
+    # A prefetch of other rows only spares the pages it covered.
+    table.prefetch(step_a[:32])
+    table.prefault(step_a)
+    assert table.last_sync_pages == pages_a.size - table._pages_of(step_a[:32]).size
     # Without a background worker prefetch is a no-op and prefault is synchronous.
     plain = MmapEngramTable(str(tmp_path), 1, dim, 32, num_threads=2)
     plain.prefetch(step_a)

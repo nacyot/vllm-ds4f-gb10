@@ -744,6 +744,9 @@ class MmapEngramTable:
             else None
         )
         self._pending: Future | None = None
+        # Pages the last prefetch populated: the next prefault skips them.
+        self._prefetched: np.ndarray | None = None
+        self.last_sync_pages = 0
         self.stats_enabled = os.environ.get("VLLM_ENGRAM_MMAP_STATS", "0") == "1"
         self.stats_calls = 0
         self.stats_rows = 0
@@ -826,6 +829,7 @@ class MmapEngramTable:
         if rows.size == 0 or self._background is None:
             return
         pages = self._pages_of(rows)
+        self._prefetched = pages
         if not self.stats_enabled:
             self._submit(self._populate, pages)
             return
@@ -855,14 +859,22 @@ class MmapEngramTable:
         self.drain()
         t_drained = time.perf_counter() if self.stats_enabled else 0.0
         pages = self._pages_of(rows)
-        self._populate(pages)
+        todo = pages
+        if self._prefetched is not None:
+            # Populating a resident page still costs a syscall and a page-table
+            # walk (5-10 us each); the prefetched ones are skipped.
+            todo = np.setdiff1d(pages, self._prefetched, assume_unique=True)
+            self._prefetched = None
+        self._populate(todo)
+        self.last_sync_pages = int(todo.size)
         if self.stats_enabled and rows.size >= 2048:
             logger.info(
-                "engram prefault %s: %d rows, %d pages, drain %.0f ms, "
-                "populate %.0f ms",
+                "engram prefault %s: %d rows, %d pages (%d not prefetched), "
+                "drain %.0f ms, populate %.0f ms",
                 os.path.basename(self.path),
                 rows.size,
                 pages.size,
+                todo.size,
                 1e3 * (t_drained - t0),
                 1e3 * (time.perf_counter() - t_drained),
             )
