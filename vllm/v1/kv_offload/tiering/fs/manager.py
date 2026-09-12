@@ -18,7 +18,7 @@ File naming:  <base_path>_r<rank>/<hhh>/<hh>_g<group_idx>/<hash_hex>.bin
 import functools
 import json
 import os
-import time
+import threading
 from collections.abc import Iterable
 from typing import TYPE_CHECKING, ClassVar
 
@@ -52,6 +52,7 @@ from vllm.v1.kv_offload.tiering.base import (
     SecondaryTierManager,
     TransferJob,
 )
+from vllm.v1.kv_offload.tiering.fs import io as fs_io
 from vllm.v1.kv_offload.tiering.fs.io import (
     batch_load_block,
     batch_store_block,
@@ -67,6 +68,10 @@ logger = init_logger(__name__)
 _O_DIRECT_ALIGN = 4096
 # VLLM_KV_OFFLOAD_TRACE=1 logs every promotion job (blocks, bytes, seconds).
 _TRACE = os.environ.get("VLLM_KV_OFFLOAD_TRACE", "0") == "1"
+# A load job is split into at most n_read_threads tasks of at least this many
+# blocks each, so a long restore reads on every thread while a small job
+# stays a single task.
+_MIN_BLOCKS_PER_TASK = 256
 
 
 class FsAsyncLookupManager(AsyncLookupManager):
@@ -163,13 +168,13 @@ class FileSystemTierManager(SecondaryTierManager):
         # its own cached lookup verdicts False (see get_finished_jobs).
         self._load_job_keys: dict[JobId, list[OffloadKey]] = {}
         # Per load job: indices of the blocks that failed to load (the rest
-        # were loaded). Written by the pool worker inside the load task before
-        # it raises (so before task_done publishes the job); read on the
-        # scheduler thread in get_finished_jobs only for job ids the finished
-        # queue returned. Under the GIL that read cannot observe the finished
-        # job without the prior write, so no extra lock is needed
-        # (get_finished is itself lock-free).
+        # were loaded). Each task of a split job appends its own failures
+        # under the lock before it raises (so before its task_done, and the
+        # last task_done publishes the job); read on the scheduler thread in
+        # get_finished_jobs only for job ids the finished queue returned.
         self._load_failures: dict[JobId, list[int]] = {}
+        self._load_failures_lock = threading.Lock()
+        self._n_read_threads = n_read_threads
 
         # Widest primary row; a group's file is at most this long.
         self._block_size: int = self._primary_row_bytes
@@ -197,6 +202,12 @@ class FileSystemTierManager(SecondaryTierManager):
                     num_bytes <= self._primary_layout.classes[cls].row_bytes
                 )
         self._checksums = checksums
+        if checksums and fs_io._HAS_FSIO_C and not fs_io._HAS_VERIFY_C:
+            logger.warning(
+                "vllm.fs_io_C has no batch_verify_crc32; checksums are verified "
+                "block by block in Python (slow under a busy scheduler). Rebuild "
+                "the extension with csrc/build_fs_io.sh."
+            )
 
         # Opt in; FileMapper enables it only for a parallelism-invariant block.
         self.file_mapper = FileMapper.from_offloading_spec(
@@ -293,42 +304,41 @@ class FileSystemTierManager(SecondaryTierManager):
         paths = [self.file_mapper.get_file_name(key) for key in keys]
         offsets = [self._slot_offset(bid) for bid in job_metadata.block_ids]
         sizes = self._key_sizes(keys)
+        num_blocks = len(paths)
+        n_tasks = max(
+            1, min(self._n_read_threads, -(-num_blocks // _MIN_BLOCKS_PER_TASK))
+        )
 
-        def load_task() -> None:
-            # Runs on the pool worker thread. Every block is loaded except the
-            # ones that failed twice (see batch_load_block); record those so
-            # get_finished_jobs keeps the rest. This write precedes task_done,
-            # so the scheduler reads it safely under the GIL once the finished
-            # queue hands back this job. Raising marks the job as failed.
-            t0 = time.perf_counter()
+        def load_task(start: int, end: int) -> None:
+            # Runs on a pool worker thread with the blocks [start, end) of the
+            # job. Every block is loaded except the ones that failed twice
+            # (see batch_load_block); record those so get_finished_jobs keeps
+            # the rest. Raising marks the job as failed.
             failed = batch_load_block(
-                paths,
+                paths[start:end],
                 self._primary_kv_view,
-                offsets,
-                sizes,
+                offsets[start:end],
+                sizes if isinstance(sizes, int) else sizes[start:end],
                 self._use_o_direct,
                 self._checksums,
             )
-            if _TRACE:
-                num_bytes = (
-                    sum(sizes) if isinstance(sizes, list) else sizes * len(paths)
-                )
-                logger.info(
-                    "fs promotion job %d: %d blocks, %d bytes, %.3f s, %d failed",
-                    job_id,
-                    len(paths),
-                    num_bytes,
-                    time.perf_counter() - t0,
-                    len(failed),
-                )
             if failed:
-                self._load_failures[job_id] = failed
+                with self._load_failures_lock:
+                    self._load_failures.setdefault(job_id, []).extend(
+                        start + i for i in failed
+                    )
                 raise OSError(
-                    f"{len(failed)} of {len(paths)} blocks failed to load "
-                    f"(first: {paths[failed[0]]})"
+                    f"{len(failed)} of {end - start} blocks failed to load "
+                    f"(first: {paths[start + failed[0]]})"
                 )
 
-        self._pool.enqueue_load(job_id, 1, [load_task])
+        tasks = [
+            functools.partial(
+                load_task, num_blocks * t // n_tasks, num_blocks * (t + 1) // n_tasks
+            )
+            for t in range(n_tasks)
+        ]
+        self._pool.enqueue_load(job_id, n_tasks, tasks)
 
     @override
     def get_finished_jobs(self) -> Iterable[JobResult]:
@@ -348,7 +358,20 @@ class FileSystemTierManager(SecondaryTierManager):
                         )
                     )
             load_keys = self._load_job_keys.pop(job_id, None)
-            failed_indices = self._load_failures.pop(job_id, None)
+            with self._load_failures_lock:
+                failed_indices = self._load_failures.pop(job_id, None)
+            if failed_indices is not None:
+                failed_indices.sort()
+            if _TRACE and load_keys is not None:
+                sizes = self._key_sizes(load_keys)
+                logger.info(
+                    "fs promotion job %d: %d blocks, %d bytes, %.3f s, %d failed",
+                    job_id,
+                    len(load_keys),
+                    sum(sizes) if isinstance(sizes, list) else sizes * len(load_keys),
+                    transfer_time,
+                    len(failed_indices or ()),
+                )
             if load_keys is not None and not success:
                 # A batched load skips only the blocks that failed twice. The
                 # loaded blocks are kept in the primary tier (reported via

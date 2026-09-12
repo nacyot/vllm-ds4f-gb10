@@ -23,7 +23,9 @@ class JobState:
     """
     Thread-safe completion tracker for a set of per-block I/O tasks.
 
-    Each task calls task_done(success) when it finishes.
+    Each task calls task_done(success, start_time, end_time) when it
+    finishes; the job's transfer time is the wall time from its first task
+    starting to its last task ending, so parallel tasks are not summed.
     """
 
     __slots__ = (
@@ -31,7 +33,8 @@ class JobState:
         "_n_tasks",
         "_completed",
         "_success",
-        "_transfer_time",
+        "_first_start",
+        "_last_end",
         "_lock",
     )
 
@@ -40,7 +43,8 @@ class JobState:
         self._n_tasks = n_tasks
         self._completed = 0
         self._success = True
-        self._transfer_time = 0.0
+        self._first_start = float("inf")
+        self._last_end = 0.0
         self._lock = threading.Lock()
 
     @property
@@ -48,15 +52,20 @@ class JobState:
         return self._job_id
 
     def task_done(
-        self, success: bool, transfer_time: float
+        self, success: bool, start_time: float, end_time: float
     ) -> tuple[bool, bool, float]:
-        """Returns if job completed and success flag"""
+        """Returns if job completed, success flag, and the job's wall time"""
         with self._lock:
             self._completed += 1
-            self._transfer_time += transfer_time
+            self._first_start = min(self._first_start, start_time)
+            self._last_end = max(self._last_end, end_time)
             if not success:
                 self._success = False
-            return self._completed == self._n_tasks, self._success, self._transfer_time
+            return (
+                self._completed == self._n_tasks,
+                self._success,
+                self._last_end - self._first_start,
+            )
 
 
 class DualQueueThreadPool:
@@ -174,20 +183,20 @@ class DualQueueThreadPool:
                 primary = self._load_q if load_priority else self._store_q
                 secondary = self._store_q if load_priority else self._load_q
                 task, state = primary.popleft() if primary else secondary.popleft()
+            start_time = time.monotonic()
             try:
-                start_time = time.monotonic()
                 task()
-                transfer_time = time.monotonic() - start_time
-                job_finished, success, total_time = state.task_done(True, transfer_time)
+                job_finished, success, total_time = state.task_done(
+                    True, start_time, time.monotonic()
+                )
             except Exception as exc:
-                transfer_time = time.monotonic() - start_time
                 logger.error(
                     "Job %s block I/O failed: %s",
                     state.job_id,
                     exc,
                 )
                 job_finished, success, total_time = state.task_done(
-                    False, transfer_time
+                    False, start_time, time.monotonic()
                 )
 
             if job_finished:
