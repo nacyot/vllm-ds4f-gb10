@@ -18,6 +18,7 @@ File naming:  <base_path>_r<rank>/<hhh>/<hh>_g<group_idx>/<hash_hex>.bin
 import functools
 import json
 import os
+import time
 from collections.abc import Iterable
 from typing import TYPE_CHECKING, ClassVar
 
@@ -64,6 +65,8 @@ if TYPE_CHECKING:
 logger = init_logger(__name__)
 
 _O_DIRECT_ALIGN = 4096
+# VLLM_KV_OFFLOAD_TRACE=1 logs every promotion job (blocks, bytes, seconds).
+_TRACE = os.environ.get("VLLM_KV_OFFLOAD_TRACE", "0") == "1"
 
 
 class FsAsyncLookupManager(AsyncLookupManager):
@@ -297,6 +300,7 @@ class FileSystemTierManager(SecondaryTierManager):
             # get_finished_jobs keeps the rest. This write precedes task_done,
             # so the scheduler reads it safely under the GIL once the finished
             # queue hands back this job. Raising marks the job as failed.
+            t0 = time.perf_counter()
             failed = batch_load_block(
                 paths,
                 self._primary_kv_view,
@@ -305,6 +309,18 @@ class FileSystemTierManager(SecondaryTierManager):
                 self._use_o_direct,
                 self._checksums,
             )
+            if _TRACE:
+                num_bytes = (
+                    sum(sizes) if isinstance(sizes, list) else sizes * len(paths)
+                )
+                logger.info(
+                    "fs promotion job %d: %d blocks, %d bytes, %.3f s, %d failed",
+                    job_id,
+                    len(paths),
+                    num_bytes,
+                    time.perf_counter() - t0,
+                    len(failed),
+                )
             if failed:
                 self._load_failures[job_id] = failed
                 raise OSError(
