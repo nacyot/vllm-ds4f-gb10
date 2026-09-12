@@ -143,7 +143,7 @@ shm_cleanup() { # Runs on the node; mode is list or clean.
       printf 'skip: unsafe path %q\n' "$path"; cleanup_error=1; continue
     fi
     rc=0
-    users=$(fuser -- "$path" 2>&1) || rc=$?
+    users=$(fuser "$path" 2>&1) || rc=$?
     if [ "$rc" -eq 0 ]; then
       printf 'skip: in use %q (%s)\n' "$path" "$users"; continue
     elif [ "$rc" -ne 1 ] || [ -n "$users" ]; then
