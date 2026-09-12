@@ -34,7 +34,11 @@ gx10-f323, gx10-37cc, and gx10-27c4. It requires Bash 4 or newer; on macOS:
 `dsv41_ctl.sh start` checks all four caps before any rank starts. After the
 check passes, it launches workers rank 3 (27c4), 2 (37cc), 1 (f323), waits
 five seconds, then launches head rank 0 (6040). Each rank uses
-`serve-node.sh` and the defaults in `dsv41.env`. The API is on head port 8889.
+`serve-node.sh` and the defaults in `dsv41.env`. The API is on head port 8888,
+the production endpoint since 2026-09-13 (it replaced the DS4F TP=4 service
+that used the same port; bring-up ran on 8889). The server answers to the
+model names `deepseek-v4.1-flash` and, for the old DS4F clients,
+`deepseek-v4-flash-0731` (`SERVED_ALIASES` in `dsv41.env`).
 
 `dsv41_ctl.sh caps` prints `HOST SERVICE PERSISTENCE MAX_SM_MHZ`. Each node
 must have an active `gpu-clock-cap.service`, persistence `Enabled`, and a
@@ -202,7 +206,7 @@ with a live server for the torch-process rule. Details:
   `rm`. The start/stop cleanup function alone may delete validated, explicitly
   listed shared-memory files; workers must not run ad hoc `rm` commands.
   Inspect actual targets before accepting a safety prompt.
-- After experiments, restore port 8889 to the adopted `dsv41.env` defaults,
+- After experiments, restore port 8888 to the adopted `dsv41.env` defaults,
   including `ENGRAM_PREFETCH=1`, `EMPTY_CACHE=1`, and
   `EMPTY_CACHE_MIN_TOKENS=65536`. End with health 200, all four cap services
   active at 1989 MHz, and record head `MemAvailable`. After short probes the

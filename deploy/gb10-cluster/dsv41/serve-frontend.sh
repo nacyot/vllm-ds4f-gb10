@@ -18,9 +18,14 @@ AVAIL_GIB=$(( $(awk '/MemAvailable/ {print $2}' /proc/meminfo) / 1048576 ))
 
 export VLLM_ENGINE_READY_TIMEOUT_S=3600
 
+# The served name plus the aliases of the replaced DS4F production (dsv41.env).
+# shellcheck disable=SC2153 # SERVED_NAME and SERVED_ALIASES come from dsv41.env.
+SERVED_NAMES=("$SERVED_NAME")
+for _alias in ${SERVED_ALIASES:-}; do SERVED_NAMES+=("$_alias"); done
+
 ARGS=(
   "$MODEL"
-  --served-model-name "$SERVED_NAME"
+  --served-model-name "${SERVED_NAMES[@]}"
   --tensor-parallel-size "$FRONTEND_TP"
   --distributed-executor-backend mp
   --data-parallel-size 1

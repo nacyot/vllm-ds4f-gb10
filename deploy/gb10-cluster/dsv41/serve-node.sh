@@ -44,9 +44,14 @@ export MAX_JOBS=${MAX_JOBS:-2}
 [ -n "${FI_WORKSPACE_MIB:-}" ] && export VLLM_FLASHINFER_WORKSPACE_BUFFER_SIZE=$((FI_WORKSPACE_MIB * 1024 * 1024))
 export VLLM_ENGINE_READY_TIMEOUT_S=3600 VLLM_EXECUTE_MODEL_TIMEOUT_SECONDS=1800
 
+# The served name plus the aliases of the replaced DS4F production (dsv41.env).
+# shellcheck disable=SC2153 # SERVED_NAME and SERVED_ALIASES come from dsv41.env.
+SERVED_NAMES=("$SERVED_NAME")
+for _alias in ${SERVED_ALIASES:-}; do SERVED_NAMES+=("$_alias"); done
+
 ARGS=(
   "$MODEL"
-  --served-model-name "$SERVED_NAME"
+  --served-model-name "${SERVED_NAMES[@]}"
   --tensor-parallel-size 4
   --nnodes 4
   --node-rank "$NODE_RANK"

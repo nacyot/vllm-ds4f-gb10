@@ -204,8 +204,8 @@ case $CMD in
       sleep 5; echo "== $FE frontend"; start_frontend
     fi
     sleep 5; echo "== $HEAD rank 0"; start_rank "$HEAD" || exit 1
-    if [ -n "$FE" ]; then echo "dsv41 TP=4 launched (frontend $FE :${PORT:-8889}, head $HEAD headless)"
-    else echo "dsv41 TP=4 launched (head $HEAD :${PORT:-8889})"; fi;;
+    if [ -n "$FE" ]; then echo "dsv41 TP=4 launched (frontend $FE :${PORT:-8888}, head $HEAD headless)"
+    else echo "dsv41 TP=4 launched (head $HEAD :${PORT:-8888})"; fi;;
   frontend)
     [ -n "$FE" ] && [ -n "${FRONTEND_ADDR:-}" ] || { echo "set FRONTEND_HOST and FRONTEND_ADDR" >&2; exit 2; }
     echo "== $FE frontend (restart)"; start_frontend;;
@@ -241,11 +241,11 @@ case $CMD in
     done
     API=$HEAD; LABEL=health
     if [ -n "$FE" ]; then
-      API=$FE; LABEL="health (frontend $FE:${PORT:-8889})"
+      API=$FE; LABEL="health (frontend $FE:${PORT:-8888})"
       printf "%s frontend: " "$FE"
       $SSH "nacyot@$FE" "export XDG_RUNTIME_DIR=/run/user/\$(id -u); systemctl --user is-active dsv41-frontend.service 2>/dev/null" 2>/dev/null
     fi
-    echo "$LABEL: $($SSH "nacyot@$API" "curl -s -m 5 -o /dev/null -w %{http_code} http://127.0.0.1:${PORT:-8889}/health" 2>/dev/null)";;
+    echo "$LABEL: $($SSH "nacyot@$API" "curl -s -m 5 -o /dev/null -w %{http_code} http://127.0.0.1:${PORT:-8888}/health" 2>/dev/null)";;
   log)
     if [ "${2:-}" = frontend ]; then
       [ -n "$FE" ] || { echo "set FRONTEND_HOST" >&2; exit 2; }
