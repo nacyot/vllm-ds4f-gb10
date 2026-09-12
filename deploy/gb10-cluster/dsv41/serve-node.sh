@@ -102,6 +102,7 @@ AC=""
 [ "${MEM_TRACE:-0}" = "1" ] && AC+='"mem_trace":true,'
 [ -n "${ALLOC_CONF:-}" ] && AC+="\"cuda_alloc_conf\":\"$ALLOC_CONF\","
 [ "${EMPTY_CACHE:-0}" = "1" ] && AC+='"empty_cache_after_prefill":true,'
+[ "${EMPTY_CACHE:-0}" = "1" ] && [ "${EMPTY_CACHE_MIN_TOKENS:-0}" != "0" ] && AC+="\"empty_cache_min_prefill_tokens\":${EMPTY_CACHE_MIN_TOKENS},"
 [ "${LOG_PARAM_BYTES:-0}" = "1" ] && AC+='"log_param_bytes":true,'
 [ -n "$AC" ] && ARGS+=(--additional-config "{${AC%,}}")
 # Kernel/parallel levers (issue #12). Dedicated knobs: JSON and flags do not
