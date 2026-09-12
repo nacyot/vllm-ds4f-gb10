@@ -825,7 +825,24 @@ class MmapEngramTable:
         table was created with `background=True`."""
         if rows.size == 0 or self._background is None:
             return
-        self._submit(self._populate, self._pages_of(rows))
+        pages = self._pages_of(rows)
+        if not self.stats_enabled:
+            self._submit(self._populate, pages)
+            return
+        submitted = time.perf_counter()
+
+        def job() -> None:
+            t0 = time.perf_counter()
+            self._populate(pages)
+            logger.info(
+                "engram prefetch %s: %d pages, queued %.0f ms, populate %.0f ms",
+                os.path.basename(self.path),
+                pages.size,
+                1e3 * (t0 - submitted),
+                1e3 * (time.perf_counter() - t0),
+            )
+
+        self._submit(job)
 
     def prefault(self, rows: np.ndarray) -> None:
         """Populate the page-table entries for `rows` (global row ids), so
@@ -836,8 +853,19 @@ class MmapEngramTable:
             return
         t0 = time.perf_counter() if self.stats_enabled else 0.0
         self.drain()
+        t_drained = time.perf_counter() if self.stats_enabled else 0.0
         pages = self._pages_of(rows)
         self._populate(pages)
+        if self.stats_enabled and rows.size >= 2048:
+            logger.info(
+                "engram prefault %s: %d rows, %d pages, drain %.0f ms, "
+                "populate %.0f ms",
+                os.path.basename(self.path),
+                rows.size,
+                pages.size,
+                1e3 * (t_drained - t0),
+                1e3 * (time.perf_counter() - t_drained),
+            )
         num_released = 0
         if self.release_after_steps > 0:
             self._recent_pages.append(pages)
