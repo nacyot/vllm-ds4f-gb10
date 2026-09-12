@@ -847,13 +847,13 @@ class TieringOffloadingManager(OffloadingManager):
                 continue
             self._metrics.on_request_allocated(state.req_context)
 
-    @override
     @property
     @override
     def state_epoch(self) -> int:
         # Secondary-tier changes surface as RETRY, which never shortcuts.
         return self.primary_tier.state_epoch
 
+    @override
     def has_pending_work(self) -> bool:
         # In-flight primary<->secondary transfers (pending promotions are
         # translated to transfer jobs in on_schedule_end), plus any work the
