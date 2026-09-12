@@ -173,19 +173,27 @@ def main():
     print("\n== annotations ==", annc.most_common(12))
 
     if args.steps:
-        fwd = sorted(
-            (e for e in ann if e["name"] == "gpu_model_runner: forward"),
+        steps = sorted(
+            (
+                e
+                for e in ann
+                if e.get("cat") == "user_annotation"
+                and e["name"].startswith("execute_context")
+            ),
             key=lambda e: e["ts"],
         )
-        if not fwd:
-            print("no forward annotations")
+        if not steps:
+            print("no execute_context annotations")
             return
-        bounds = [e["ts"] for e in fwd] + [float("inf")]
-        print(f"\n== per forward step ({len(fwd)} steps, binned by start time) ==")
-        head = " ".join(f"{c[0]:>10s}" for c in CATS[:8])
-        print("  step   busy_ms  span_ms  " + head)
+        bounds = [e["ts"] for e in steps] + [float("inf")]
+        print(
+            f"\n== per step ({len(steps)} steps, GPU kernels binned by start time) =="
+        )
+        head = " ".join(f"{c[0][:9]:>9s}" for c in CATS[:8])
+        print("  step  name                       busy_ms  span_ms  gap_ms " + head)
         i = 0
-        for si in range(len(fwd)):
+        slow = []
+        for si, st in enumerate(steps):
             lo, hi = bounds[si], bounds[si + 1]
             ks = []
             while i < len(kern) and kern[i]["ts"] < hi:
@@ -197,11 +205,18 @@ def main():
             per = collections.defaultdict(float)
             for e in ks:
                 per[cat_of(e["name"])] += e["dur"]
+                if "nccl" in e["name"].lower() and e["dur"] > 50e3:
+                    slow.append((e["dur"], si, e["ts"] - lo, e["name"][:40]))
             sp = max(e["ts"] + e["dur"] for e in ks) - ks[0]["ts"]
+            gap = sp - union_busy(ks)
             print(
-                f"  {si:4d} {union_busy(ks) / 1e3:9.1f} {sp / 1e3:8.1f}  "
-                + " ".join(f"{per[c[0]] / 1e3:10.1f}" for c in CATS[:8])
+                f"  {si:4d}  {st['name'][:26]:26s} {union_busy(ks) / 1e3:8.1f} "
+                f"{sp / 1e3:8.1f} {gap / 1e3:7.1f} "
+                + " ".join(f"{per[c[0]] / 1e3:9.1f}" for c in CATS[:8])
             )
+        print(f"\n== NCCL kernels > 50 ms: n={len(slow)} ==")
+        for dur, si, off, name in sorted(slow, reverse=True)[:20]:
+            print(f"  {dur / 1e3:8.1f} ms  step {si:3d}  +{off / 1e3:8.1f} ms  {name}")
 
 
 if __name__ == "__main__":
