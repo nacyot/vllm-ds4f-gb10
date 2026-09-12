@@ -205,7 +205,10 @@ with a live server for the torch-process rule. Details:
 - After experiments, restore port 8889 to the adopted `dsv41.env` defaults,
   including `ENGRAM_PREFETCH=1`, `EMPTY_CACHE=1`, and
   `EMPTY_CACHE_MIN_TOKENS=65536`. End with health 200, all four cap services
-  active at 1989 MHz, and head `MemAvailable` at least 4.5 GiB. `status` reports
+  active at 1989 MHz, and record head `MemAvailable`. After short probes the
+  head sits at about 3.4–4.0 GiB under `EMPTY_CACHE_MIN_TOKENS=65536`; that is
+  expected. Any long cold prefill must pass `dsv41_ctl.sh headroom` (≥5.2 GiB)
+  first, which in practice means a fresh boot. `status` reports
   memory from `/proc/meminfo` to two decimal places.
 
 ### Long cold prefill headroom
@@ -235,7 +238,8 @@ local memory would not measure that server. Model discovery, metrics and
 prefill token calibration can still run before an inference refusal.
 
 Measured head memory drop during 493K prefill is about 2.1–2.2 GiB. The old
-4.5 GiB start rule was insufficient; 4.5 GiB remains the **end-state** rule.
+4.5 GiB start rule was insufficient. Record end-state memory; short probes can
+leave the head at 3.4–4.0 GiB under the adopted cache-release policy.
 In practice, restart the adopted configuration after a restore session
 before running another long cold prefill. Fresh-boot headroom varies from
 4.6 to 7.1 GiB: a restart does not guarantee sufficient memory. Always run
