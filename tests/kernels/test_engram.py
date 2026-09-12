@@ -964,6 +964,9 @@ def test_mmap_table_background_prefetch_and_release(tmp_path):
     step_c = np.arange(3000, 3064)
     pages_a, pages_b = table._pages_of(step_a), table._pages_of(step_b)
     assert not np.intersect1d(pages_a, pages_b).size
+    # (page 0 is populated by the table's madvise probe, so test the far rows)
+    if any(resident(pages_b)):
+        pytest.skip("the shard's page cache cannot be evicted here (tmpfs?)")
 
     # Production order: prefault this step, prefetch the next, prefault it.
     table.prefault(step_a)
