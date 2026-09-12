@@ -14,6 +14,7 @@ gx10-f323, gx10-37cc, and gx10-27c4. It requires Bash 4 or newer; on macOS:
 | --- | --- |
 | `dsv41_ctl.sh` | Workstation start, stop, status, caps, and log commands. |
 | `serve-node.sh` | Launch one TP rank as the `dsv41-serve` user service. |
+| `serve-frontend.sh`, `kv_transfer_json.sh` | API server without an engine on `FRONTEND_HOST` (issue #24 spike, off by default); the shared `--kv-transfer-config` builder. |
 | `dsv41.env` | Adopted server defaults, overridable through the environment. |
 | `clock_ctl.sh` | Clock observations and sampling; `cap` is owner-only recovery. |
 | `selftest_caps.sh` | Local cap fixtures and simulated SSH tests without node access. |
@@ -110,6 +111,33 @@ cd ~/vllm-dsv41 && PYTHON=~/vllm-dsv41-venv/bin/python csrc/build_fs_io.sh
 
 An extension without `batch_verify_crc32` falls back to the per-block
 Python verifier and logs a warning at boot.
+
+## Remote frontend (issue #24 spike, off by default)
+
+`FRONTEND_HOST=gx10-f323 FRONTEND_ADDR=10.100.0.32 dsv41_ctl.sh start` runs
+the API server on f323 as the unit `dsv41-frontend` (`serve-frontend.sh`:
+`--data-parallel-size-local 0`, no weights, no GPU) and boots rank 0 with
+`--headless`, which dials `tcp://FRONTEND_ADDR:DP_RPC_PORT` (29560) for the
+engine handshake. Order: workers, frontend, head. `status` and `log frontend`
+follow `FRONTEND_HOST`; `stop` always stops the frontend unit too; `frontend`
+restarts only that unit. With the knobs empty every command line is unchanged.
+
+Two things the launcher has to do that the flags alone do not (measured
+2026-09-12): with DP=1 the head takes its master IP from `VLLM_DP_MASTER_IP`,
+not `--data-parallel-address` (`vllm/config/parallel.py`, non-DP branch), and
+the frontend needs the engine's exact `--kv-transfer-config` because its stats
+loggers build their metric definitions from it.
+
+Measured 2026-09-12 (same sequence on a fresh boot each): 8K TTFT 4.55 vs
+4.54 s, 32K 19.46 vs 19.52 s, 8K needle correct. Head memory saving is zero:
+the headless head keeps the `vllm serve --headless` parent process at the same
+PSS as the API server (1,011 vs 1,015 MB); head MemAvailable 5.67 vs 5.70 GiB
+after boot, 3.96 vs 3.95 GiB after the probes. f323 pays 0.83 GiB for the
+frontend. A frontend-only restart never comes back (the new frontend waits for
+an engine HELLO that the running engine never repeats), so a frontend restart
+is an engine restart. While the frontend runs on f323, f323 is also a node
+with a live server for the torch-process rule. Details:
+`.notes/2026-09-12-issue-24-frontend-split/results.md`.
 
 ## Operating rules
 
