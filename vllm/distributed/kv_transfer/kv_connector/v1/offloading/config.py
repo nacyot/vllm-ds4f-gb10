@@ -35,14 +35,19 @@ if TYPE_CHECKING:
 
 
 def _group_bytes_per_block(group: KVCacheGroupSpec) -> int:
-    """Bytes of the group's own pages in one block: one page per layer.
+    """Bytes accounted to the group in one block: one page per layer.
 
-    ``UniformTypeKVCacheSpecs`` carries a spec per layer; any other spec
-    describes every layer of the group.
+    The scheduler's KV cache config collapses a ``UniformTypeKVCacheSpecs``
+    group to its first layer's spec (generate_scheduler_kv_cache_config), so
+    the scheduler sees ``first page x layers``. The workers keep the per-layer
+    specs; they apply the same rule here so that every process derives the
+    same bytes per group (the fs tier's file sizes and the CPU tier's slot
+    layout both depend on them). For a group mixing page sizes this can
+    exceed the group's own bytes; it never exceeds the packed block.
     """
     spec = group.kv_cache_spec
     if isinstance(spec, UniformTypeKVCacheSpecs):
-        return sum(s.page_size_bytes for s in spec.kv_cache_specs.values())
+        spec = spec.first_spec
     return spec.page_size_bytes * len(group.layer_names)
 
 
