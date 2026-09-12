@@ -272,6 +272,31 @@ and a local HTTP server to check refusal without inference, CLI exit 3,
 remote bypass, and shared cancellation while waiting for the first token.
 Run them only on the workstation, without importing vLLM or torch.
 
+### FlashInfer unit tests on a node
+
+Run node unit tests only during a coordinated server downtime window, with
+the servers stopped on all four nodes. These tests import torch.
+`flashinfer-python` and `flashinfer-cubin` must have matching versions in
+`~/vllm-dsv41-venv`; change that venv only inside the same downtime window,
+because running servers can load cubin files lazily.
+
+If matching packages are unavailable, `FLASHINFER_DISABLE_VERSION_CHECK=1`
+is a temporary, per-command bypass for the import-time version check:
+
+```bash
+cd ~/vllm-dsv41
+FLASHINFER_DISABLE_VERSION_CHECK=1 ~/vllm-dsv41-venv/bin/python -m pytest \
+  tests/v1/kv_connector/unit/offloading_connector/test_worker.py \
+  -k 'register_kv_caches and FLASHINFER' -v
+```
+
+The bypass does not align package versions or guarantee kernel compatibility.
+Omit it once the versions match. The server launcher already sets this bypass,
+so a healthy server does not prove that standalone tests can import FlashInfer.
+Issue #26 records the four-node 0.7.0/0.6.18 mismatch and the unavailable
+`flashinfer-cubin==0.7.0` release observed on 2026-09-12 in
+`.notes/2026-09-12-issue-26-flashinfer-cubin/results.md`.
+
 ## Proposals for the owner (not implemented)
 
 The owner could add a `gpu-clock-cap-check.timer` (for example every five
