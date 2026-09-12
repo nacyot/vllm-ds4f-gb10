@@ -141,7 +141,10 @@ fi
 
 if [ "$NODE_RANK" = "0" ] && [ -n "${FRONTEND_ADDR:-}" ]; then
   # Issue #24: the API server runs on FRONTEND_HOST (serve-frontend.sh); rank 0
-  # boots the engine only and dials the frontend for the ZMQ handshake.
+  # boots the engine only and dials the frontend for the ZMQ handshake. With
+  # DP=1 ParallelConfig takes the master IP from the env, not the flag
+  # (vllm/config/parallel.py, the non-DP branch), so export it as well.
+  export VLLM_DP_MASTER_IP="$FRONTEND_ADDR"
   exec vllm serve "${ARGS[@]}" --headless --data-parallel-address "$FRONTEND_ADDR" --data-parallel-rpc-port "$DP_RPC_PORT"
 elif [ "$NODE_RANK" = "0" ]; then
   exec vllm serve "${ARGS[@]}" --host 0.0.0.0 --port "$PORT"
