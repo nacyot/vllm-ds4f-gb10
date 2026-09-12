@@ -24,7 +24,7 @@ gx10-f323, gx10-37cc, and gx10-27c4. It requires Bash 4 or newer; on macOS:
 | `divergence.py` | Record and compare greedy completions and log probabilities. |
 | `smoke.py` | Basic API and deterministic-output smoke checks. |
 | `kvoff_probe.py`, `kvoff_concurrent.py` | Cold and concurrent KV offload restore probes. |
-| `kvfs_gc.sh` | KV filesystem retention and size management. |
+| `kvfs_gc.sh`, `systemd/kvfs-gc.{service,timer}` | KV filesystem retention and size management; the head user timer that runs it. |
 | `memlog.py`, `memtrace_summary.py` | Memory sampling (meminfo, worker/EngineCore/API anon and swap, reclaim and compaction counters, free order≥9 blocks; no torch) and allocator-log summaries. |
 | `clock_summary.py` | Summarize sampled clock CSVs. |
 | `prof_summary.py` | Summarize GPU profiler traces. |
@@ -38,7 +38,18 @@ five seconds, then launches head rank 0 (6040). Each rank uses
 the production endpoint since 2026-09-13 (it replaced the DS4F TP=4 service
 that used the same port; bring-up ran on 8889). The server answers to the
 model names `deepseek-v4.1-flash` and, for the old DS4F clients,
-`deepseek-v4-flash-0731` (`SERVED_ALIASES` in `dsv41.env`).
+`deepseek-v4-flash-0731` and `deepseek-v4-flash-vision` (`SERVED_ALIASES` in
+`dsv41.env`).
+
+Production settings since 2026-09-13: the vision tower is loaded
+(`TEXT_ONLY=0`; image inputs accepted, encoder attention on FLASH_ATTN, boot
+160 s, head MemAvailable 4.9 GiB after boot) and the filesystem KV tier lives
+on the external 3.6 TB USB SSD at `/mnt/kvdisk/kv/dsv41` (`KVFS_DIR`), the
+disk the DS4F production used, with retention by `systemd/kvfs-gc.timer`
+(every 30 minutes: files older than 7 days, then oldest-first above 3000 GiB).
+The bring-up store `~/dsv41-prep/kvfs` on the root NVMe was copied there with
+`rsync -aX` (xattr checksums preserved); a store moved to a new root keeps its
+identity because the base path is `<root>/<model>_<hash of the run config>`.
 
 `dsv41_ctl.sh caps` prints `HOST SERVICE PERSISTENCE MAX_SM_MHZ`. Each node
 must have an active `gpu-clock-cap.service`, persistence `Enabled`, and a

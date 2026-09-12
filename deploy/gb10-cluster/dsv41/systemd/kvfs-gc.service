@@ -1,0 +1,11 @@
+# Retention for the KV offload filesystem tier on the head node (issue #32, 2026-09-13).
+# Install on the head: cp systemd/kvfs-gc.* ~/.config/systemd/user/ && systemctl --user daemon-reload
+#   && systemctl --user enable --now kvfs-gc.timer
+[Unit]
+Description=KV offload fs tier GC (TTL 7 days, cap 3000 GiB on /mnt/kvdisk)
+
+[Service]
+Type=oneshot
+ExecStart=/bin/bash /home/nacyot/vllm-dsv41/deploy/gb10-cluster/dsv41/kvfs_gc.sh /mnt/kvdisk/kv/dsv41 7 3000
+StandardOutput=append:/home/nacyot/dsv41-prep/logs/kvfs-gc.log
+StandardError=append:/home/nacyot/dsv41-prep/logs/kvfs-gc.log
