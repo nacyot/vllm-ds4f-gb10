@@ -139,7 +139,11 @@ fi
 # shellcheck disable=SC2206
 [ -n "$EXTRA_ARGS" ] && ARGS+=($EXTRA_ARGS)
 
-if [ "$NODE_RANK" = "0" ]; then
+if [ "$NODE_RANK" = "0" ] && [ -n "${FRONTEND_ADDR:-}" ]; then
+  # Issue #24: the API server runs on FRONTEND_HOST (serve-frontend.sh); rank 0
+  # boots the engine only and dials the frontend for the ZMQ handshake.
+  exec vllm serve "${ARGS[@]}" --headless --data-parallel-address "$FRONTEND_ADDR" --data-parallel-rpc-port "$DP_RPC_PORT"
+elif [ "$NODE_RANK" = "0" ]; then
   exec vllm serve "${ARGS[@]}" --host 0.0.0.0 --port "$PORT"
 else
   exec vllm serve "${ARGS[@]}" --headless

@@ -1,7 +1,9 @@
 #!/usr/bin/env bash
-# dsv41_ctl.sh start|stop|status|caps|log [n] -- run from a workstation with SSH to the four nodes.
+# dsv41_ctl.sh start|stop|status|caps|frontend|log [host|frontend] [n] -- run from a workstation with SSH to the four nodes.
 # Starts DeepSeek-V4.1-Flash TP=4 (workers 3,2,1 first, then head 0) as the user unit
 # `dsv41-serve` on each node, via deploy/gb10-cluster/dsv41/serve-node.sh in ~/vllm-dsv41.
+# With FRONTEND_HOST/FRONTEND_ADDR set (issue #24) the API server runs on FRONTEND_HOST
+# as the unit `dsv41-frontend` (serve-frontend.sh) and rank 0 boots headless.
 # Needs bash >= 4 (associative arrays); on macOS use /opt/homebrew/bin/bash.
 set -u
 CMD=${1:-status}
@@ -10,7 +12,7 @@ HEAD=gx10-6040; WORKERS=(gx10-27c4 gx10-37cc gx10-f323); ALL=(gx10-6040 gx10-f32
 SSH="ssh -n -o BatchMode=yes -o ConnectTimeout=10"
 # shellcheck disable=SC2016 # Expand id on the remote node.
 PRE='export XDG_RUNTIME_DIR=/run/user/$(id -u); mkdir -p ~/dsv41-prep/logs'
-KNOBS=""; for k in MEM_TRACE ALLOC_CONF EMPTY_CACHE EMPTY_CACHE_MIN_TOKENS LOG_PARAM_BYTES GMU KVMEM MAXLEN SEQS MNBT EAGER CAPTURE_SIZES CAPTURE_SIZES_EXPLICIT CUDAGRAPH_MODE SPEC SPEC_K SPEC_DRAFT SPEC_REJECT SPEC_EXTRA KVOFF_GIB KVOFF_SLABS KVOFF_SLAB_SHARES KVFS_DIR KV_RETENTION KV_RELAY KV_RELAY_WINDOW_MIB FI_WORKSPACE_MIB NCCL_LEAN NCCL_MAX_NCHANNELS NCCL_BUFFSIZE NCCL_LL128_BUFFSIZE NCCL_PROTO KV_TRACE TEXT_ONLY THINKING ENGRAM_MMAP ENGRAM_THREADS ENGRAM_RELEASE ENGRAM_PREFETCH ENGRAM_STATS LOAD_FORMAT INSTANTTENSOR_DRAFT_LOADER DSPARK_DRAFT_PRUNE DSPARK_STATE_DIGEST VLLM_INSTANTTENSOR_MEMAVAIL_MIN_GIB MOE_BACKEND LINEAR_BACKEND EP PROFILER_DIR EXTRA_ARGS PORT; do
+KNOBS=""; for k in FRONTEND_HOST FRONTEND_ADDR DP_RPC_PORT FRONTEND_TP FRONTEND_EXTRA_ARGS MEM_TRACE ALLOC_CONF EMPTY_CACHE EMPTY_CACHE_MIN_TOKENS LOG_PARAM_BYTES GMU KVMEM MAXLEN SEQS MNBT EAGER CAPTURE_SIZES CAPTURE_SIZES_EXPLICIT CUDAGRAPH_MODE SPEC SPEC_K SPEC_DRAFT SPEC_REJECT SPEC_EXTRA KVOFF_GIB KVOFF_SLABS KVOFF_SLAB_SHARES KVFS_DIR KV_RETENTION KV_RELAY KV_RELAY_WINDOW_MIB FI_WORKSPACE_MIB NCCL_LEAN NCCL_MAX_NCHANNELS NCCL_BUFFSIZE NCCL_LL128_BUFFSIZE NCCL_PROTO KV_TRACE TEXT_ONLY THINKING ENGRAM_MMAP ENGRAM_THREADS ENGRAM_RELEASE ENGRAM_PREFETCH ENGRAM_STATS LOAD_FORMAT INSTANTTENSOR_DRAFT_LOADER DSPARK_DRAFT_PRUNE DSPARK_STATE_DIGEST VLLM_INSTANTTENSOR_MEMAVAIL_MIN_GIB MOE_BACKEND LINEAR_BACKEND EP PROFILER_DIR EXTRA_ARGS PORT; do
   v="${!k:-}"; [ -n "$v" ] && KNOBS="$KNOBS --setenv=$k=$v"; done
 
 cap_probe() { # host
@@ -72,6 +74,13 @@ check_caps() {
   return 0
 }
 
+FE=${FRONTEND_HOST:-}
+start_frontend() {
+  $SSH "nacyot@$FE" "$PRE; systemctl --user stop dsv41-frontend.service 2>/dev/null;
+    systemd-run --user --collect --unit=dsv41-frontend -p LimitNOFILE=65536 $KNOBS \
+      -p StandardOutput=append:/home/nacyot/dsv41-prep/logs/dsv41-frontend.log -p StandardError=append:/home/nacyot/dsv41-prep/logs/dsv41-frontend.log \
+      /home/nacyot/vllm-dsv41/deploy/gb10-cluster/dsv41/serve-frontend.sh 2>&1 | tail -1"
+}
 start_rank() { # host
   local h=$1 r=${RANK[$1]}
   $SSH "nacyot@$h" "$PRE; systemctl --user stop dsv41-serve.service 2>/dev/null; rm -f /dev/shm/sem.mp-* /dev/shm/psm_* 2>/dev/null;
@@ -84,10 +93,18 @@ case $CMD in
   start)
     [ "${SKIP_CAP_CHECK:-0}" = "1" ] || check_caps || exit 3
     for w in "${WORKERS[@]}"; do echo "== $w rank ${RANK[$w]}"; start_rank "$w"; done
+    if [ -n "$FE" ]; then
+      [ -n "${FRONTEND_ADDR:-}" ] || { echo "FRONTEND_HOST is set but FRONTEND_ADDR is empty" >&2; exit 2; }
+      sleep 5; echo "== $FE frontend"; start_frontend
+    fi
     sleep 5; echo "== $HEAD rank 0"; start_rank "$HEAD"
-    echo "dsv41 TP=4 launched (head $HEAD :${PORT:-8889})";;
+    if [ -n "$FE" ]; then echo "dsv41 TP=4 launched (frontend $FE :${PORT:-8889}, head $HEAD headless)"
+    else echo "dsv41 TP=4 launched (head $HEAD :${PORT:-8889})"; fi;;
+  frontend)
+    [ -n "$FE" ] && [ -n "${FRONTEND_ADDR:-}" ] || { echo "set FRONTEND_HOST and FRONTEND_ADDR" >&2; exit 2; }
+    echo "== $FE frontend (restart)"; start_frontend;;
   stop)
-    for h in "${ALL[@]}"; do $SSH "nacyot@$h" "$PRE; systemctl --user stop dsv41-serve.service 2>/dev/null; pkill -TERM -f 'serve-node.sh|[v]llm serve.*DeepSeek-V4.1' 2>/dev/null; true"; done
+    for h in "${ALL[@]}"; do $SSH "nacyot@$h" "$PRE; systemctl --user stop dsv41-serve.service dsv41-frontend.service 2>/dev/null; pkill -TERM -f 'serve-node.sh|[v]llm serve.*DeepSeek-V4.1' 2>/dev/null; true"; done
     sleep 6; for h in "${ALL[@]}"; do $SSH "nacyot@$h" "pkill -KILL -f '[v]llm serve.*DeepSeek-V4.1|[V]LLM::|[E]ngineCore' 2>/dev/null; rm -f /dev/shm/sem.mp-* /dev/shm/psm_* /dev/shm/vllm_offload_*.mmap 2>/dev/null; true"; done
     echo "dsv41 stopped";;
   caps) check_caps;;
@@ -98,7 +115,19 @@ case $CMD in
       read -r host state persistence mhz <<< "$(cap_probe "$h")"
       printf 'cap %s %sMHz\n' "$state" "$mhz"
     done
-    echo "health: $($SSH "nacyot@$HEAD" "curl -s -m 5 -o /dev/null -w %{http_code} http://127.0.0.1:${PORT:-8889}/health" 2>/dev/null)";;
-  log) $SSH "nacyot@${2:-$HEAD}" "tail -n ${3:-40} ~/dsv41-prep/logs/dsv41-r${RANK[${2:-$HEAD}]}.log";;
-  *) echo "usage: dsv41_ctl.sh start|stop|status|caps|log [host] [n]"; exit 2;;
+    API=$HEAD; LABEL=health
+    if [ -n "$FE" ]; then
+      API=$FE; LABEL="health (frontend $FE:${PORT:-8889})"
+      printf "%s frontend: " "$FE"
+      $SSH "nacyot@$FE" "export XDG_RUNTIME_DIR=/run/user/\$(id -u); systemctl --user is-active dsv41-frontend.service 2>/dev/null" 2>/dev/null
+    fi
+    echo "$LABEL: $($SSH "nacyot@$API" "curl -s -m 5 -o /dev/null -w %{http_code} http://127.0.0.1:${PORT:-8889}/health" 2>/dev/null)";;
+  log)
+    if [ "${2:-}" = frontend ]; then
+      [ -n "$FE" ] || { echo "set FRONTEND_HOST" >&2; exit 2; }
+      $SSH "nacyot@$FE" "tail -n ${3:-40} ~/dsv41-prep/logs/dsv41-frontend.log"
+    else
+      $SSH "nacyot@${2:-$HEAD}" "tail -n ${3:-40} ~/dsv41-prep/logs/dsv41-r${RANK[${2:-$HEAD}]}.log"
+    fi;;
+  *) echo "usage: dsv41_ctl.sh start|stop|status|caps|frontend|log [host|frontend] [n]"; exit 2;;
 esac
