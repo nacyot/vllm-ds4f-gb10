@@ -1,0 +1,113 @@
+# DeepSeek-V4.1-Flash on four GB10 nodes
+
+Run `dsv41_ctl.sh` from a workstation with SSH access to gx10-6040,
+gx10-f323, gx10-37cc, and gx10-27c4. It requires Bash 4 or newer; on macOS:
+
+```bash
+/opt/homebrew/bin/bash deploy/gb10-cluster/dsv41/dsv41_ctl.sh caps
+/opt/homebrew/bin/bash deploy/gb10-cluster/dsv41/dsv41_ctl.sh status
+```
+
+## Files
+
+| File | Role |
+| --- | --- |
+| `dsv41_ctl.sh` | Workstation start, stop, status, caps, and log commands. |
+| `serve-node.sh` | Launch one TP rank as the `dsv41-serve` user service. |
+| `dsv41.env` | Adopted server defaults, overridable through the environment. |
+| `clock_ctl.sh` | Clock observations and sampling; `cap` is owner-only recovery. |
+| `selftest_caps.sh` | Local cap fixtures and simulated SSH tests without node access. |
+| `bench.py` | Before/after latency, throughput, and greedy-output checks. |
+| `bench2.py`, `bench_prompts_v1.json` | Category and concurrency benchmarks and prompts. |
+| `prefill_probe.py` | Prefill throughput measurements with unique prompts. |
+| `divergence.py` | Record and compare greedy completions and log probabilities. |
+| `smoke.py` | Basic API and deterministic-output smoke checks. |
+| `kvoff_probe.py`, `kvoff_concurrent.py` | Cold and concurrent KV offload restore probes. |
+| `kvfs_gc.sh` | KV filesystem retention and size management. |
+| `memlog.py`, `memtrace_summary.py` | Memory sampling and allocator-log summaries. |
+| `clock_summary.py` | Summarize sampled clock CSVs. |
+| `prof_summary.py` | Summarize GPU profiler traces. |
+
+## Startup and cap checks
+
+`dsv41_ctl.sh start` checks all four caps before any rank starts. After the
+check passes, it launches workers rank 3 (27c4), 2 (37cc), 1 (f323), waits
+five seconds, then launches head rank 0 (6040). Each rank uses
+`serve-node.sh` and the defaults in `dsv41.env`. The API is on head port 8889.
+
+`dsv41_ctl.sh caps` prints `HOST SERVICE PERSISTENCE MAX_SM_MHZ`. Each node
+must have an active `gpu-clock-cap.service`, persistence `Enabled`, and a
+maximum SM clock of at most 2000 MHz across five samples, 200 ms apart.
+Normal idle readings are 1989 MHz. This is an observation-based guard for
+these nodes, not a direct query of the driver's clock-lock setting.
+`RemainAfterExit=yes` can leave the cap service active after the lock is
+lost, so service status alone is insufficient (issue #14).
+
+Any failed or incomplete check returns exit code 3 and lists the affected
+hosts with owner recovery instructions. `start` stops before launching a
+rank; it never restores clocks automatically. `status` appends
+`cap <service-state> <max-sm>MHz` to each existing node row and still prints
+API health. Use `caps` for the pass/fail exit status.
+
+`CAP_MHZ` overrides the local threshold (default 2000). The owner's
+`SKIP_CAP_CHECK=1` bypasses only the automatic start gate, not `caps`.
+Neither variable is forwarded to node services. Automation workers must
+not use the override to bypass an observed failure.
+
+Existing `start`/`stop` shared-memory cleanup uses glob deletion; issue #20
+tracks bringing that cleanup into compliance with the worker safety rules.
+Workers must not execute those paths while that conflict remains.
+
+## Operating rules
+
+- Clocks and persistence mode belong to the owner. Automation workers must
+  not execute `nvidia-smi -pm`, `-lgc`, `-rgc`, or
+  `systemctl stop|restart gpu-clock-cap.service`. Issue #14 traced lost
+  locks on two nodes to a persistence-mode toggle; the owner's decision
+  is to keep all four nodes capped. The service's `ExecStop` releases the
+  lock, so stopping it is also prohibited.
+- If recovery is needed, report the failing hosts. The owner can use
+  `clock_ctl.sh cap` to reapply the service and record the action in the
+  issue. That helper restarts the service and is not a worker workaround
+  for the prohibition. Workers must not deliberately release caps to test
+  the guard; use fixtures instead.
+- Do not run pytest or processes importing torch (including vLLM probes)
+  on a node with a live server. The earlyoom threshold is 2.43 GiB.
+- Transfer node code with `git format-patch | git am`; do not replace files
+  during boot. These workstation script changes require no node deployment.
+- Keep cluster operations in small foreground steps, monitor at 30–60 second
+  intervals, and stop on anomalies. Do not chain background jobs. Use
+  `mktemp -d` for fresh artifacts; do not use variable or glob paths with
+  `rm`. Inspect actual targets before accepting a safety prompt.
+- After experiments, restore port 8889 to the adopted `dsv41.env` defaults,
+  including `ENGRAM_PREFETCH=1`, `EMPTY_CACHE=1`, and
+  `EMPTY_CACHE_MIN_TOKENS=65536`. End with health 200, all four cap services
+  active at 1989 MHz, and head `MemAvailable` at least 4.5 GiB. Read
+  `/proc/meminfo` for that threshold; `status` rounds memory to whole GiB.
+
+## Local selftest
+
+```bash
+/opt/homebrew/bin/bash deploy/gb10-cluster/dsv41/selftest_caps.sh
+```
+
+`DSV41_CAP_FIXTURE=<file>` replaces cap SSH queries with rows of
+`host service-state persistence max-sm`. This is only for local tests;
+leave it unset for real checks. The selftest checks healthy and failed
+caps, invalid inputs, thresholds, start blocking and order, the owner
+bypass, status output, and sampled SSH responses. Its SSH stub records
+commands without executing them. Temporary fixtures and logs are retained
+in the printed directory; no cleanup deletion is performed.
+
+## Proposals for the owner (not implemented)
+
+The owner could add a `gpu-clock-cap-check.timer` (for example every five
+minutes) that samples clocks and restarts the cap service if the maximum
+exceeds 2000 MHz. This would require an explicit owner decision about
+unattended recovery and the same observation-based detection limitations.
+
+Alternatively, the owner could add
+`ExecStartPre=/usr/bin/nvidia-smi -pm 1` to the cap unit and make cap
+reapplication mandatory after any persistence-mode toggle. The pre-start
+command alone cannot detect a later lost lock. Only the owner changes
+these unit files; neither proposal is implemented here.
