@@ -37,8 +37,14 @@ ARGS=(
 )
 [ "$TEXT_ONLY" = "1" ] && ARGS+=(--language-model-only)
 # The engine's OffloadingConnector reports kv_connector_stats; the frontend's
-# KVConnectorLogging needs the connector class to decode them (no size, no tiers).
-[ "${KVOFF_GIB:-0}" != "0" ] && ARGS+=(--kv-transfer-config '{"kv_connector":"OffloadingConnector","kv_role":"kv_both"}')
+# loggers decode them with the connector class and build their Prometheus
+# metric definitions from the same extra config (spec and tiers), so pass the
+# engine's --kv-transfer-config verbatim (no --kv-offloading-size: no store here).
+if [ "${KVOFF_GIB:-0}" != "0" ]; then
+  source "$HERE/kv_transfer_json.sh"
+  [ -n "$KV_TRANSFER_JSON" ] || KV_TRANSFER_JSON='{"kv_connector":"OffloadingConnector","kv_role":"kv_both"}'
+  ARGS+=(--kv-transfer-config "$KV_TRANSFER_JSON")
+fi
 # shellcheck disable=SC2206
 [ -n "$FRONTEND_EXTRA_ARGS" ] && ARGS+=($FRONTEND_EXTRA_ARGS)
 
