@@ -224,7 +224,10 @@ prefill token calibration can still run before an inference refusal.
 Measured head memory drop during 493K prefill is about 2.1–2.2 GiB. The old
 4.5 GiB start rule was insufficient; 4.5 GiB remains the **end-state** rule.
 In practice, restart the adopted configuration after a restore session
-before running another long cold prefill. Keep earlyoom at 2.43 GiB.
+before running another long cold prefill. Fresh-boot headroom varies from
+4.6 to 7.1 GiB: a restart does not guarantee sufficient memory. Always run
+`headroom` before 493K cold prefill and do not start below 5.2 GiB.
+Keep earlyoom at 2.43 GiB.
 
 | Run | Server state | Start GiB | Floor GiB | Drop GiB | Outcome |
 | --- | --- | ---: | ---: | ---: | --- |
@@ -232,9 +235,14 @@ before running another long cold prefill. Keep earlyoom at 2.43 GiB.
 | #15 P19 | Warm, after restore | 4.9 | 2.76 | 2.14 | Completed, 387 s |
 | #15 P20 | Warm, restore + 32K | 3.05 | 2.54 at 60 s | ≥0.51 | Client stopped; server survived |
 | #27 | Warm, after concurrent restore | 4.48–4.52 | 2.92 at 30 s, then <2.43 | >2.05 | earlyoom killed EngineCore |
+| #19, 2026-09-12 23:01 KST | Fresh adopted boot + 82K warm-up | 4.61 | Not run | Not measured | Guard exit 3; 493K not started. Idle headroom −2.5 GiB vs #25 S4 7.11 GiB; swap usage difference 1.5 GiB, AnonPages +1.7 GiB |
 
 Source: issue #19 manager investigation `icmt-15ef874f`, citing the #25
-1-second memlog and #15/#27 results. For the #27 outstanding ≥3.0 GiB floor
+1-second memlog and #15/#27 results. The #19 row and memory comparison
+follow the manager decision responding to `icmt-929be183`; 7.11 GiB is the
+S4 idle observation from issue #25, distinct from its 6.95 GiB prefill start above.
+The #27 ≥3.0 GiB floor gate remains incomplete in this work; the manager
+will track it in a follow-up issue. For that outstanding floor
 gate, use a fresh adopted boot, one 82K warm-up (5600 records), then verify
 headroom ≥5.2 GiB before one 493K request (33000 records, **new three-character
 salt**; four characters exceed MAXLEN). Record both a 1-second memlog minimum
