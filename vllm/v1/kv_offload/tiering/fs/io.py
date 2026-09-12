@@ -23,6 +23,16 @@ try:
 except ImportError:
     _HAS_FSIO_C = False
 
+try:
+    from vllm.fs_io_C import (  # pyright: ignore[reportMissingImports]
+        batch_verify_crc32 as batch_verify_crc32_C,
+    )
+
+    _HAS_VERIFY_C = True
+except ImportError:
+    # An fs_io_C built before batch_verify_crc32 (e.g. the wheel's copy).
+    _HAS_VERIFY_C = False
+
 logger = logging.getLogger(__name__)
 
 # O_DIRECT is Linux-specific and not available on macOS
@@ -117,6 +127,38 @@ def write_checksums(
             return
 
 
+def _crc_mismatches(
+    paths: list[str],
+    view: memoryview,
+    offsets: list[int],
+    sizes: list[int],
+    indices: list[int],
+) -> list[int]:
+    """Return the members of ``indices`` whose recorded CRC32 differs from
+    the bytes in ``view``. A file without a recorded checksum is not checked.
+
+    With the C extension the whole batch runs under a single GIL release
+    (one getxattr and one CRC32 per block); the Python fallback reacquires
+    the GIL twice per block, which starves the reader when the engine's
+    scheduler thread is busy."""
+    if _HAS_VERIFY_C:
+        view_B = view.cast("B")
+        mismatched = batch_verify_crc32_C(
+            [paths[i] for i in indices],
+            [view_B[offsets[i] : offsets[i] + sizes[i]] for i in indices],
+        )
+        return [indices[j] for j in mismatched]
+    mismatched = []
+    for i in indices:
+        try:
+            recorded = os.getxattr(paths[i], _XATTR_CRC)
+        except OSError:
+            continue
+        if int.from_bytes(recorded, "big") != _crc_of(view, offsets[i], sizes[i]):
+            mismatched.append(i)
+    return mismatched
+
+
 def verify_checksums(
     paths: list[str],
     view: memoryview,
@@ -134,16 +176,10 @@ def verify_checksums(
     bytes with the new checksum. A mismatch is therefore confirmed by reading
     the file again before it is declared corrupt; the re-read bytes replace the
     stale ones."""
+    indices = [i for i in range(len(paths)) if i not in skip]
     failed: list[int] = []
-    for i, (path, offset, size) in enumerate(zip(paths, offsets, sizes)):
-        if i in skip:
-            continue
-        try:
-            recorded = os.getxattr(path, _XATTR_CRC)
-        except OSError:
-            continue
-        if int.from_bytes(recorded, "big") == _crc_of(view, offset, size):
-            continue
+    for i in _crc_mismatches(paths, view, offsets, sizes, indices):
+        path, offset, size = paths[i], offsets[i], sizes[i]
         try:
             _load_block(path, view, offset, size, use_o_direct=False)
             recorded = os.getxattr(path, _XATTR_CRC)
