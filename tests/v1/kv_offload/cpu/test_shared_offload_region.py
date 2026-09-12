@@ -43,6 +43,7 @@ def _make_region(
     num_workers: int = 1,
     rank: int = 0,
     barrier=None,
+    layout=None,
 ) -> SharedOffloadRegion:
     assert cpu_page_size % PAGE_SIZE == 0
     return SharedOffloadRegion(
@@ -52,6 +53,7 @@ def _make_region(
         kv_bytes_per_block=num_workers * cpu_page_size,
         cpu_page_size=cpu_page_size,
         barrier=barrier,
+        layout=layout,
     )
 
 
