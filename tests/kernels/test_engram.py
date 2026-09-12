@@ -961,16 +961,17 @@ def test_mmap_table_background_prefetch_and_release(tmp_path):
 
     step_a = np.arange(0, 64)
     step_b = np.arange(2048, 2112)
+    step_c = np.arange(3000, 3064)
     pages_a, pages_b = table._pages_of(step_a), table._pages_of(step_b)
     assert not np.intersect1d(pages_a, pages_b).size
 
-    table.prefetch(step_b)
-    table.drain()
-    assert all(resident(pages_b))
-
+    # Production order: prefault this step, prefetch the next, prefault it.
     table.prefault(step_a)
     assert all(resident(pages_a))
     assert table.last_sync_pages == pages_a.size
+    table.prefetch(step_b)
+    table.drain()
+    assert all(resident(pages_b))
     # Step b enters the ring without populating again (its pages were
     # prefetched); step a's pages leave the ring through the background.
     table.prefault(step_b)
@@ -979,10 +980,14 @@ def test_mmap_table_background_prefetch_and_release(tmp_path):
     table.drain()
     assert not any(resident(pages_a))
     assert all(resident(pages_b))
-    # A prefetch of other rows only spares the pages it covered.
-    table.prefetch(step_a[:32])
-    table.prefault(step_a)
-    assert table.last_sync_pages == pages_a.size - table._pages_of(step_a[:32]).size
+    # A prefetch that covered only part of the step spares just those pages.
+    table.prefetch(step_c[:32])
+    table.prefault(step_c)
+    assert (
+        table.last_sync_pages
+        == table._pages_of(step_c).size - table._pages_of(step_c[:32]).size
+    )
+    table.drain()
     # Without a background worker prefetch is a no-op and prefault is synchronous.
     plain = MmapEngramTable(str(tmp_path), 1, dim, 32, num_threads=2)
     plain.prefetch(step_a)
