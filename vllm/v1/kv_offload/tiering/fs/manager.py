@@ -187,11 +187,12 @@ class FileSystemTierManager(SecondaryTierManager):
         ]
         self._compact = any(n != self._block_size for n in self._group_bytes)
         # A slab row must hold the whole file of its group.
-        for group_idx, cls in enumerate(self._primary_layout.group_class):
-            assert cls < 0 or (
-                self._group_bytes[group_idx]
-                <= self._primary_layout.classes[cls].row_bytes
-            )
+        if not self._primary_layout.is_uniform:
+            for group_idx, num_bytes in enumerate(self._group_bytes):
+                cls = self._primary_layout.group_class[group_idx]
+                assert cls < 0 or (
+                    num_bytes <= self._primary_layout.classes[cls].row_bytes
+                )
         self._checksums = checksums
 
         # Opt in; FileMapper enables it only for a parallelism-invariant block.

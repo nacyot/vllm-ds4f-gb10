@@ -143,6 +143,14 @@ class CPUOffloadingManager(OffloadingManager):
     def _num_evictable_cache_blocks(self) -> int:
         return sum(pool.num_evictable_cache_blocks for pool in self._pools)
 
+    @property
+    def _num_allocated_blocks(self) -> int:
+        return sum(pool.num_allocated_blocks for pool in self._pools)
+
+    @property
+    def _free_list(self) -> list[int]:
+        return [block_id for pool in self._pools for block_id in pool.free_list]
+
     def _pool_of(self, key: OffloadKey) -> _SlotPool:
         if len(self._pools) == 1:
             return self._pools[0]
