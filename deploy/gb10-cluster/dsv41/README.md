@@ -58,6 +58,26 @@ Existing `start`/`stop` shared-memory cleanup uses glob deletion; issue #20
 tracks bringing that cleanup into compliance with the worker safety rules.
 Workers must not execute those paths while that conflict remains.
 
+## KV offload host tier (issue #2)
+
+With `KVOFF_GIB` set, the head keeps a `/dev/shm` region in front of the
+filesystem tier. Its rows are sized per KV cache group (slabs): a block of
+the ratio-2 MLA group (g15) takes a 139,264 B row, an SWA block 114,688 B,
+and a block of g13, g14 or g17 77,824 B. At 3 GiB the boot log reports
+`KV offload CPU tier slabs: 139264 B x 8657 slots ..., 114688 B x 5275
+slots ..., 77824 B x 18125 slots ...` (32,057 slots; the previous uniform
+layout held 23,130). The split follows the bytes one 512K session leaves in
+each slab, so every slab holds about 2.1 such sessions.
+
+- `KVOFF_SLABS=0` restores the uniform layout without a code change.
+- `KVOFF_SLAB_SHARES=139264:0.4,77824:0.4,114688:0.2` overrides the split;
+  read `vllm:kv_offload_cpu_slab_usage_perc{slab_bytes=...}` on `/metrics`
+  after a long session to see how full each slab is before changing it.
+- A slab evicts only its own rows; a store batch is refused only when one of
+  its slabs has nothing evictable. The filesystem tier and its `config.json`
+  are unchanged by the slab layout; a new namespace directory under
+  `KVFS_DIR` after a boot means the store identity changed and is a bug.
+
 ## Operating rules
 
 - Clocks and persistence mode belong to the owner. Automation workers must
