@@ -168,16 +168,21 @@ class ObjectStoreSecondaryTierManager(SecondaryTierManager):
 
         self._probe_connectivity()
 
-        base_addr = ctypes.addressof(ctypes.c_char.from_buffer(primary_kv_view))
-        assert primary_kv_view.strides is not None
-        stride = primary_kv_view.strides[0]
+        if not self._primary_layout.is_uniform:
+            raise NotImplementedError(
+                "The obj tier addresses primary blocks by one fixed row size; "
+                "disable CPU slabs (cpu_slabs: false) to use it."
+            )
+        view = self._primary_kv_view
+        base_addr = ctypes.addressof(ctypes.c_char.from_buffer(view))
+        stride = self._primary_row_bytes
         self._primary_reg = self._agent.register_memory(
-            [(base_addr, primary_kv_view.nbytes, NIXL_DEV_ID, "")], "DRAM"
+            [(base_addr, view.nbytes, NIXL_DEV_ID, "")], "DRAM"
         )
         self._block_size_bytes = stride
         all_blocks = [
             (base_addr + i * stride, stride, NIXL_DEV_ID)
-            for i in range(len(primary_kv_view))
+            for i in range(self._primary_layout.num_blocks)
         ]
         # NIXL_INIT_AGENT marks this as the local side; make_prepped_xfer requires
         # local_xfer_side tagged with NIXL_INIT_AGENT and remote_xfer_side tagged

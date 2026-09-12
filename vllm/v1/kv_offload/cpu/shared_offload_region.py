@@ -14,6 +14,7 @@ from vllm.distributed.device_communicators.shm_broadcast import (
 )
 from vllm.logger import init_logger
 from vllm.platforms import current_platform
+from vllm.v1.kv_offload.cpu.slot_layout import SlotLayout
 
 logger = init_logger(__name__)
 
@@ -75,6 +76,11 @@ class SharedOffloadRegion:
     given, the path is unlinked once every worker has mapped the file, so
     the kernel reclaims the memory when the last worker exits, no matter
     how it exits; mappings taken before the unlink stay valid.
+
+    Rows are ``kv_bytes_per_block`` apart unless ``layout`` has more than
+    one row-size class: then the region is that layout's slabs back to back,
+    ``slot_offsets[b]`` addresses block ``b`` and the strided per-tensor
+    views are unavailable (the worker addresses blocks through the table).
     """
 
     BLOCK_SIZE_ALIGNMENT: int = mmap.PAGESIZE
@@ -87,13 +93,30 @@ class SharedOffloadRegion:
         kv_bytes_per_block: int,
         cpu_page_size: int,
         barrier: Callable[[], None] | None = None,
+        layout: SlotLayout | None = None,
     ) -> None:
         self.page_size = mmap.PAGESIZE
         assert kv_bytes_per_block % self.page_size == 0
 
+        if layout is None:
+            layout = SlotLayout.uniform(num_blocks, kv_bytes_per_block)
+        assert layout.num_blocks == num_blocks
+        assert layout.max_row_bytes <= kv_bytes_per_block
+        assert all(c.row_bytes % self.page_size == 0 for c in layout.classes)
+        self.layout = layout
         self.num_blocks = num_blocks
         self._row_stride = kv_bytes_per_block
-        self.total_size_bytes = self.num_blocks * self._row_stride
+        self.total_size_bytes = (
+            self.num_blocks * self._row_stride
+            if layout.is_uniform
+            else layout.total_bytes
+        )
+        # Byte offset of every block; the strided views cover the uniform case.
+        self.slot_offsets: np.ndarray = (
+            np.arange(num_blocks, dtype=np.int64) * self._row_stride
+            if layout.is_uniform
+            else layout.offset_table()
+        )
 
         self.mmap_path = f"/dev/shm/vllm_offload_{engine_id}.mmap"
         self._creator = False  # set True only if this worker creates the file
@@ -181,7 +204,19 @@ class SharedOffloadRegion:
 
         populate_write_fn = _get_populate_write_fn(self.mmap_obj)
 
-        if rank is not None:
+        if rank is not None and not layout.is_uniform:
+            # Slabs hold a single worker copy per row: populate each slab whole.
+            _t0 = time.perf_counter()
+            for c in layout.classes:
+                populate_write_fn(
+                    self.mmap_obj, c.base_offset, c.num_blocks * c.row_bytes
+                )
+            logger.debug(
+                "MADV_POPULATE_WRITE slabs: %d slabs in %.3f s",
+                len(layout.classes),
+                time.perf_counter() - _t0,
+            )
+        elif rank is not None:
             # Populate only this worker's pages (one slot per block row).
             worker_offset = rank * cpu_page_size
             _t0 = time.perf_counter()
@@ -233,6 +268,7 @@ class SharedOffloadRegion:
             tensor_page_size: Bytes per block for this  tensor.
         """
         assert self.rank is not None
+        assert self.layout.is_uniform, "slab layouts have no strided views"
         new_offset = self._worker_offset + tensor_page_size
         assert new_offset <= self._worker_area_end, (
             f"Worker offset {new_offset} exceeds worker area end "
@@ -281,6 +317,7 @@ class SharedOffloadRegion:
         Args:
             tensor_page_size: Canonical bytes per block for this tensor.
         """
+        assert self.layout.is_uniform, "slab layouts have no strided views"
         new_offset = self._canonical_offset + tensor_page_size
         assert new_offset <= self._row_stride
         view = torch.as_strided(
@@ -293,19 +330,28 @@ class SharedOffloadRegion:
         self._views.append(view)
         return view
 
-    def create_kv_memoryview(self) -> memoryview:
-        """Return a zero-copy memoryview over the entire KV buffer.
+    @property
+    def base_ptr(self) -> int:
+        return self._base.data_ptr()
 
-        Shape: (num_blocks, row_stride_bytes). Secondary tiers address
-        block *b* as ``view[b]``.
+    @property
+    def base_tensor(self) -> torch.Tensor:
+        """The whole region as a flat int8 tensor."""
+        return self._base
+
+    def create_kv_memoryview(self) -> memoryview:
+        """Return a zero-copy, flat byte memoryview over the entire KV buffer.
+
+        Secondary tiers address block *b* at ``slot_offsets[b]`` (see
+        ``SecondaryTierManager``), which is ``b * row_stride`` for a uniform
+        layout.
         """
-        kv_tensor = self._base.view(self.num_blocks, self._row_stride)
-        np_arr = kv_tensor.numpy()
+        np_arr = self._base.numpy()
         assert np_arr.ctypes.data == self._base.data_ptr(), (
-            "view()/numpy() created a copy instead of sharing the mmap buffer; "
+            "numpy() created a copy instead of sharing the mmap buffer; "
             "secondary tiers require zero-copy access to primary KV data"
         )
-        return memoryview(np_arr)
+        return memoryview(np_arr).cast("B")
 
     def cleanup(self) -> None:
         if self.is_pinned and self._base is not None:

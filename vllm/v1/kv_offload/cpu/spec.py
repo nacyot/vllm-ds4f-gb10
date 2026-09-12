@@ -5,6 +5,8 @@ from typing import Any
 import torch
 from typing_extensions import override
 
+import vllm.envs as envs
+from vllm.logger import init_logger
 from vllm.platforms import current_platform
 from vllm.utils.math_utils import round_up
 from vllm.v1.kv_offload.base import (
@@ -22,6 +24,13 @@ from vllm.v1.kv_offload.cpu.common import CPUOffloadingMetrics
 from vllm.v1.kv_offload.cpu.gpu_worker import CPUOffloadingWorker
 from vllm.v1.kv_offload.cpu.manager import CPUOffloadingManager
 from vllm.v1.kv_offload.cpu.shared_offload_region import SharedOffloadRegion
+from vllm.v1.kv_offload.cpu.slot_layout import (
+    SlotLayout,
+    plan_slot_layout,
+    slabs_enabled,
+)
+
+logger = init_logger(__name__)
 
 
 def _all_workers_barrier() -> None:
@@ -78,6 +87,13 @@ class CPUOffloadingSpec(OffloadingSpec):
                 ),
                 buckets=(1, 4, 16, 64, 256, 1024, 4096, 16384, 65536, 262144),
             ),
+            CPUOffloadingMetrics.CPU_SLAB_USAGE_PERC: OffloadingGaugeMetadata(
+                documentation=(
+                    "Fraction of the CPU KV-cache slots of one row-size class "
+                    "(slab) currently holding a block, by row bytes."
+                ),
+                labelnames=("slab_bytes",),
+            ),
         }
         store_threshold = int(extra_config.get("store_threshold", 0))
         if store_threshold >= 2:
@@ -104,6 +120,9 @@ class CPUOffloadingSpec(OffloadingSpec):
         self.num_blocks = 0
         self.kv_bytes_per_chunk = 0
         self.cpu_page_size_per_worker = 0
+        # Row-size classes of the host region; None until the block size is
+        # known (see create_worker's tensor fallback).
+        self.slot_layout: SlotLayout | None = None
         self.replicated_layout = config.replicated_layout and self._uses_shared_region()
         # Multi-node TP: only rank 0's CPU tier is visible to the scheduler-side
         # tiers, so loads are broadcast from rank 0's GPU to the other ranks.
@@ -131,7 +150,6 @@ class CPUOffloadingSpec(OffloadingSpec):
             aligned_kv_bytes_per_chunk = round_up(
                 kv_bytes_per_chunk, self.BLOCK_SIZE_ALIGNMENT
             )
-            self.num_blocks = int(cpu_bytes_to_use) // aligned_kv_bytes_per_chunk
 
             # Expose aligned_kv_bytes_per_chunk as
             # kv_bytes_per_chunk. Note that this might contain
@@ -139,6 +157,31 @@ class CPUOffloadingSpec(OffloadingSpec):
             # |--- W0-B0---|---- W1-B0---| ... |---- Wn-B0---| *** maybe-pad *** |
             # or |--- B0 (single copy) ---| *** maybe-pad *** |
             self.kv_bytes_per_chunk = aligned_kv_bytes_per_chunk
+
+            # With a packed block and a single host copy a group's bytes are
+            # the prefix of its row, so rows can be sized per group (slabs).
+            if self._uses_shared_region() and slabs_enabled(
+                self.extra_config,
+                packed_layout=config.packed_layout,
+                single_copy=self.single_copy,
+                blocks_per_chunk=self.blocks_per_chunk,
+            ):
+                self.slot_layout = plan_slot_layout(
+                    int(cpu_bytes_to_use),
+                    config.groups,
+                    blocks_per_chunk=self.blocks_per_chunk,
+                    max_model_len=config.cache.max_model_len,
+                    retention_interval=envs.VLLM_PREFIX_CACHE_RETENTION_INTERVAL,
+                    row_cap=aligned_kv_bytes_per_chunk,
+                    shares=self.extra_config.get("cpu_slab_shares"),
+                )
+            else:
+                self.slot_layout = SlotLayout.uniform(
+                    int(cpu_bytes_to_use) // aligned_kv_bytes_per_chunk,
+                    aligned_kv_bytes_per_chunk,
+                    len(config.groups),
+                )
+            self.num_blocks = self.slot_layout.num_blocks
 
         # scheduler-side
         self._manager: OffloadingManager | None = None
@@ -163,6 +206,7 @@ class CPUOffloadingSpec(OffloadingSpec):
             # Maximum entries in the internal tracker's LRU table.
             max_tracker_size = int(self.extra_config.get("max_tracker_size", 64_000))
 
+            self.log_slot_layout()
             self._manager = CPUOffloadingManager(
                 num_blocks=self.num_blocks,
                 cache_policy=self.eviction_policy,
@@ -170,8 +214,19 @@ class CPUOffloadingSpec(OffloadingSpec):
                 enable_events=self.kv_events_config.enable_kv_cache_events,
                 store_threshold=store_threshold,
                 max_tracker_size=max_tracker_size,
+                slot_layout=self.slot_layout,
             )
         return self._manager
+
+    def log_slot_layout(self) -> None:
+        if self.slot_layout is None or self.slot_layout.is_uniform:
+            return
+        logger.info(
+            "KV offload CPU tier slabs: %s (%d slots, %.2f GB)",
+            self.slot_layout.describe(),
+            self.slot_layout.num_blocks,
+            self.slot_layout.total_bytes / 1e9,
+        )
 
     def _uses_shared_region(self) -> bool:
         """Whether the worker CPU buffer is the shared mmap region (vs a private
@@ -198,6 +253,7 @@ class CPUOffloadingSpec(OffloadingSpec):
                 kv_bytes_per_block=self.kv_bytes_per_chunk,
                 cpu_page_size=self.cpu_page_size_per_worker,
                 barrier=_all_workers_barrier,
+                layout=self.slot_layout,
             )
         try:
             return CPUOffloadingWorker(

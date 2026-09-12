@@ -22,6 +22,7 @@ from vllm.v1.kv_offload.base import (
     RequestOffloadingContext,
     ScheduleEndContext,
 )
+from vllm.v1.kv_offload.cpu.slot_layout import SlotLayout
 
 if TYPE_CHECKING:
     from vllm.distributed.kv_transfer.kv_connector.v1.offloading.metrics import (
@@ -143,14 +144,34 @@ class SecondaryTierManager(ABC):
         """
         Args:
             offloading_spec: Offloading configuration.
-            primary_kv_view: Memoryview of the primary tier's CPU KV cache.
+            primary_kv_view: Memoryview of the primary tier's CPU KV cache:
+                flat bytes addressed through the spec's slot layout, or a
+                (num_blocks, row_bytes) view whose rows are the blocks.
             tier_type: Tier type identifier, set by SecondaryTierFactory
                 from the registered tier type.
         """
         self._offloading_spec = offloading_spec
-        self._primary_kv_view: memoryview = primary_kv_view
+        layout = getattr(offloading_spec, "slot_layout", None)
+        if not isinstance(layout, SlotLayout):
+            assert primary_kv_view.ndim == 2 and primary_kv_view.strides is not None
+            layout = SlotLayout.uniform(
+                primary_kv_view.shape[0], primary_kv_view.strides[0]
+            )
+        # Primary tier addressing: block b is the ``_slot_row_bytes[b]`` bytes
+        # at ``_slot_offsets[b]`` of the flat view.
+        self._primary_layout: SlotLayout = layout
+        self._slot_offsets: np.ndarray = layout.offset_table()
+        self._slot_row_bytes: np.ndarray = layout.row_bytes_table()
+        self._primary_row_bytes: int = layout.max_row_bytes
+        self._primary_kv_view: memoryview = primary_kv_view.cast("B")
         self.tier_type = tier_type
         self.locality: Locality | None = None
+
+    def _slot_offset(self, block_id: int) -> int:
+        return int(self._slot_offsets[block_id])
+
+    def _slot_bytes(self, block_id: int) -> int:
+        return int(self._slot_row_bytes[block_id])
 
     @abstractmethod
     def lookup(self, key: OffloadKey, req_context: ReqContext) -> LookupResult:

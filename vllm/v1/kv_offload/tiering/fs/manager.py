@@ -168,11 +168,8 @@ class FileSystemTierManager(SecondaryTierManager):
         # (get_finished is itself lock-free).
         self._load_failures: dict[JobId, list[int]] = {}
 
-        # Extract block size from primary view
-        assert primary_kv_view.strides is not None, (
-            "primary_kv_view.strides cannot be None"
-        )
-        self._block_size: int = primary_kv_view.strides[0]
+        # Widest primary row; a group's file is at most this long.
+        self._block_size: int = self._primary_row_bytes
         # Bytes persisted per key, by KV cache group. With a packed block
         # layout and a single valid worker slot (replicated layout or rank-0
         # relay) a group's KV is the prefix of slot 0, so only that prefix is
@@ -189,6 +186,12 @@ class FileSystemTierManager(SecondaryTierManager):
             for group in config.groups
         ]
         self._compact = any(n != self._block_size for n in self._group_bytes)
+        # A slab row must hold the whole file of its group.
+        for group_idx, cls in enumerate(self._primary_layout.group_class):
+            assert cls < 0 or (
+                self._group_bytes[group_idx]
+                <= self._primary_layout.classes[cls].row_bytes
+            )
         self._checksums = checksums
 
         # Opt in; FileMapper enables it only for a parallelism-invariant block.
@@ -268,7 +271,7 @@ class FileSystemTierManager(SecondaryTierManager):
             batch_store_block,
             [self.file_mapper.get_file_name(key) for key in keys],
             self._primary_kv_view,
-            [int(bid) * self._block_size for bid in job_metadata.block_ids],
+            [self._slot_offset(bid) for bid in job_metadata.block_ids],
             self._key_sizes(keys),
             self._use_o_direct,
             self._checksums,
@@ -284,7 +287,7 @@ class FileSystemTierManager(SecondaryTierManager):
         keys = list(job_metadata.keys)
         self._load_job_keys[job_id] = keys
         paths = [self.file_mapper.get_file_name(key) for key in keys]
-        offsets = [int(bid) * self._block_size for bid in job_metadata.block_ids]
+        offsets = [self._slot_offset(bid) for bid in job_metadata.block_ids]
         sizes = self._key_sizes(keys)
 
         def load_task() -> None:

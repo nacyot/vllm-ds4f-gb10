@@ -122,7 +122,8 @@ class OffloadingConnectorWorker:
 
         # Packed layouts (e.g. DSv4) interleave all layers within each manager
         # block: a layer view's block stride exceeds its page size. Offload the
-        # whole packed block as a single transfer region.
+        # packed block as a single transfer region, copying for each group only
+        # its own bytes (the prefix of the block, see OffloadingGroupConfig).
         packed_layer_name = next(
             (
                 layer_name
@@ -139,13 +140,16 @@ class OffloadingConnectorWorker:
                 (block_stride, 1),
                 storage_offset=0,
             )
+            group_bytes = [
+                group.bytes_per_block or block_stride
+                for group in self.spec.config.groups
+            ]
+            assert len(group_bytes) == len(kv_cache_config.kv_cache_groups)
+            assert all(0 < n <= block_stride for n in group_bytes)
             self._init_worker(
                 CanonicalKVCaches(
                     [CanonicalKVCacheTensor(packed_tensor, block_stride)],
-                    [
-                        [CanonicalKVCacheRef(0, block_stride)]
-                        for _ in kv_cache_config.kv_cache_groups
-                    ],
+                    [[CanonicalKVCacheRef(0, n)] for n in group_bytes],
                 )
             )
             return

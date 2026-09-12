@@ -47,6 +47,7 @@ from vllm.v1.kv_offload.base import (
 from vllm.v1.kv_offload.cpu.common import CPULoadStoreSpec
 from vllm.v1.kv_offload.cpu.manager import CPUOffloadingManager
 from vllm.v1.kv_offload.cpu.shared_offload_region import SharedOffloadRegion
+from vllm.v1.kv_offload.cpu.slot_layout import SlotLayout
 from vllm.v1.kv_offload.tiering.base import (
     JobId,
     JobResult,
@@ -99,12 +100,23 @@ class CPUPrimaryTierOffloadingManager(CPUOffloadingManager):
         cache_policy: str = "lru",
         cache_policy_module_path: str | None = None,
         enable_events: bool = False,
+        slot_layout: SlotLayout | None = None,
     ):
+        kv_memoryview = mmap_region.create_kv_memoryview()
+        if slot_layout is None:
+            # Take the region's layout, else read the rows off a 2-D view.
+            slot_layout = getattr(mmap_region, "layout", None)
+            if not isinstance(slot_layout, SlotLayout):
+                assert kv_memoryview.ndim == 2 and kv_memoryview.strides is not None
+                slot_layout = SlotLayout.uniform(
+                    kv_memoryview.shape[0], kv_memoryview.strides[0]
+                )
         super().__init__(
             num_blocks=num_blocks,
             cache_policy=cache_policy,
             cache_policy_module_path=cache_policy_module_path,
             enable_events=enable_events,
+            slot_layout=slot_layout,
         )
         self._mmap_region = mmap_region
         # read/write is for CPU<->secondary transfers,
@@ -115,16 +127,18 @@ class CPUPrimaryTierOffloadingManager(CPUOffloadingManager):
         self.prepare_write = self.prepare_store
         self.complete_write = self.complete_store
 
-        self._kv_memoryview = mmap_region.create_kv_memoryview()
+        self._kv_memoryview = kv_memoryview
 
     def get_kv_memoryview(self) -> memoryview:
         """Return the memoryview over the primary tier's KV cache buffer.
 
-        The view has shape (num_blocks, row_stride_bytes) and is backed by the
-        SharedOffloadRegion mmap.  Secondary tiers address block *b* as
-        ``view[b]``.
+        Flat bytes backed by the SharedOffloadRegion mmap; secondary tiers
+        address block *b* at ``get_slot_layout().offset_table()[b]``.
         """
         return self._kv_memoryview
+
+    def get_slot_layout(self) -> SlotLayout:
+        return self._layout
 
     @override
     def shutdown(self) -> None:
@@ -202,12 +216,10 @@ class TieringOffloadingManager(OffloadingManager):
         #   True:  secondary → primary (promotion)
         #   False: primary → secondary (cascade)
         self._jobs: dict[JobId, JobMetadata] = {}
-        primary_view = self.primary_tier.get_kv_memoryview()
-        assert primary_view.strides is not None
         self._metrics = TieringMetricsTracker(
             tier_types=[tier.tier_type for tier in self.secondary_tiers],
             num_primary_blocks=self.primary_tier._num_blocks,
-            primary_block_size=primary_view.strides[0],
+            primary_block_size=self.primary_tier.get_slot_layout().max_row_bytes,
         )
 
         # Pending promotion requests accumulated during lookup() calls; flushed

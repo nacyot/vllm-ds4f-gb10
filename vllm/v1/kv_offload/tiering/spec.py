@@ -301,12 +301,14 @@ class TieringOffloadingSpec(CPUOffloadingSpec):
             try:
                 # Create scheduler-side SharedOffloadRegion (rank=None) so the
                 # primary tier can eagerly create a memoryview over _base.
+                self.log_slot_layout()
                 scheduler_mmap = SharedOffloadRegion(
                     engine_id=self._engine_id,
                     num_blocks=self.num_blocks,
                     rank=None,
                     kv_bytes_per_block=self.kv_bytes_per_chunk,
                     cpu_page_size=self.cpu_page_size_per_worker,
+                    layout=self.slot_layout,
                 )
                 self._scheduler_mmap = scheduler_mmap
 
@@ -317,6 +319,7 @@ class TieringOffloadingSpec(CPUOffloadingSpec):
                     cache_policy_module_path=self.cache_policy_module_path,
                     enable_events=self.kv_events_config.enable_kv_cache_events,
                     mmap_region=scheduler_mmap,
+                    slot_layout=self.slot_layout,
                 )
 
                 # Create secondary tiers
@@ -409,6 +412,7 @@ class TieringOffloadingSpec(CPUOffloadingSpec):
                 rank=rank,
                 kv_bytes_per_block=self.kv_bytes_per_chunk,
                 cpu_page_size=self.cpu_page_size_per_worker,
+                layout=self.slot_layout,
             )
         try:
             if self.config.canonical_layout:

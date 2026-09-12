@@ -80,6 +80,16 @@ class Transfer:
     relay_buffers: tuple[torch.Tensor, torch.Tensor] | None = None
 
 
+class CPUSlotTable(NamedTuple):
+    """Host addresses of a slab layout: block ``b`` starts at
+    ``base_ptr + offsets[b]`` and holds ``row_bytes_per_group[g]`` bytes for
+    a block of KV cache group ``g`` (-1 for groups that are never offloaded)."""
+
+    base_ptr: int
+    offsets: np.ndarray
+    row_bytes_per_group: list[int]
+
+
 class RelayConfig(NamedTuple):
     """Rank-0 relay for multi-node TP: only the source rank copies KV between
     its CPU tier and the GPU; loads are broadcast from its GPU to the other
@@ -269,6 +279,7 @@ class SingleDirectionOffloadingHandler:
         gpu_to_cpu: bool,
         canonical_layout: bool = False,
         relay: RelayConfig | None = None,
+        cpu_slot_table: CPUSlotTable | None = None,
     ):
         """
         Initialize a SingleDirectionOffloadingHandler.
@@ -284,6 +295,8 @@ class SingleDirectionOffloadingHandler:
             canonical_layout: if True, CPU pages use the canonical layout
                 described by the refs' mappings.
             relay: rank-0 relay configuration (see RelayConfig), or None.
+            cpu_slot_table: host addresses of a slab layout; then CPU blocks
+                are addressed through it instead of the cpu_tensors' strides.
         """
         assert len(gpu_tensors) == len(cpu_tensors)
         assert len(gpu_tensors) > 0
@@ -300,8 +313,10 @@ class SingleDirectionOffloadingHandler:
             assert gpu_tensor.ndim == 2
             assert gpu_tensor.is_cuda or gpu_tensor.is_xpu
             assert cpu_tensor.dtype == torch.int8
-            assert cpu_tensor.ndim == 2
             assert cpu_tensor.device.type == "cpu"
+            if cpu_slot_table is not None:
+                continue
+            assert cpu_tensor.ndim == 2
             _, gpu_page_size = gpu_tensor.shape
             _, cpu_page_size = cpu_tensor.shape
             if canonical_bytes_per_block is not None:
@@ -310,6 +325,21 @@ class SingleDirectionOffloadingHandler:
                 )
             else:
                 assert cpu_page_size == gpu_page_size * blocks_per_chunk
+
+        self._cpu_slot_table = cpu_slot_table
+        if cpu_slot_table is not None:
+            # A slab row holds one block of one group: its refs must fit the row.
+            assert not canonical_layout
+            assert blocks_per_chunk == 1
+            for g_idx, layer_refs in enumerate(layer_refs_per_group):
+                row_bytes = cpu_slot_table.row_bytes_per_group[g_idx]
+                if row_bytes < 0:
+                    continue
+                group_bytes = sum(ref.page_size_bytes for ref in layer_refs)
+                assert group_bytes <= row_bytes, (
+                    f"KV cache group {g_idx} needs {group_bytes} bytes per block "
+                    f"but its CPU slab rows hold {row_bytes}"
+                )
 
         self.src_tensors: list[torch.Tensor] = (
             gpu_tensors if gpu_to_cpu else cpu_tensors
@@ -395,24 +425,39 @@ class SingleDirectionOffloadingHandler:
 
         Returns (op_idx past the filled descriptors, bytes added)."""
         num_bytes = 0
+        slot_table = self._cpu_slot_table
+        # With slabs the CPU block address comes from the offset table; the
+        # refs of a group are laid out back to back inside its row.
+        cpu_row_offset = 0
         for data_ref in self.layer_refs_per_group[g_idx]:
             t_idx = data_ref.tensor_idx
             end_idx = op_idx + group_size
 
-            compute_sub_block_ptrs(
-                group_src,
-                self.src_blocks_per_chunk,
-                all_src[op_idx:end_idx],
-                self.src_tensors[t_idx],
-                skip_count=src_skip_count,
-            )
-            compute_sub_block_ptrs(
-                group_dst,
-                self.dst_blocks_per_chunk,
-                all_dst[op_idx:end_idx],
-                self.dst_tensors[t_idx],
-                skip_count=dst_skip_count,
-            )
+            if slot_table is not None and self.gpu_to_cpu:
+                all_dst[op_idx:end_idx] = (
+                    slot_table.base_ptr + cpu_row_offset + slot_table.offsets[group_dst]
+                )
+            else:
+                compute_sub_block_ptrs(
+                    group_dst,
+                    self.dst_blocks_per_chunk,
+                    all_dst[op_idx:end_idx],
+                    self.dst_tensors[t_idx],
+                    skip_count=dst_skip_count,
+                )
+            if slot_table is not None and not self.gpu_to_cpu:
+                all_src[op_idx:end_idx] = (
+                    slot_table.base_ptr + cpu_row_offset + slot_table.offsets[group_src]
+                )
+            else:
+                compute_sub_block_ptrs(
+                    group_src,
+                    self.src_blocks_per_chunk,
+                    all_src[op_idx:end_idx],
+                    self.src_tensors[t_idx],
+                    skip_count=src_skip_count,
+                )
+            cpu_row_offset += data_ref.page_size_bytes
 
             all_sizes[op_idx:end_idx] = data_ref.page_size_bytes
             num_bytes += group_size * data_ref.page_size_bytes
@@ -932,6 +977,20 @@ class CPUOffloadingWorker(OffloadingWorker):
             else None
         )
 
+        # Slab layouts address CPU blocks through an offset table rather than
+        # one strided view per tensor.
+        cpu_slot_table: CPUSlotTable | None = None
+        if mmap_region is not None and not mmap_region.layout.is_uniform:
+            layout = mmap_region.layout
+            cpu_slot_table = CPUSlotTable(
+                base_ptr=mmap_region.base_ptr,
+                offsets=mmap_region.slot_offsets,
+                row_bytes_per_group=[
+                    layout.classes[cls].row_bytes if cls >= 0 else -1
+                    for cls in layout.group_class
+                ],
+            )
+
         gpu_tensors: list[torch.Tensor] = []
         cpu_tensors: list[torch.Tensor] = []
         for t_idx, kv_cache_tensor in enumerate(kv_caches.tensors):
@@ -941,7 +1000,10 @@ class CPUOffloadingWorker(OffloadingWorker):
             )
             cpu_page_size_bytes = gpu_page_size_bytes * blocks_per_chunk
 
-            if canonical_bytes_per_block is not None:
+            if cpu_slot_table is not None:
+                assert mmap_region is not None
+                cpu_tensor = mmap_region.base_tensor
+            elif canonical_bytes_per_block is not None:
                 assert mmap_region is not None
                 cpu_tensor = mmap_region.create_next_canonical_view(
                     canonical_bytes_per_block[t_idx] * blocks_per_chunk
@@ -975,6 +1037,7 @@ class CPUOffloadingWorker(OffloadingWorker):
             gpu_to_cpu=True,
             canonical_layout=canonical_layout,
             relay=relay,
+            cpu_slot_table=cpu_slot_table,
         )
 
         self._load_handler = SingleDirectionOffloadingHandler(
@@ -985,6 +1048,7 @@ class CPUOffloadingWorker(OffloadingWorker):
             gpu_to_cpu=False,
             canonical_layout=canonical_layout,
             relay=relay,
+            cpu_slot_table=cpu_slot_table,
         )
 
     def submit_store(

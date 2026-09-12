@@ -18,6 +18,12 @@ class OffloadingGroupConfig:
     # page sizes). In a packed block-outermost layout these occupy the first
     # ``bytes_per_block`` bytes of the block; 0 when unknown.
     bytes_per_block: int = 0
+    # Tokens an attention layer of this group looks back over: the sliding
+    # window, the local-attention chunk, or one block for a state-space layer.
+    # None for full attention (every block of a request is kept).
+    window_tokens: int | None = None
+    # False for scratch groups, which are never offloaded.
+    prefix_cacheable: bool = True
 
 
 @dataclass(frozen=True)
@@ -34,6 +40,8 @@ class OffloadingCacheConfig:
     tokens_per_hash: int
     # Blocks coalesced into one offload chunk.
     blocks_per_chunk: int
+    # Longest request the engine admits, in tokens; 0 when unknown.
+    max_model_len: int = 0
 
 
 @dataclass(frozen=True)

@@ -73,8 +73,7 @@ class ExampleSecondaryTierManager(SecondaryTierManager):
 
         # Completed jobs waiting to be retrieved by get_finished_jobs()
         self.completed_jobs: list[JobResult] = []
-        assert primary_kv_view.strides is not None
-        self._block_size = primary_kv_view.strides[0]
+        self._block_size = self._primary_row_bytes
 
     @override
     def lookup(self, key: OffloadKey, req_context: ReqContext) -> LookupResult:

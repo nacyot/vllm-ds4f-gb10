@@ -9,6 +9,7 @@ class CPUOffloadingMetrics:
     CPU_ALLOCATION_SIZE = "vllm:kv_offload_cpu_allocation_size"
     CPU_CACHE_WRITE_USAGE_PERC = "vllm:kv_offload_cpu_cache_write_usage_perc"
     CPU_CACHE_READ_USAGE_PERC = "vllm:kv_offload_cpu_cache_read_usage_perc"
+    CPU_SLAB_USAGE_PERC = "vllm:kv_offload_cpu_slab_usage_perc"
 
 
 class CPULoadStoreSpec(BlockIDsLoadStoreSpec):

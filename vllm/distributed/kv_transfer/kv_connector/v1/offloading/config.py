@@ -10,9 +10,11 @@ from vllm.v1.core.kv_cache_utils import (
 )
 from vllm.v1.kv_cache_interface import (
     AttentionSpec,
+    ChunkedLocalAttentionSpec,
     FullAttentionSpec,
     KVCacheGroupSpec,
     KVCacheSpec,
+    MambaSpec,
     MLAAttentionSpec,
     SlidingWindowMLASpec,
     SlidingWindowSpec,
@@ -42,6 +44,18 @@ def _group_bytes_per_block(group: KVCacheGroupSpec) -> int:
     if isinstance(spec, UniformTypeKVCacheSpecs):
         return sum(s.page_size_bytes for s in spec.kv_cache_specs.values())
     return spec.page_size_bytes * len(group.layer_names)
+
+
+def _group_window_tokens(group: KVCacheGroupSpec) -> int | None:
+    """Tokens a layer of the group attends back over; None for full attention."""
+    spec = next(iter(iter_layer_specs(group.kv_cache_spec)))
+    if isinstance(spec, SlidingWindowSpec):
+        return spec.sliding_window
+    if isinstance(spec, ChunkedLocalAttentionSpec):
+        return spec.attention_chunk_size
+    if isinstance(spec, MambaSpec):
+        return spec.block_size
+    return None
 
 
 def build_offloading_config(
@@ -85,6 +99,8 @@ def build_offloading_config(
             ),
             layer_names=tuple(group.layer_names),
             bytes_per_block=_bounded_group_bytes(group),
+            window_tokens=_group_window_tokens(group),
+            prefix_cacheable=group.kv_cache_spec.prefix_cacheable,
         )
         for group in kv_cache_config.kv_cache_groups
     )
@@ -239,6 +255,7 @@ def build_offloading_config(
         cache=OffloadingCacheConfig(
             tokens_per_hash=tokens_per_hash,
             blocks_per_chunk=blocks_per_chunk,
+            max_model_len=vllm_config.model_config.max_model_len,
         ),
         parallel=OffloadingParallelConfig(
             rank=parallel_config.rank,
