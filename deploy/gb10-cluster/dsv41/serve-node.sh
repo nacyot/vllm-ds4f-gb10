@@ -68,7 +68,8 @@ ARGS=(
   --default-chat-template-kwargs "{\"thinking\":$THINKING}"
 )
 if [ "$ENGRAM_MMAP" = "1" ]; then
-  ARGS+=(--engram-config "{\"mmap\":true,\"mmap_prefault_threads\":$ENGRAM_THREADS,\"mmap_release_after_steps\":${ENGRAM_RELEASE:-3}}")
+  PREFETCH=false; [ "${ENGRAM_PREFETCH:-0}" = "1" ] && PREFETCH=true
+  ARGS+=(--engram-config "{\"mmap\":true,\"mmap_prefault_threads\":$ENGRAM_THREADS,\"mmap_release_after_steps\":${ENGRAM_RELEASE:-3},\"mmap_prefetch_next_chunk\":$PREFETCH}")
 else
   ARGS+=(--engram-config '{"cpu_offload":false}')
 fi

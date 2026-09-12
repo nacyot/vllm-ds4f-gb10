@@ -45,6 +45,13 @@ class EngramConfig:
     cache holds only the last few steps' rows instead of every row ever
     read; 0 leaves reclaim to the kernel."""
 
+    mmap_prefetch_next_chunk: bool = False
+    """Hash the tokens each prefilling request continues with after the
+    current step and populate their pages in a background thread while the
+    step runs, and run the page releases there too. The step's own
+    prefault then finds its rows resident, so the forward no longer waits
+    on the disk reads (about 0.3-0.8 s per 4K chunk on GB10)."""
+
     def verify_model_config(self, model_config: "ModelConfig | None") -> None:
         """Reject Engram configuration for models without n-gram embeddings."""
         from vllm.platforms import current_platform

@@ -890,3 +890,95 @@ def test_engram_mmap_matches_resident(tp_size, tmp_path, monkeypatch):
         torch.testing.assert_close(actual, expected, rtol=0, atol=0)
     names = [name for name, _ in safetensors_weights_iterator([str(shard)], False)]
     assert names == ["layers.1.engram.q_weight"]
+
+
+def test_next_chunk_windows_follow_each_prefill():
+    """The next-chunk windows start where this step's tokens end, skip decode
+    requests and prefills that finish this step, and share the token budget
+    in batch order."""
+    from vllm.models.deepseek_v4_1.common.engram import next_chunk_windows
+
+    num_computed = np.array([0, 4096, 10, 8192, 3000])
+    num_scheduled = np.array([4096, 4096, 6, 4100, 1000])
+    prefill_len = np.array([12292, 6000, 5, 12292, 9000])
+    assert next_chunk_windows(num_computed, num_scheduled, prefill_len, 4096) == [
+        (0, 4096, 8192),
+    ]
+    # A decode request (10 + 6 past its 5-token prefill), a prefill that ends
+    # this step (8192 + 4100 == 12292) and one that continues.
+    assert next_chunk_windows(
+        num_computed[1:], num_scheduled[1:], prefill_len[1:], 4096
+    ) == [
+        (3, 4000, 8096),
+    ]
+    # Budget is shared in batch order: the second prefill gets the remainder.
+    windows = next_chunk_windows(
+        np.array([4096, 3000]), np.array([1000, 1000]), np.array([6000, 9000]), 4096
+    )
+    assert windows == [(0, 5096, 6000), (1, 4000, 4000 + (4096 - 904))]
+    assert next_chunk_windows(np.array([0]), np.array([0]), np.array([0]), 4096) == []
+
+
+@pytest.mark.skipif(
+    not os.path.exists("/lib/aarch64-linux-gnu/libc.so.6")
+    and not os.path.exists("/lib/x86_64-linux-gnu/libc.so.6"),
+    reason="madvise(MADV_POPULATE_READ) needs Linux 5.14+",
+)
+def test_mmap_table_background_prefetch_and_release(tmp_path):
+    """With `background=True` a prefetch populates a later step's pages off
+    the caller's thread, and a prefault releases the ring's stale pages in
+    the background; both are drained before the next prefault populates."""
+    import ctypes
+
+    num_rows, dim = 4096, 64
+    torch.manual_seed(0)
+    weight = (torch.randn(num_rows, dim) * 4).to(torch.float8_e4m3fn)
+    scales = torch.randint(120, 134, (num_rows, dim // 32), dtype=torch.uint8)
+    shard = _write_engram_shard(tmp_path, 1, weight, scales)
+    fd = os.open(shard, os.O_RDONLY)
+    os.fsync(fd)
+    os.posix_fadvise(fd, 0, 0, os.POSIX_FADV_DONTNEED)
+    os.close(fd)
+    table = MmapEngramTable(
+        str(tmp_path),
+        1,
+        dim,
+        32,
+        num_threads=2,
+        release_after_steps=1,
+        background=True,
+    )
+    libc = ctypes.CDLL("libc.so.6", use_errno=True)
+    libc.mincore.argtypes = [ctypes.c_void_p, ctypes.c_size_t, ctypes.c_char_p]
+
+    def resident(pages):
+        out = []
+        for page in pages.tolist():
+            vec = ctypes.create_string_buffer(1)
+            assert libc.mincore(table.base + page * table.page, table.page, vec) == 0
+            out.append(bool(vec.raw[0] & 1))
+        return out
+
+    step_a = np.arange(0, 64)
+    step_b = np.arange(2048, 2112)
+    pages_a, pages_b = table._pages_of(step_a), table._pages_of(step_b)
+    assert not np.intersect1d(pages_a, pages_b).size
+
+    table.prefetch(step_b)
+    table.drain()
+    assert all(resident(pages_b))
+
+    table.prefault(step_a)
+    assert all(resident(pages_a))
+    # Step b enters the ring; step a's pages leave it through the background.
+    table.prefault(step_b)
+    assert table._pending is not None
+    table.drain()
+    assert not any(resident(pages_a))
+    assert all(resident(pages_b))
+    # Without a background worker prefetch is a no-op and prefault is synchronous.
+    plain = MmapEngramTable(str(tmp_path), 1, dim, 32, num_threads=2)
+    plain.prefetch(step_a)
+    assert plain._pending is None
+    plain.prefault(step_a)
+    assert all(resident(pages_a))

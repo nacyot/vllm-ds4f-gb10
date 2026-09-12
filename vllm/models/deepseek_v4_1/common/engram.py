@@ -42,7 +42,7 @@ import struct
 import time
 import weakref
 from collections import deque
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import Future, ThreadPoolExecutor
 
 import numpy as np
 import torch
@@ -389,6 +389,28 @@ def _hash_ids_kernel(
             tl.store(output + out_offset, hashed, valid[:, None] & (head < num_heads))
 
 
+def next_chunk_windows(
+    num_computed: np.ndarray,
+    num_scheduled: np.ndarray,
+    prefill_len: np.ndarray,
+    budget: int,
+) -> list[tuple[int, int, int]]:
+    """Token ranges the prefilling requests of a batch continue with after
+    the current step: (batch index, start, end) in batch order, at most
+    `budget` tokens in total (the scheduler's per-step token budget). Decode
+    requests and prefills that end this step contribute nothing."""
+    windows: list[tuple[int, int, int]] = []
+    for i in range(len(num_computed)):
+        start = int(num_computed[i]) + int(num_scheduled[i])
+        end = min(int(prefill_len[i]), start + budget)
+        if end > start:
+            windows.append((i, start, end))
+            budget -= end - start
+            if budget <= 0:
+                break
+    return windows
+
+
 class NgramHashState(nn.Module):
     """Maps each position to the hash ids of the n-grams ending there.
 
@@ -656,6 +678,7 @@ class MmapEngramTable:
         block_size: int,
         num_threads: int,
         release_after_steps: int = 0,
+        background: bool = False,
     ) -> None:
         index_path = os.path.join(model_dir, "model.safetensors.index.json")
         with open(index_path) as f:
@@ -710,6 +733,17 @@ class MmapEngramTable:
         # newer step still needs them.
         self.release_after_steps = release_after_steps
         self._recent_pages: deque[np.ndarray] = deque()
+        # `background`: a single worker runs the page releases and the
+        # prefetch of a later step's rows off the step's critical path. One
+        # worker keeps them ordered (a release never overtakes the prefetch
+        # that follows it) and `prefault` drains it before populating, so a
+        # release can never race the pages a lookup is about to read.
+        self._background = (
+            ThreadPoolExecutor(1, thread_name_prefix="engram-bg")
+            if background
+            else None
+        )
+        self._pending: Future | None = None
         self.stats_enabled = os.environ.get("VLLM_ENGRAM_MMAP_STATS", "0") == "1"
         self.stats_calls = 0
         self.stats_rows = 0
@@ -765,15 +799,7 @@ class MmapEngramTable:
             splits = np.array_split(runs, min(self.num_threads * 4, runs.shape[0]))
             list(self.pool.map(work, splits))
 
-    def prefault(self, rows: np.ndarray) -> None:
-        """Populate the page-table entries for `rows` (global row ids), so
-        the GPU gather that follows finds every page resident. Then release
-        the pages of the step that falls out of the ring (see
-        `release_after_steps`)."""
-        if rows.size == 0:
-            return
-        t0 = time.perf_counter() if self.stats_enabled else 0.0
-        pages = self._pages_of(rows)
+    def _populate(self, pages: np.ndarray) -> None:
         madvise, base, page = self._libc.madvise, self.base, self.page
 
         def populate(chunk: np.ndarray) -> None:
@@ -781,13 +807,49 @@ class MmapEngramTable:
                 madvise(base + start * page, length * page, _MADV_POPULATE_READ)
 
         self._run_over_pages(pages, populate)
+
+    def _submit(self, fn, *args) -> None:
+        assert self._background is not None
+        self._pending = self._background.submit(fn, *args)
+
+    def drain(self) -> None:
+        """Wait for the background release / prefetch to finish."""
+        if self._pending is not None:
+            self._pending.result()
+            self._pending = None
+
+    def prefetch(self, rows: np.ndarray) -> None:
+        """Populate the pages of `rows` (a later step's row ids, hashed
+        ahead of time) in the background, outside the release ring: the
+        `prefault` of that step then finds them resident. No-op unless the
+        table was created with `background=True`."""
+        if rows.size == 0 or self._background is None:
+            return
+        self._submit(self._populate, self._pages_of(rows))
+
+    def prefault(self, rows: np.ndarray) -> None:
+        """Populate the page-table entries for `rows` (global row ids), so
+        the GPU gather that follows finds every page resident. Then release
+        the pages of the step that falls out of the ring (see
+        `release_after_steps`), in the background when there is one."""
+        if rows.size == 0:
+            return
+        t0 = time.perf_counter() if self.stats_enabled else 0.0
+        self.drain()
+        pages = self._pages_of(rows)
+        self._populate(pages)
         num_released = 0
         if self.release_after_steps > 0:
             self._recent_pages.append(pages)
             if len(self._recent_pages) > self.release_after_steps:
                 old = self._recent_pages.popleft()
                 in_flight = np.unique(np.concatenate(list(self._recent_pages)))
-                num_released = self.release(np.setdiff1d(old, in_flight))
+                stale = np.setdiff1d(old, in_flight)
+                if self._background is not None:
+                    self._submit(self.release, stale)
+                    num_released = int(stale.size)
+                else:
+                    num_released = self.release(stale)
         if self.stats_enabled:
             self.stats_released += num_released
             self._record_stats(rows.size, pages.size, t0)
@@ -955,6 +1017,15 @@ class ParallelEngramEmbedding(nn.Module):
         assert self._views is not None
         return self._views
 
+    def _local_rows(self, indices: torch.Tensor) -> np.ndarray:
+        """This rank's rows among `indices` [T, n_hash_cols] (a host sync
+        when the ids live on the device)."""
+        head_end = min(self.head_start + self.part_n_hash_cols, self.n_hash_cols)
+        local = indices[:, self.head_start : head_end]
+        rows = local.to("cpu", dtype=torch.int64).numpy().ravel()
+        owned = (rows >= self.vocab_start_idx) & (rows < self.vocab_end_idx)
+        return rows[owned]
+
     def prefault(self, indices: torch.Tensor) -> None:
         """mmap mode: map the pages of this rank's rows in `indices` before
         `lookup` reads them. A host sync (D2H of the ids); skipped while a
@@ -962,11 +1033,14 @@ class ParallelEngramEmbedding(nn.Module):
         """
         if self.mmap_table is None or torch.cuda.is_current_stream_capturing():
             return
-        head_end = min(self.head_start + self.part_n_hash_cols, self.n_hash_cols)
-        local = indices[:, self.head_start : head_end]
-        rows = local.to("cpu", dtype=torch.int64).numpy().ravel()
-        owned = (rows >= self.vocab_start_idx) & (rows < self.vocab_end_idx)
-        self.mmap_table.prefault(rows[owned])
+        self.mmap_table.prefault(self._local_rows(indices))
+
+    def prefetch(self, indices: torch.Tensor) -> None:
+        """mmap mode: populate this rank's rows of a later step in the
+        background (see `MmapEngramTable.prefetch`)."""
+        if self.mmap_table is None:
+            return
+        self.mmap_table.prefetch(self._local_rows(indices))
 
     def lookup(
         self, indices: torch.Tensor, out: torch.Tensor, background: bool = False
@@ -1172,6 +1246,7 @@ class Engram(nn.Module):
                 32,
                 engram_config.mmap_prefault_threads,
                 engram_config.mmap_release_after_steps,
+                background=engram_config.mmap_prefetch_next_chunk,
             )
         self.embed_tokens = ParallelEngramEmbedding(
             layout.num_embeddings[layer_hash_index],
