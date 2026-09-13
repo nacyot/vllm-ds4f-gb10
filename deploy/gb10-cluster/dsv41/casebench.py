@@ -13,8 +13,11 @@ Modes:
   multi   --prefills P concurrent prefills (optional --decodes D)
   hol     one big prefill; a short request fired 5 s in
   agent   --lanes L agent lanes x --turns T, staggered; each turn appends code
-          and asks for --gen-tokens tokens (prefix cache carries the history)
-  logits  first-token logprobs of a probe alone, then during P prefills + D lanes
+          and asks for --gen-tokens tokens (prefix cache carries the history);
+          --turn-tokens-max/--gen-max draw the sizes per lane and turn from
+          --work-seed, so every run does the same work with fresh content
+  logits  first-token logprobs of one prompt (a fresh cache_salt per sample forces
+          recompute) alone, then during P prefills + D lanes
 
 Usage: casebench.py --mode MODE --tag TAG [--base URL] [--config LABEL] [--out FILE]
 Appends one JSON line per run to --out and prints it.
@@ -323,18 +326,30 @@ class AgentLane(threading.Thread):
             "Explain what each function in this part does, as a long numbered list."
         )
 
+    def size(self, turn):
+        """New and generated tokens of a turn, seeded per lane and turn so every
+        config does the same work (the content itself stays unique per run)."""
+        a = self.a
+        work = random.Random(f"{a.work_seed}-{self.idx}-{turn}")
+        new = a.start_tokens if turn == 0 else a.turn_tokens
+        if turn and a.turn_tokens_max:
+            new = work.randint(a.turn_tokens_min, a.turn_tokens_max)
+        gen = work.randint(a.gen_min, a.gen_max) if a.gen_max else a.gen_tokens
+        return new, gen
+
     def run(self):
         a = self.a
         time.sleep(self.idx * a.stagger)
         tag = "m" + "".join(self.rng.choices("abcdefghij", k=6))
         msgs = [
             {"role": "system", "content": self.SYSTEM},
-            {"role": "user", "content": self.ask(tag, 0, a.start_tokens)},
+            {"role": "user", "content": self.ask(tag, 0, self.size(0)[0])},
         ]
         for turn in range(a.turns):
+            new_tokens, gen_tokens = self.size(turn)
             if turn:
                 msgs.append(
-                    {"role": "user", "content": self.ask(tag, turn, a.turn_tokens)}
+                    {"role": "user", "content": self.ask(tag, turn, new_tokens)}
                 )
             ev = TokenEvents()
             t0 = time.time()
@@ -343,8 +358,8 @@ class AgentLane(threading.Thread):
                     {
                         "model": MODEL,
                         "messages": msgs,
-                        "max_tokens": a.gen_tokens,
-                        "min_tokens": a.gen_tokens,
+                        "max_tokens": gen_tokens,
+                        "min_tokens": gen_tokens,
                         "ignore_eos": True,
                         "temperature": 0.6,
                         "chat_template_kwargs": {"thinking": False},
@@ -400,11 +415,18 @@ def run_agent(a, rec):
     ctoks = sum(t["completion_tokens"] for t in turns)
     dec_s = sum(t["decode_s"] for t in turns)
     ttfts = [t["ttft_s"] for t in turns if t["ttft_s"] is not None]
+    lane_walls = [
+        max(t["t_end"] for t in lane.turns) - min(t["t0"] for t in lane.turns)
+        for lane in lanes
+        if lane.turns
+    ]
     n_gaps = sum(t["n_gaps"] for t in turns)
     long_gaps = [g for t in turns for g in t["gaps"]]
     rec["agent"] = {
         "turns": len(turns),
         "wall_s": round(wall, 1),
+        "lane_wall_mean_s": round(sum(lane_walls) / len(lane_walls), 1),
+        "lane_wall_max_s": round(max(lane_walls), 1),
         "completion_tokens": ctoks,
         "decode_tok_per_s_per_lane": round(ctoks / dec_s, 2) if dec_s else None,
         "ttft_mean_s": round(sum(ttfts) / len(ttfts), 2),
@@ -423,12 +445,13 @@ def run_agent(a, rec):
     ]
 
 
-def first_token(prompt):
+def first_token(prompt, cache_salt):
     body = json.loads(
         post(
             "/v1/chat/completions",
             {
                 "model": MODEL,
+                "cache_salt": cache_salt,
                 "messages": [{"role": "user", "content": prompt}],
                 "max_tokens": 1,
                 "temperature": 0.0,
@@ -451,9 +474,9 @@ def run_logits(a, rec, rng):
     instr = "\nReturn exactly 200 numbered lowercase English words, then stop."
 
     def probe():
-        nonce = "".join(rng.choices("abcdefghij", k=10))
+        salt = "".join(rng.choices("abcdefghij", k=16))
         t = time.time()
-        top = first_token(f"[{nonce}]\n{body}{instr}")
+        top = first_token(body + instr, salt)
         return {"t": round(t, 1), "lat_s": round(time.time() - t, 2), "top": top}
 
     rec["solo"] = [probe() for _ in range(3)]
@@ -514,6 +537,11 @@ def main():
     ap.add_argument("--turn-tokens", type=int, default=6000)
     ap.add_argument("--gen-tokens", type=int, default=300)
     ap.add_argument("--stagger", type=float, default=15.0)
+    ap.add_argument("--turn-tokens-min", type=int, default=0)
+    ap.add_argument("--turn-tokens-max", type=int, default=0)
+    ap.add_argument("--gen-min", type=int, default=0)
+    ap.add_argument("--gen-max", type=int, default=0)
+    ap.add_argument("--work-seed", default="w1")
     a = ap.parse_args()
     BASE = a.base.rstrip("/")
     MODEL = json.load(urllib.request.urlopen(BASE + "/v1/models", timeout=30))["data"][
