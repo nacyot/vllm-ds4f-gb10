@@ -100,11 +100,12 @@ def stream_chat(payload, record, stop=lambda: False):
         if not choices:
             continue
         delta = choices[0].get("delta") or {}
-        text = "".join(
-            delta.get(k) or "" for k in ("content", "reasoning_content", "reasoning")
+        content = delta.get("content") or ""
+        text = content + "".join(
+            delta.get(k) or "" for k in ("reasoning_content", "reasoning")
         )
         if text:
-            record(time.time(), text, (usage or {}).get("completion_tokens"))
+            record(time.time(), text, (usage or {}).get("completion_tokens"), content)
     return usage
 
 
@@ -112,15 +113,17 @@ class TokenEvents:
     def __init__(self):
         self.events = []  # (t, tokens)
         self.text = []
+        self.content = []
         self._cum = 0
 
-    def __call__(self, t, text, cum):
+    def __call__(self, t, text, cum, content=""):
         if cum is None:
             n = len(text) / CHARS_PER_TOKEN
         else:
             n, self._cum = cum - self._cum, cum
         self.events.append((t, n))
         self.text.append(text)
+        self.content.append(content)
 
 
 class DecodeLane(threading.Thread):
@@ -366,8 +369,7 @@ class AgentLane(threading.Thread):
                         "max_tokens": gen_tokens,
                         "min_tokens": gen_tokens,
                         "ignore_eos": True,
-                        "temperature": 0.6,
-                        "chat_template_kwargs": {"thinking": False},
+                        **a.sampling,
                     },
                     ev,
                 )
@@ -396,7 +398,8 @@ class AgentLane(threading.Thread):
                     "t_end": t_end,
                 }
             )
-            msgs.append({"role": "assistant", "content": "".join(ev.text)})
+            # Like an agent client, the history keeps the answer, not the reasoning.
+            msgs.append({"role": "assistant", "content": "".join(ev.content) or "OK."})
 
 
 def pct(xs, q):
@@ -549,7 +552,23 @@ def main():
     ap.add_argument("--gen-min", type=int, default=0)
     ap.add_argument("--gen-max", type=int, default=0)
     ap.add_argument("--work-seed", default="w1")
+    ap.add_argument(
+        "--thinking",
+        default="off",
+        help="agent mode: off, or a reasoning_effort such as high (pi default)",
+    )
+    ap.add_argument(
+        "--temperature",
+        default="0.6",
+        help="agent mode: a float, or 'default' to use the model's generation config",
+    )
     a = ap.parse_args()
+    kwargs = {"thinking": a.thinking != "off"}
+    if a.thinking != "off":
+        kwargs["reasoning_effort"] = a.thinking
+    a.sampling = {"chat_template_kwargs": kwargs}
+    if a.temperature != "default":
+        a.sampling["temperature"] = float(a.temperature)
     BASE = a.base.rstrip("/")
     MODEL = json.load(urllib.request.urlopen(BASE + "/v1/models", timeout=30))["data"][
         0
