@@ -1,8 +1,10 @@
 # vllm-ds4f-gb10: DeepSeek-V4.1-Flash on four DGX Spark
 
+> Looking for the DeepSeek V4 Flash (4.0) line on vLLM 0.27.1? It lives on the [`gb10-longctx-offload`](https://github.com/nacyot/vllm-ds4f-gb10/tree/gb10-longctx-offload) branch.
+
 A vLLM fork that serves **DeepSeek-V4.1-Flash** on four DGX Spark GB10 nodes (TP=4) and keeps long agent sessions alive by **offloading their KV cache to disk**. A session evicted from the GPU, or lost in a server restart, comes back from disk instead of being prefilled again.
 
-- **Branches.** `dsv41-gb10` is this V4.1 line. `gb10-longctx-offload` is the earlier DeepSeek V4 Flash line on vLLM 0.27.1.
+- **Branches.** `dsv41-gb10` is this V4.1 line and the default branch. [`gb10-longctx-offload`](https://github.com/nacyot/vllm-ds4f-gb10/tree/gb10-longctx-offload) is the earlier 4.0 line, kept separately.
 - **Base.** Upstream vLLM main at `29af8bd672` (2026-09-04, 0.28.1 dev) with upstream DeepSeek-V4.1-Flash support, plus the commits in this branch.
 - **Scope.** A reference for one cluster, not a production guarantee. License Apache-2.0, inherited from vLLM. Author: nacyot.
 

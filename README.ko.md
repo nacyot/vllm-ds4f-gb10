@@ -1,8 +1,10 @@
 # vllm-ds4f-gb10: DGX Spark 4대에서 DeepSeek-V4.1-Flash
 
+> vLLM 0.27.1 기반 DeepSeek V4 Flash(4.0) 라인은 [`gb10-longctx-offload`](https://github.com/nacyot/vllm-ds4f-gb10/tree/gb10-longctx-offload) 브랜치에 있습니다.
+
 DGX Spark GB10 4대(TP=4)에서 **DeepSeek-V4.1-Flash**를 서빙하는 vLLM 포크입니다. 핵심 목표는 긴 에이전트 세션의 **KV 캐시를 디스크로 오프로딩**해 살려 두는 것입니다. GPU에서 밀려났거나 서버 재시작으로 사라진 세션은 프리필을 다시 하지 않고 디스크에서 복원합니다.
 
-- **브랜치.** `dsv41-gb10`이 이 V4.1 라인입니다. `gb10-longctx-offload`는 vLLM 0.27.1 기반의 이전 DeepSeek V4 Flash 라인입니다.
+- **브랜치.** `dsv41-gb10`이 이 V4.1 라인이자 기본 브랜치입니다. [`gb10-longctx-offload`](https://github.com/nacyot/vllm-ds4f-gb10/tree/gb10-longctx-offload)는 따로 유지하는 이전 4.0 라인입니다.
 - **기반.** upstream vLLM main `29af8bd672`(2026-09-04, 0.28.1 개발판)에 upstream의 DeepSeek-V4.1-Flash 지원과 이 브랜치의 커밋을 더했습니다.
 - **범위.** 특정 클러스터용 참고 구현이며 운영 보증은 없습니다. 라이선스는 vLLM을 따라 Apache-2.0입니다. 작성자: nacyot.
 
