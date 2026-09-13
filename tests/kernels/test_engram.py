@@ -924,6 +924,41 @@ def test_next_chunk_windows_follow_each_prefill():
     and not os.path.exists("/lib/x86_64-linux-gnu/libc.so.6"),
     reason="madvise(MADV_POPULATE_READ) needs Linux 5.14+",
 )
+def test_mmap_table_decode_prefault_keeps_prefetch(tmp_path):
+    """A small prefault between a chunk's prefetch and the chunk (a decode-only
+    step) neither consumes the prefetch nor re-populates the chunk's pages."""
+    num_rows, dim = 4096, 64
+    torch.manual_seed(0)
+    weight = (torch.randn(num_rows, dim) * 4).to(torch.float8_e4m3fn)
+    scales = torch.randint(120, 134, (num_rows, dim // 32), dtype=torch.uint8)
+    _write_engram_shard(tmp_path, 1, weight, scales)
+    table = MmapEngramTable(
+        str(tmp_path),
+        1,
+        dim,
+        32,
+        num_threads=2,
+        release_after_steps=1,
+        background=True,
+    )
+    chunk = np.arange(2048, 2112)
+    decode = np.arange(1000, 1004)
+    assert not np.intersect1d(table._pages_of(chunk), table._pages_of(decode)).size
+    table.prefault(np.arange(0, 64))
+    table.prefetch(chunk)
+    table.prefault(decode)
+    assert table._prefetched is not None
+    table.prefault(chunk)
+    assert table.last_sync_pages == 0
+    assert table._prefetched is None
+    table.drain()
+
+
+@pytest.mark.skipif(
+    not os.path.exists("/lib/aarch64-linux-gnu/libc.so.6")
+    and not os.path.exists("/lib/x86_64-linux-gnu/libc.so.6"),
+    reason="madvise(MADV_POPULATE_READ) needs Linux 5.14+",
+)
 def test_mmap_table_background_prefetch_and_release(tmp_path):
     """With `background=True` a prefetch populates a later step's pages off
     the caller's thread, and a prefault releases the ring's stale pages in

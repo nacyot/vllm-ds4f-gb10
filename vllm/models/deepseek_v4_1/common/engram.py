@@ -733,17 +733,26 @@ class MmapEngramTable:
         # newer step still needs them.
         self.release_after_steps = release_after_steps
         self._recent_pages: deque[np.ndarray] = deque()
-        # `background`: a single worker runs the page releases and the
-        # prefetch of a later step's rows off the step's critical path. One
-        # worker keeps them ordered (a release never overtakes the prefetch
-        # that follows it) and `prefault` drains it before populating, so a
-        # release can never race the pages a lookup is about to read.
+        # `background`: one worker runs the page releases and another the
+        # prefetch of a later step's rows, both off the step's critical path.
+        # A prefetch job waits for the release submitted before it (a release
+        # never overtakes the prefetch that follows it). `prefault` always
+        # drains the release before populating, so a release never races the
+        # pages a lookup is about to read, but it waits for a prefetch only
+        # when that prefetch covers the step: a decode step that runs between
+        # a chunk's prefetch and the chunk does not stall on it.
         self._background = (
             ThreadPoolExecutor(1, thread_name_prefix="engram-bg")
             if background
             else None
         )
+        self._prefetch_worker = (
+            ThreadPoolExecutor(1, thread_name_prefix="engram-prefetch")
+            if background
+            else None
+        )
         self._pending: Future | None = None
+        self._pending_prefetch: Future | None = None
         # Pages the last prefetch populated: the next prefault skips them.
         self._prefetched: np.ndarray | None = None
         self.last_sync_pages = 0
@@ -815,38 +824,45 @@ class MmapEngramTable:
         assert self._background is not None
         self._pending = self._background.submit(fn, *args)
 
-    def drain(self) -> None:
-        """Wait for the background release / prefetch to finish."""
+    def _drain_release(self) -> None:
         if self._pending is not None:
             self._pending.result()
             self._pending = None
+
+    def drain(self) -> None:
+        """Wait for the background release and prefetch to finish."""
+        self._drain_release()
+        if self._pending_prefetch is not None:
+            self._pending_prefetch.result()
+            self._pending_prefetch = None
 
     def prefetch(self, rows: np.ndarray) -> None:
         """Populate the pages of `rows` (a later step's row ids, hashed
         ahead of time) in the background, outside the release ring: the
         `prefault` of that step then finds them resident. No-op unless the
         table was created with `background=True`."""
-        if rows.size == 0 or self._background is None:
+        if rows.size == 0 or self._prefetch_worker is None:
             return
         pages = self._pages_of(rows)
         self._prefetched = pages
-        if not self.stats_enabled:
-            self._submit(self._populate, pages)
-            return
+        release = self._pending
         submitted = time.perf_counter()
 
         def job() -> None:
+            if release is not None:
+                release.result()
             t0 = time.perf_counter()
             self._populate(pages)
-            logger.info(
-                "engram prefetch %s: %d pages, queued %.0f ms, populate %.0f ms",
-                os.path.basename(self.path),
-                pages.size,
-                1e3 * (t0 - submitted),
-                1e3 * (time.perf_counter() - t0),
-            )
+            if self.stats_enabled:
+                logger.info(
+                    "engram prefetch %s: %d pages, queued %.0f ms, populate %.0f ms",
+                    os.path.basename(self.path),
+                    pages.size,
+                    1e3 * (t0 - submitted),
+                    1e3 * (time.perf_counter() - t0),
+                )
 
-        self._submit(job)
+        self._pending_prefetch = self._prefetch_worker.submit(job)
 
     def prefault(self, rows: np.ndarray) -> None:
         """Populate the page-table entries for `rows` (global row ids), so
@@ -856,14 +872,23 @@ class MmapEngramTable:
         if rows.size == 0:
             return
         t0 = time.perf_counter() if self.stats_enabled else 0.0
-        self.drain()
-        t_drained = time.perf_counter() if self.stats_enabled else 0.0
         pages = self._pages_of(rows)
+        prefetched = self._prefetched
+        covered = (
+            prefetched is not None
+            and 2 * np.intersect1d(pages, prefetched, assume_unique=True).size
+            >= prefetched.size
+        )
+        if covered:
+            self.drain()
+        else:
+            self._drain_release()
+        t_drained = time.perf_counter() if self.stats_enabled else 0.0
         todo = pages
-        if self._prefetched is not None:
+        if covered:
             # Populating a resident page still costs a syscall and a page-table
             # walk (5-10 us each); the prefetched ones are skipped.
-            todo = np.setdiff1d(pages, self._prefetched, assume_unique=True)
+            todo = np.setdiff1d(pages, prefetched, assume_unique=True)
             self._prefetched = None
         self._populate(todo)
         self.last_sync_pages = int(todo.size)
@@ -885,6 +910,8 @@ class MmapEngramTable:
                 old = self._recent_pages.popleft()
                 in_flight = np.unique(np.concatenate(list(self._recent_pages)))
                 stale = np.setdiff1d(old, in_flight)
+                if self._prefetched is not None:
+                    stale = np.setdiff1d(stale, self._prefetched, assume_unique=True)
                 if self._background is not None:
                     self._submit(self.release, stale)
                     num_released = int(stale.size)
