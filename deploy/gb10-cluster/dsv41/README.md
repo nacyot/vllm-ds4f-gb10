@@ -52,6 +52,25 @@ The bring-up store `~/dsv41-prep/kvfs` on the root NVMe was copied there with
 `rsync -aX` (xattr checksums preserved); a store moved to a new root keeps its
 identity because the base path is `<root>/<model>_<hash of the run config>`.
 
+Speculative decoding verifies drafts with block verification
+(`SPEC_REJECT=block`, Sun et al. 2024) on probabilistic drafts
+(`SPEC_DRAFT=probabilistic`) since 2026-09-13. Block verification leaves the
+sampling distribution unchanged and applies only to sampled requests; agent
+clients such as pi send no temperature, so the server samples at 1.0. On the
+pi-like 4-agent benchmark (`casebench.py --mode agent`, thinking high) the
+same work took 232 s instead of 247 s; greedy requests are unchanged.
+
+The scheduler caps `LPTT`, `LPTT_MIXED`, `PPCAP` and `DECODE_STEPS` stay
+unset by default. On that benchmark none of them shortened the total time.
+The DS4F mixed cap of 2,048 tokens cost 33% of prefill throughput here,
+because DeepSeek-V4.1 routes to 6 of 384 experts and a 2,048-token chunk
+leaves each expert about 32 tokens. With a 128K cold prefill injected into
+the 4-agent load, the default finished everything in 329 s. An 8,192 budget
+with a 6,144 chunk cap and 4 decode-only steps per prefill took 364 s. It cut
+a short request's wait behind a 128K prefill from about 87 s to 7 s by
+slowing that prefill to 878 tok/s. An 8,192 budget was the upper bound: at
+12,288 the boot-time FlashInfer autotune ran every worker into earlyoom.
+
 `dsv41_ctl.sh caps` prints `HOST SERVICE PERSISTENCE MAX_SM_MHZ`. Each node
 must have an active `gpu-clock-cap.service`, persistence `Enabled`, and a
 maximum SM clock of at most 2000 MHz across five samples, 200 ms apart.
@@ -95,6 +114,15 @@ and a block of g13, g14 or g17 77,824 B. At 3 GiB the boot log reports
 slots ..., 77824 B x 18125 slots ...` (32,057 slots; the previous uniform
 layout held 23,130). The split follows the bytes one 512K session leaves in
 each slab, so every slab holds about 2.1 such sessions.
+
+The default is 2 GiB since 2026-09-13 (about 1.4 max-length sessions). At
+3 GiB the head's MemAvailable reached earlyoom's 2.43 GiB line twice: under
+a sustained 4-agent load (13:06, the worker was killed) and during a fresh
+boot's first 16K prefill (2,619 MiB). The drop is GPU allocator growth in
+unified memory, outside every process RSS, so nothing reclaimable covers
+it. 2 GiB returns about 1 GiB to the head (warm-up low 3,914 MiB, loaded
+lows 3.1 to 4.9 GiB). Two concurrent max-length restores have less
+promotion room than at 3 GiB.
 
 - `KVOFF_SLABS=0` restores the uniform layout without a code change.
 - `KVOFF_SLAB_SHARES=139264:0.4,77824:0.4,114688:0.2` overrides the split;
