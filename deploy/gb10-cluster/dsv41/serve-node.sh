@@ -78,6 +78,10 @@ if [ "$ENGRAM_MMAP" = "1" ]; then
 else
   ARGS+=(--engram-config '{"cpu_offload":false}')
 fi
+[ -n "${LPTT:-}" ] && ARGS+=(--long-prefill-token-threshold "$LPTT")
+[ -n "${LPTT_MIXED:-}" ] && export DSPARK_LPTT_MIXED="$LPTT_MIXED"
+[ -n "${PPCAP:-}" ] && export DSPARK_PPCAP="$PPCAP"
+[ -n "${PPCAP_LONG_TOKENS:-}" ] && export DSPARK_PPCAP_LONG_TOKENS="$PPCAP_LONG_TOKENS"
 [ "$TEXT_ONLY" = "1" ] && ARGS+=(--language-model-only)
 [ "$TEXT_ONLY" != "1" ] && [ -n "${MM_IMAGES:-}" ] && ARGS+=(--limit-mm-per-prompt "{\"image\":$MM_IMAGES}")
 if [ "$EAGER" = "1" ]; then
