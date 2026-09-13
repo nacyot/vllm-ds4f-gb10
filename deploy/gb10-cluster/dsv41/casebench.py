@@ -320,7 +320,8 @@ class AgentLane(threading.Thread):
         self.err = None
 
     def ask(self, tag, part, tokens):
-        code = code_text(self.rng, tokens, f"{tag}{part}")
+        seed = f"{self.a.work_seed}-{self.idx}-{part}-code"
+        code = code_text(random.Random(seed), tokens, f"{tag}{part}")
         return (
             f"Part {part} of module {tag}:\n\n```python\n{code}```\n"
             "Explain what each function in this part does, as a long numbered list."
@@ -340,9 +341,13 @@ class AgentLane(threading.Thread):
     def run(self):
         a = self.a
         time.sleep(self.idx * a.stagger)
-        tag = "m" + "".join(self.rng.choices("abcdefghij", k=6))
+        tag_rng = random.Random(f"{a.work_seed}-{self.idx}-tag")
+        tag = "m" + "".join(tag_rng.choices("abcdefghij", k=6))
+        # The same content every run; the nonce keeps runs out of each other's
+        # prefix and offload caches.
+        nonce = "".join(self.rng.choices("abcdefghij", k=12))
         msgs = [
-            {"role": "system", "content": self.SYSTEM},
+            {"role": "system", "content": f"[run {nonce}] {self.SYSTEM}"},
             {"role": "user", "content": self.ask(tag, 0, self.size(0)[0])},
         ]
         for turn in range(a.turns):
