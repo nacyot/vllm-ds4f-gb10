@@ -476,7 +476,9 @@ def first_token(prompt, cache_salt):
 
 def run_logits(a, rec, rng):
     body = code_text(random.Random(1234), 3000, "probe")
-    instr = "\nReturn exactly 200 numbered lowercase English words, then stop."
+    # A high-margin answer after a 3K-token prefill: solo recomputes of a
+    # near-tie prompt already moved the top logprob by 0.3 nats.
+    instr = "\nIgnore the code above and reply with exactly the word YES."
 
     def probe():
         salt = "".join(rng.choices("abcdefghij", k=16))
