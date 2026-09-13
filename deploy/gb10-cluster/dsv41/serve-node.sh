@@ -82,6 +82,7 @@ fi
 [ -n "${LPTT_MIXED:-}" ] && export DSPARK_LPTT_MIXED="$LPTT_MIXED"
 [ -n "${PPCAP:-}" ] && export DSPARK_PPCAP="$PPCAP"
 [ -n "${PPCAP_LONG_TOKENS:-}" ] && export DSPARK_PPCAP_LONG_TOKENS="$PPCAP_LONG_TOKENS"
+[ -n "${DECODE_STEPS:-}" ] && export DSPARK_DECODE_STEPS_PER_PREFILL="$DECODE_STEPS"
 [ "$TEXT_ONLY" = "1" ] && ARGS+=(--language-model-only)
 [ "$TEXT_ONLY" != "1" ] && [ -n "${MM_IMAGES:-}" ] && ARGS+=(--limit-mm-per-prompt "{\"image\":$MM_IMAGES}")
 if [ "$EAGER" = "1" ]; then

@@ -89,6 +89,10 @@ DSPARK_PPCAP = _env_int("DSPARK_PPCAP")
 # With DSPARK_PPCAP, count and block only prefills longer than this; a blocked
 # long request is skipped for the step so shorter requests behind it enter.
 DSPARK_PPCAP_LONG_TOKENS = _env_int("DSPARK_PPCAP_LONG_TOKENS")
+# Decode share: after a step that schedules prefill work, defer prefill
+# chunks and admissions for this many steps while any request is decoding.
+# Prefill keeps its full chunk (MoE efficiency) and decodes get cheap steps.
+DSPARK_DECODE_STEPS_PER_PREFILL = _env_int("DSPARK_DECODE_STEPS_PER_PREFILL")
 
 
 class Scheduler(SchedulerInterface):
@@ -342,6 +346,7 @@ class Scheduler(SchedulerInterface):
         # prefill batch fully drained the waiting queue. Prefill throttling
         # is disabled in this case.
         self.prefill_capacity_bound = False
+        self._steps_since_prefill = DSPARK_DECODE_STEPS_PER_PREFILL
         self.scheduler_reserve_full_isl = (
             self.scheduler_config.scheduler_reserve_full_isl
         )
@@ -600,9 +605,10 @@ class Scheduler(SchedulerInterface):
         self.kv_cache_manager.new_step_starts()
 
         # DP prefill balancing: on a throttled (non-cadence-aligned) step, defer
-        # all prefill compute unless saturated.
+        # all prefill compute unless saturated. The decode share defers it too.
         defer_prefills = (
-            throttle_prefills and not self.prefill_capacity_bound
+            (throttle_prefills and not self.prefill_capacity_bound)
+            or self._steps_since_prefill < DSPARK_DECODE_STEPS_PER_PREFILL
         ) and any(not r.is_prefill_chunk for r in self.running)
 
         # First, schedule the RUNNING requests.
@@ -1280,6 +1286,11 @@ class Scheduler(SchedulerInterface):
             # record whether it was capacity-bound.
             if not defer_prefills:
                 self.prefill_capacity_bound = bool(self.waiting)
+
+        if prefill_scheduled or scheduled_new_reqs or scheduled_resumed_reqs:
+            self._steps_since_prefill = 0
+        elif defer_prefills:
+            self._steps_since_prefill += 1
 
         # Check if the scheduling constraints are satisfied.
         total_num_scheduled_tokens = sum(num_scheduled_tokens.values())

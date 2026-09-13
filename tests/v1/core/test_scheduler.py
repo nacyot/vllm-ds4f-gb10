@@ -6377,3 +6377,52 @@ def test_ppcap_holds_second_long_prefill(
     for request in requests:
         scheduler.add_request(request)
     assert scheduler.schedule().num_scheduled_tokens == expected
+
+
+def test_decode_steps_per_prefill_defers_prefill_chunks(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    """DSPARK_DECODE_STEPS_PER_PREFILL=2 gives a running decode two decode-only
+    steps after every step that schedules prefill work."""
+    monkeypatch.setattr(sched_module, "DSPARK_DECODE_STEPS_PER_PREFILL", 2)
+    scheduler = create_scheduler(
+        max_num_batched_tokens=1024, long_prefill_token_threshold=400
+    )
+    requests: dict[str, Request] = {}
+
+    def step() -> dict[str, int]:
+        output = scheduler.schedule()
+        ids = list(output.num_scheduled_tokens)
+        done = [
+            requests[i].num_computed_tokens >= requests[i].num_prompt_tokens
+            for i in ids
+        ]
+        scheduler.update_from_output(
+            output,
+            ModelRunnerOutput(
+                req_ids=ids,
+                req_id_to_index={i: n for n, i in enumerate(ids)},
+                sampled_token_ids=[[0] if d else [] for d in done],
+                logprobs=None,
+                prompt_logprobs_dict={},
+                pooler_output=[],
+            ),
+        )
+        return dict(output.num_scheduled_tokens)
+
+    (decode,) = create_requests(
+        num_requests=1, num_tokens=10, max_tokens=100, req_ids=["decode"]
+    )
+    (prefill,) = create_requests(num_requests=1, num_tokens=800, req_ids=["prefill"])
+    requests = {"decode": decode, "prefill": prefill}
+    scheduler.add_request(decode)
+    assert step() == {"decode": 10}
+    scheduler.add_request(prefill)
+    assert [step() for _ in range(6)] == [
+        {"decode": 1},
+        {"decode": 1},
+        {"decode": 1, "prefill": 400},
+        {"decode": 1},
+        {"decode": 1},
+        {"decode": 1, "prefill": 400},
+    ]
