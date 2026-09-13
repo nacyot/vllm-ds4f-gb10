@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 import itertools
+import os
 import time
 from collections import defaultdict, deque
 from collections.abc import Iterable
@@ -69,6 +70,25 @@ from vllm.v1.structured_output import StructuredOutputGrammar, StructuredOutputM
 from vllm.v1.utils import record_function_or_nullcontext
 
 logger = init_logger(__name__)
+
+
+def _env_int(name: str) -> int:
+    try:
+        return int(os.environ.get(name, "0") or 0)
+    except ValueError:
+        return 0
+
+
+# Mixed-only prefill quantum (DS4F [lptt-mixed], ds4-server style): while a
+# decode runs or two prefills compete, a request's prefill chunk is capped at
+# this many tokens; a solo prefill keeps --long-prefill-token-threshold.
+DSPARK_LPTT_MIXED = _env_int("DSPARK_LPTT_MIXED")
+# Concurrent compute prefills (DS4F [ppcap]): a waiting request is not admitted
+# while this many running requests are still prefilling.
+DSPARK_PPCAP = _env_int("DSPARK_PPCAP")
+# With DSPARK_PPCAP, count and block only prefills longer than this; a blocked
+# long request is skipped for the step so shorter requests behind it enter.
+DSPARK_PPCAP_LONG_TOKENS = _env_int("DSPARK_PPCAP_LONG_TOKENS")
 
 
 class Scheduler(SchedulerInterface):
@@ -438,7 +458,11 @@ class Scheduler(SchedulerInterface):
         # and re-aligns at the next boundary.
         if end < prefill_end and not use_internal_checkpoint:
             max_prefill_tokens = self.max_num_scheduled_tokens
-            long_prefill_threshold = self.scheduler_config.long_prefill_token_threshold
+            long_prefill_threshold = getattr(
+                self,
+                "_long_prefill_threshold",
+                self.scheduler_config.long_prefill_token_threshold,
+            )
             if long_prefill_threshold > 0:
                 max_prefill_tokens = min(max_prefill_tokens, long_prefill_threshold)
             aligned_end = end // block_size * block_size
@@ -506,6 +530,31 @@ class Scheduler(SchedulerInterface):
             num_new_tokens -= self.num_prefill_lookahead - remaining
         return max(num_new_tokens, 0)
 
+    def _effective_long_prefill_threshold(self) -> int:
+        threshold = self.scheduler_config.long_prefill_token_threshold
+        if DSPARK_LPTT_MIXED <= 0:
+            return threshold
+        mixed = (
+            min(threshold, DSPARK_LPTT_MIXED) if threshold > 0 else DSPARK_LPTT_MIXED
+        )
+        num_prefills = 0
+        for request in self.running:
+            if request.num_computed_tokens >= request.num_prompt_tokens:
+                return mixed
+            num_prefills += 1
+        if num_prefills + len(self.waiting) + len(self.skipped_waiting) >= 2:
+            return mixed
+        return threshold
+
+    def _long_prefills_at_cap(self) -> bool:
+        long_tokens = max(DSPARK_PPCAP_LONG_TOKENS, 0)
+        count = sum(
+            1
+            for request in self.running
+            if request.num_prompt_tokens - request.num_computed_tokens > long_tokens
+        )
+        return count >= DSPARK_PPCAP
+
     def schedule(self, throttle_prefills: bool = False) -> SchedulerOutput:
         self.current_step += 1
         # NOTE(woosuk) on the scheduling algorithm:
@@ -527,6 +576,7 @@ class Scheduler(SchedulerInterface):
         req_to_new_blocks: dict[str, KVCacheBlocks] = {}
         num_scheduled_tokens: dict[str, int] = {}
         token_budget = self.max_num_scheduled_tokens
+        self._long_prefill_threshold = self._effective_long_prefill_threshold()
         spec = self.vllm_config.speculative_config
         draft_slots = spec.max_num_new_slots_for_drafting if spec is not None else 0
         input_budget = self.scheduler_config.max_num_batched_tokens
@@ -595,8 +645,8 @@ class Scheduler(SchedulerInterface):
                 + request.num_output_placeholders
                 - request.num_computed_tokens
             )
-            if 0 < self.scheduler_config.long_prefill_token_threshold < num_new_tokens:
-                num_new_tokens = self.scheduler_config.long_prefill_token_threshold
+            if 0 < self._long_prefill_threshold < num_new_tokens:
+                num_new_tokens = self._long_prefill_threshold
             num_new_tokens = min(
                 num_new_tokens, token_budget, input_budget - draft_slots
             )
@@ -811,6 +861,14 @@ class Scheduler(SchedulerInterface):
                     step_skipped_waiting.prepend_request(request)
                     continue
 
+                if DSPARK_PPCAP > 0 and self._long_prefills_at_cap():
+                    if DSPARK_PPCAP_LONG_TOKENS <= 0:
+                        break
+                    if request.num_prompt_tokens > DSPARK_PPCAP_LONG_TOKENS:
+                        request_queue.pop_request()
+                        step_skipped_waiting.prepend_request(request)
+                        continue
+
                 if (
                     request.num_stale_output_tokens > 0
                     and not request.drop_stale_output
@@ -990,7 +1048,7 @@ class Scheduler(SchedulerInterface):
                             num_new_tokens = padded_num_tokens
                             pad_spec_decode = True
 
-                    threshold = self.scheduler_config.long_prefill_token_threshold
+                    threshold = self._long_prefill_threshold
                     if 0 < threshold < num_new_tokens:
                         num_new_tokens = threshold
 

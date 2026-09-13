@@ -29,6 +29,7 @@ from vllm.utils.hashing import sha256
 from vllm.v1.core.encoder_cache_manager import EncoderCacheManager
 from vllm.v1.core.kv_cache_coordinator import HybridKVCacheCoordinator
 from vllm.v1.core.kv_cache_utils import get_request_block_hasher, init_none_hash
+from vllm.v1.core.sched import scheduler as sched_module
 from vllm.v1.core.sched.output import CachedRequestData, SchedulerOutput
 from vllm.v1.core.sched.scheduler import Scheduler
 from vllm.v1.core.single_type_kv_cache_manager import register_all_kvcache_specs
@@ -6339,3 +6340,40 @@ def test_encoder_input_skipped_when_connector_already_has_the_item(ec_role: str)
 
     assert output.num_scheduled_tokens[req_id] > 0
     assert not output.scheduled_encoder_inputs.get(req_id)
+
+
+def test_lptt_mixed_caps_only_competing_prefills(monkeypatch: pytest.MonkeyPatch):
+    """DSPARK_LPTT_MIXED leaves a solo prefill whole and caps competing ones."""
+    monkeypatch.setattr(sched_module, "DSPARK_LPTT_MIXED", 200)
+
+    scheduler = create_scheduler(max_num_batched_tokens=1024)
+    for request in create_requests(num_requests=1, num_tokens=800, req_ids=["solo"]):
+        scheduler.add_request(request)
+    assert scheduler.schedule().num_scheduled_tokens == {"solo": 800}
+
+    scheduler = create_scheduler(max_num_batched_tokens=1024)
+    for request in create_requests(num_requests=2, num_tokens=800, req_ids=["a", "b"]):
+        scheduler.add_request(request)
+    assert scheduler.schedule().num_scheduled_tokens == {"a": 200, "b": 200}
+
+
+@pytest.mark.parametrize(
+    ("long_tokens", "expected"),
+    [(100, {"long0": 400, "short0": 50}), (0, {"long0": 400})],
+)
+def test_ppcap_holds_second_long_prefill(
+    monkeypatch: pytest.MonkeyPatch, long_tokens: int, expected: dict[str, int]
+):
+    """DSPARK_PPCAP=1 keeps a second long prefill waiting; with
+    DSPARK_PPCAP_LONG_TOKENS a short request behind it is still admitted."""
+    monkeypatch.setattr(sched_module, "DSPARK_PPCAP", 1)
+    monkeypatch.setattr(sched_module, "DSPARK_PPCAP_LONG_TOKENS", long_tokens)
+    scheduler = create_scheduler(
+        max_num_batched_tokens=1024, long_prefill_token_threshold=400
+    )
+    requests = create_requests(
+        num_requests=2, num_tokens=800, req_ids=["long0", "long1"]
+    ) + create_requests(num_requests=1, num_tokens=50, req_ids=["short0"])
+    for request in requests:
+        scheduler.add_request(request)
+    assert scheduler.schedule().num_scheduled_tokens == expected
