@@ -191,7 +191,9 @@ so `stop` first when switching). Run `install` again after changing a unit file.
   in total). Restarting the head unit therefore restarts the whole server,
   and a head boot or restart never runs next to stale workers. A worker unit
   that restarts alone (its own crash, a worker reboot) leaves the TP group
-  broken until the watchdog restarts the head.
+  broken until the watchdog restarts the head. Workers do not need
+  `/mnt/kvdisk`: only rank 0 creates and uses the filesystem tier, and a
+  worker's NFS mount of it is not restored at boot.
 - Knobs: `start` rewrites `~/dsv41-prep/dsv41-override.env` on the head
   (`KEY="value"` lines; empty means the `dsv41.env` defaults) and the head
   pre-start copies it to the workers, so all ranks boot with the same knobs.
