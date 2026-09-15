@@ -6504,6 +6504,62 @@ def test_short_reserve_feeds_decode_behind_prefill(monkeypatch: pytest.MonkeyPat
     assert step() == {"prefill": 255, "short": 1}
 
 
+def test_short_reserve_survives_drafting_slots(monkeypatch: pytest.MonkeyPatch):
+    """The reservation holds back input budget as well as token budget.
+
+    Every scheduled request costs draft_slots of input budget on top of its
+    tokens, so a prefill chunk sized against the token budget alone drains the
+    input budget instead and the running loop breaks before the decode behind
+    it. The reservation then looks applied and changes nothing, which is what
+    the cluster measured before this was fixed.
+    """
+    monkeypatch.setattr(sched_module, "DSPARK_SHORT_RESERVE", 64)
+    scheduler = create_scheduler(
+        max_num_batched_tokens=256,
+        max_num_seqs=4,
+        num_speculative_tokens=5,
+        parallel_drafting=True,
+    )
+    requests: dict[str, Request] = {}
+
+    def step() -> dict[str, int]:
+        output = scheduler.schedule()
+        ids = list(output.num_scheduled_tokens)
+        scheduler.update_from_output(
+            output,
+            ModelRunnerOutput(
+                req_ids=ids,
+                req_id_to_index={i: n for n, i in enumerate(ids)},
+                sampled_token_ids=[
+                    [0]
+                    if requests[i].num_computed_tokens >= requests[i].num_prompt_tokens
+                    else []
+                    for i in ids
+                ],
+                logprobs=None,
+                prompt_logprobs_dict={},
+                pooler_output=[],
+            ),
+        )
+        return dict(output.num_scheduled_tokens)
+
+    (prefill,) = create_requests(num_requests=1, num_tokens=2000, req_ids=["prefill"])
+    (short,) = create_requests(
+        num_requests=1, num_tokens=8, max_tokens=100, req_ids=["short"]
+    )
+    requests.update({"prefill": prefill, "short": short})
+    scheduler.add_request(prefill)
+    assert step().get("prefill", 0) > 0
+    scheduler.add_request(short)
+    admitted = step()
+    assert admitted.get("short") == 8
+    assert admitted.get("prefill", 0) > 0
+    for _ in range(2):
+        decoding = step()
+        assert decoding.get("short", 0) > 0, decoding
+        assert decoding.get("prefill", 0) > 0, decoding
+
+
 def test_short_reserve_off_matches_baseline(monkeypatch: pytest.MonkeyPatch):
     """Disabled, the knob leaves num_scheduled_tokens exactly as it was."""
     monkeypatch.setattr(sched_module, "DSPARK_SHORT_RESERVE", 0)

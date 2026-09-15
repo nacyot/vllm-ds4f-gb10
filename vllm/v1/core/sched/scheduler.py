@@ -567,8 +567,10 @@ class Scheduler(SchedulerInterface):
         )
         return count >= DSPARK_PPCAP
 
-    def _short_reserve_tokens(self, token_budget: int) -> int:
-        """Tokens to withhold from prefill chunks for the requests behind them.
+    def _short_reserve_tokens(
+        self, token_budget: int, draft_slots: int
+    ) -> tuple[int, int]:
+        """Budget to withhold from prefill chunks for the requests behind them.
 
         Counts what the decodes queued behind a prefill chunk and the short
         requests at the front of the waiting queue need for this step. Requests
@@ -577,14 +579,19 @@ class Scheduler(SchedulerInterface):
 
         Args:
             token_budget: The step's remaining token budget.
+            draft_slots: Extra input slots each scheduled request costs for
+                drafting.
 
         Returns:
-            The reservation, capped at half the budget so a prefill chunk that
-            leads the running loop always keeps a workable share.
+            The token reservation, capped at half the budget so a prefill chunk
+            that leads the running loop keeps a workable share, and the matching
+            input reservation. Both are needed: a prefill chunk large enough to
+            exhaust either budget leaves the requests behind it unscheduled.
         """
         if DSPARK_SHORT_RESERVE <= 0:
-            return 0
+            return 0, 0
         reserve = 0
+        reserved_reqs = 0
         behind_prefill = False
         for request in self.running:
             if request.is_prefill_chunk:
@@ -595,8 +602,9 @@ class Scheduler(SchedulerInterface):
                     + request.num_output_placeholders
                     - request.num_computed_tokens
                 )
+                reserved_reqs += 1
         if not behind_prefill:
-            return 0
+            return 0, 0
         for scanned, request in enumerate(self.waiting):
             if scanned >= DSPARK_SHORT_RESERVE_SCAN:
                 break
@@ -605,7 +613,11 @@ class Scheduler(SchedulerInterface):
             num_new_tokens = request.num_tokens - request.num_computed_tokens
             if num_new_tokens <= DSPARK_SHORT_RESERVE:
                 reserve += num_new_tokens
-        return min(max(reserve, 0), token_budget // 2)
+                reserved_reqs += 1
+        reserve = min(max(reserve, 0), token_budget // 2)
+        if reserve == 0:
+            return 0, 0
+        return reserve, reserve + draft_slots * reserved_reqs
 
     def schedule(self, throttle_prefills: bool = False) -> SchedulerOutput:
         self.current_step += 1
@@ -629,10 +641,12 @@ class Scheduler(SchedulerInterface):
         num_scheduled_tokens: dict[str, int] = {}
         token_budget = self.max_num_scheduled_tokens
         self._long_prefill_threshold = self._effective_long_prefill_threshold()
-        short_reserve = self._short_reserve_tokens(token_budget)
         spec = self.vllm_config.speculative_config
         draft_slots = spec.max_num_new_slots_for_drafting if spec is not None else 0
         input_budget = self.scheduler_config.max_num_batched_tokens
+        short_reserve, short_reserve_input = self._short_reserve_tokens(
+            token_budget, draft_slots
+        )
         if self._pause_state == PauseState.PAUSED_ALL:
             # Do not schedule any requests when paused.
             token_budget = 0
@@ -704,11 +718,11 @@ class Scheduler(SchedulerInterface):
             if 0 < self._long_prefill_threshold < num_new_tokens:
                 num_new_tokens = self._long_prefill_threshold
             chunk_budget = token_budget
+            chunk_input_budget = input_budget - draft_slots
             if short_reserve > 0 and request.is_prefill_chunk:
                 chunk_budget = max(token_budget - short_reserve, 0)
-            num_new_tokens = min(
-                num_new_tokens, chunk_budget, input_budget - draft_slots
-            )
+                chunk_input_budget = max(chunk_input_budget - short_reserve_input, 0)
+            num_new_tokens = min(num_new_tokens, chunk_budget, chunk_input_budget)
 
             # Make sure the input position does not exceed the max model len.
             # This is necessary when using spec decoding.
@@ -847,6 +861,9 @@ class Scheduler(SchedulerInterface):
                 # A reserved decode took its share; release it so a later
                 # prefill chunk in this step is not cut for it twice.
                 short_reserve = max(short_reserve - num_new_tokens, 0)
+                short_reserve_input = max(
+                    short_reserve_input - num_new_tokens - draft_slots, 0
+                )
             req_index += 1
 
             # Speculative decode related.
