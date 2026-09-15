@@ -3,6 +3,7 @@
 
 """KV inspection and deletion boundaries, using only disposable test stores."""
 
+import errno
 import importlib.util
 import json
 import os
@@ -306,3 +307,37 @@ def test_io_error_is_incomplete_scan(verify, store, monkeypatch):
     monkeypatch.setattr(verify.os, "open", denied)
     assert verify.main([str(root)], check_server=lambda: False) == 2
     assert path.exists()
+
+
+def test_inspection_preserves_gc_access_time(verify, store):
+    if not hasattr(os, "O_NOATIME"):
+        pytest.skip("O_NOATIME is Linux-specific")
+    root, make = store
+    path = make("abcde0.bin")
+    os.utime(path, ns=(1_000_000_000, path.stat().st_mtime_ns))
+    inspector = verify.Verifier(root)
+    assert inspector.inspect(path, 8)[0] == "ok"
+    assert path.stat().st_atime_ns == 1_000_000_000
+
+
+def test_noatime_permission_failure_warns_and_falls_back(
+    verify,
+    store,
+    monkeypatch,
+    capsys,
+):
+    root, make = store
+    path = make("abcde0.bin", checksum=False)
+    real_open = verify.os.open
+    noatime = getattr(os, "O_NOATIME", 1 << 29)
+    monkeypatch.setattr(verify.os, "O_NOATIME", noatime, raising=False)
+
+    def denied(name, flags, **kwargs):
+        if flags & noatime:
+            raise PermissionError(errno.EPERM, "not the owner")
+        return real_open(name, flags, **kwargs)
+
+    monkeypatch.setattr(verify.os, "open", denied)
+    inspector = verify.Verifier(root)
+    assert inspector.inspect(path, 8)[0] == "no_xattr"
+    assert "reads may update atime" in capsys.readouterr().err

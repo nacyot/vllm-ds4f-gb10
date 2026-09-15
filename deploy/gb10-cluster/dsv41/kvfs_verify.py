@@ -85,6 +85,7 @@ class Verifier:
         self.root = root
         self.fadvise = fadvise
         self.progress = progress
+        self.noatime = getattr(os, "O_NOATIME", 0)
         self.counts = dict.fromkeys(KINDS, 0)
         self.sizes = dict.fromkeys(KINDS, 0)
         self.examples = {kind: [] for kind in KINDS}
@@ -156,11 +157,18 @@ class Verifier:
         for attempt in range(2):
             try:
                 with parent_fd(self.root, path.relative_to(self.root)) as directory:
-                    fd = os.open(
-                        path.name,
-                        os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK,
-                        dir_fd=directory,
-                    )
+                    flags = os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK
+                    try:
+                        fd = os.open(path.name, flags | self.noatime, dir_fd=directory)
+                    except OSError as exc:
+                        if not self.noatime or exc.errno != errno.EPERM:
+                            raise
+                        print(
+                            "O_NOATIME unavailable; reads may update atime",
+                            file=sys.stderr,
+                        )
+                        self.noatime = 0
+                        fd = os.open(path.name, flags, dir_fd=directory)
                 with os.fdopen(fd, "rb") as stream:
                     info = os.fstat(stream.fileno())
                     identity = signature(info)

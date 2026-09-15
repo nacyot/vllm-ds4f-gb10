@@ -418,6 +418,9 @@ Sampling is deterministic for an unchanged tree, and partial scans are labeled.
 `--progress` prints every 50,000 inspected files. By default, `posix_fadvise`
 returns read pages to the kernel for eviction; `--no-fadvise` disables it.
 This is a best-effort cache hint, not a guarantee about total system cache use.
+On Linux, `O_NOATIME` preserves access times used by GC's capacity ordering.
+If the file ownership prevents it, the scanner warns and falls back to ordinary
+reads; those reads may update access times on mounts without `noatime`.
 
 The scanner uses each namespace's version-2, single-block `config.json`
 `group_bytes` and the file's `_g<idx>` directory. It reports `size_mismatch`,
