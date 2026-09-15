@@ -29,6 +29,8 @@ gx10-f323, gx10-37cc, and gx10-27c4. It requires Bash 4 or newer; on macOS:
 | `smoke.py` | Basic API and deterministic-output smoke checks. |
 | `kvoff_probe.py`, `kvoff_concurrent.py` | Cold and concurrent KV offload restore probes. |
 | `kvfs_gc.sh`, `systemd/kvfs-gc.{service,timer}` | KV filesystem retention and size management; the head user timer that runs it. |
+| `kvfs_verify.py` | Read-only filesystem KV size and xattr CRC inspection; guarded, explicit deletion. |
+| `test_kvfs_verify.py` | Standalone verifier tests with temporary stores, without torch or vLLM imports. |
 | `memlog.py`, `memtrace_summary.py` | Memory sampling (meminfo, worker/EngineCore/API anon and swap, reclaim and compaction counters, free order≥9 blocks; no torch) and allocator-log summaries. |
 | `clock_summary.py` | Summarize sampled clock CSVs. |
 | `prof_summary.py` | Summarize GPU profiler traces. |
@@ -58,6 +60,7 @@ disk the DS4F production used, with retention by `systemd/kvfs-gc.timer`
 The bring-up store `~/dsv41-prep/kvfs` on the root NVMe was copied there with
 `rsync -aX` (xattr checksums preserved); a store moved to a new root keeps its
 identity because the base path is `<root>/<model>_<hash of the run config>`.
+Use [Filesystem KV verification](#filesystem-kv-verification) to inspect either store.
 
 Speculative decoding verifies drafts with block verification
 (`SPEC_REJECT=block`, Sun et al. 2024) on probabilistic drafts
@@ -393,6 +396,64 @@ with a live server for the torch-process rule. Details:
   expected. Any long cold prefill must pass `dsv41_ctl.sh headroom` (≥5.2 GiB)
   first, which in practice means a fresh boot. `status` reports
   memory from `/proc/meminfo` to two decimal places.
+
+### Filesystem KV verification
+
+Run `kvfs_verify.py` before a restart, preferably while the server is down.
+For suspected corruption (`Checksum mismatch` logs or unexpectedly zero restore
+hits), use report mode even with the server running. It reads ordinary files
+without O_DIRECT, torch, vLLM, or C extensions. The root defaults to `KVFS_DIR`,
+then `/mnt/kvdisk/kv/dsv41`; the old NVMe store is inspected only when passed
+explicitly. From the head checkout:
+
+```bash
+.venv/bin/python deploy/gb10-cluster/dsv41/kvfs_verify.py --progress
+.venv/bin/python deploy/gb10-cluster/dsv41/kvfs_verify.py --sample 100 --limit 1000
+.venv/bin/python deploy/gb10-cluster/dsv41/kvfs_verify.py ~/dsv41-prep/kvfs --progress
+```
+
+`--sample K` checks every Kth `.bin` in sorted traversal (default 1, all files).
+`--limit N` caps inspected files; examples are limited to five per category.
+Sampling is deterministic for an unchanged tree, and partial scans are labeled.
+`--progress` prints every 50,000 inspected files. By default, `posix_fadvise`
+returns read pages to the kernel for eviction; `--no-fadvise` disables it.
+This is a best-effort cache hint, not a guarantee about total system cache use.
+
+The scanner uses each namespace's version-2, single-block `config.json`
+`group_bytes` and the file's `_g<idx>` directory. It reports `size_mismatch`,
+`no_xattr`, confirmed `crc_mismatch`, and `unknown`, with counts, observed bytes
+and examples. CRC mismatches are read again once to avoid concurrent-write
+false positives. Temporary files count as `skipped_tmp`; files removed by the
+30-minute GC count as `vanished`. Removed directories are diagnosed separately.
+A live scan is not a snapshot and may miss files created during traversal.
+`no_xattr` and `unknown` are unverified, even if the command exits successfully.
+The last `kvfs_verify:` line contains the root, counts, deletion count, elapsed
+seconds and actual read throughput in MiB/s.
+
+Exit codes: 0 means no size/CRC mismatch, 1 means a mismatch was found, 2 means
+invalid input or an incomplete scan due to an I/O error, and 3 means deletion
+was refused. Missing or unsupported xattrs are reported, never deleted.
+
+Only explicitly add `--delete` during a server-down maintenance window. It
+refuses deletion if `dsv41-serve.service` is active, `pgrep -f 'vllm serve'`
+finds a process, or either check cannot establish the server state. There is no
+CLI bypass. It prints the complete candidate list, then removes only unchanged,
+rechecked size/CRC failures within the selected root, checking server state
+again before removal. It never removes directories or follows symlinks.
+Under the existing recompute failure policy, lost corrupt blocks become cache
+misses and their tokens are recomputed. Issue #10 validation does not delete
+any files from either real store; deletion tests use disposable fixtures.
+
+The standalone pytest suite below is the torch-free exception to the live-node
+pytest rule for this tool. Use a fresh, disposable ext4 directory because
+pytest clears its basetemp, and `/tmp` may not support user xattrs. The suite
+skips xattr tests where the platform or filesystem lacks support:
+
+```bash
+kvfs_test_dir=$(mktemp -d ~/dsv41-prep/i10-pytest.XXXXXX)
+.venv/bin/python -m pytest -c /dev/null -p no:cacheprovider \
+  --basetemp "${kvfs_test_dir:?}" deploy/gb10-cluster/dsv41/test_kvfs_verify.py
+```
 
 ### Metrics in Grafana (issue #33)
 

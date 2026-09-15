@@ -212,6 +212,8 @@ cython_debug/
 # DS Store
 .DS_Store
 
+!.notes/2026-09-16-issue-10-kvfs-verify/
+
 # Results
 *.csv
 
