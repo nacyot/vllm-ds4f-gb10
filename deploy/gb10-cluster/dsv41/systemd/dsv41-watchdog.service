@@ -1,0 +1,9 @@
+# Head only (issue #32): one check per run, driven by dsv41-watchdog.timer.
+[Unit]
+Description=DeepSeek-V4.1-Flash watchdog (one check, dsv41_watchdog.sh)
+
+[Service]
+Type=oneshot
+EnvironmentFile=-%h/dsv41-prep/dsv41-override.env
+ExecStart=/bin/bash %h/vllm-dsv41/deploy/gb10-cluster/dsv41/dsv41_watchdog.sh
+TimeoutStartSec=300

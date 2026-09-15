@@ -1,0 +1,30 @@
+# DeepSeek-V4.1-Flash TP=4, one rank per node (issue #32). The same file on all four nodes; the
+# rank comes from the host name (dsv41_unit.sh). The head's pre-start restarts the three workers,
+# so restarting the head unit restarts the whole server. Install and enable on every node with
+# `dsv41_ctl.sh install`; `dsv41_ctl.sh start` writes the knobs to dsv41-override.env and
+# restarts the head.
+[Unit]
+Description=DeepSeek-V4.1-Flash TP=4 rank (dsv41_unit.sh)
+StartLimitIntervalSec=1800
+StartLimitBurst=5
+
+[Service]
+Type=simple
+EnvironmentFile=-%h/dsv41-prep/dsv41-override.env
+ExecStartPre=/bin/bash %h/vllm-dsv41/deploy/gb10-cluster/dsv41/dsv41_unit.sh pre
+ExecStart=/bin/bash %h/vllm-dsv41/deploy/gb10-cluster/dsv41/dsv41_unit.sh start
+ExecStartPost=/bin/bash %h/vllm-dsv41/deploy/gb10-cluster/dsv41/dsv41_unit.sh post
+# always: after EngineDeadError the API server can exit 0. `systemctl stop` does not restart.
+Restart=always
+RestartSec=20
+# The head pre-start waits for /mnt/kvdisk (180 s), the caps (120 s), worker ssh (480 s in total)
+# and three worker restarts; the manager default of 90 s would kill it.
+TimeoutStartSec=1200
+# A graceful stop next to a dead NCCL peer only ends at the timeout; then SIGKILL the rest.
+TimeoutStopSec=60
+KillMode=mixed
+SendSIGKILL=yes
+LimitNOFILE=65536
+
+[Install]
+WantedBy=default.target

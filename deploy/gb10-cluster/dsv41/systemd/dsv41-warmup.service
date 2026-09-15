@@ -1,0 +1,12 @@
+# Head only (issue #32): queued by dsv41-serve's ExecStartPost on every start of rank 0.
+[Unit]
+Description=DeepSeek-V4.1-Flash post-start warm-up (three requests, dsv41_warmup.py)
+After=dsv41-serve.service
+
+[Service]
+Type=oneshot
+EnvironmentFile=-%h/dsv41-prep/dsv41-override.env
+ExecStart=%h/vllm-dsv41/.venv/bin/python %h/vllm-dsv41/deploy/gb10-cluster/dsv41/dsv41_warmup.py
+TimeoutStartSec=1800
+StandardOutput=append:%h/dsv41-prep/logs/dsv41-warmup.log
+StandardError=append:%h/dsv41-prep/logs/dsv41-warmup.log
