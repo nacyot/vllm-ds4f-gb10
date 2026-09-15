@@ -1032,3 +1032,116 @@ def test_mmap_table_background_prefetch_and_release(tmp_path):
     assert plain._pending is None
     plain.prefault(step_a)
     assert all(resident(pages_a))
+
+
+def _mincore(table):
+    import ctypes
+
+    libc = ctypes.CDLL("libc.so.6", use_errno=True)
+    libc.mincore.argtypes = [ctypes.c_void_p, ctypes.c_size_t, ctypes.c_char_p]
+
+    def resident(pages):
+        out = []
+        for page in pages.tolist():
+            vec = ctypes.create_string_buffer(1)
+            assert libc.mincore(table.base + page * table.page, table.page, vec) == 0
+            out.append(bool(vec.raw[0] & 1))
+        return out
+
+    return resident
+
+
+def _evicted_shard(tmp_path, num_rows=4096, dim=64):
+    torch.manual_seed(0)
+    weight = (torch.randn(num_rows, dim) * 4).to(torch.float8_e4m3fn)
+    scales = torch.randint(120, 134, (num_rows, dim // 32), dtype=torch.uint8)
+    shard = _write_engram_shard(tmp_path, 1, weight, scales)
+    fd = os.open(shard, os.O_RDONLY)
+    os.fsync(fd)
+    os.posix_fadvise(fd, 0, 0, os.POSIX_FADV_DONTNEED)
+    os.close(fd)
+    return dim
+
+
+@pytest.mark.skipif(
+    not os.path.exists("/lib/aarch64-linux-gnu/libc.so.6")
+    and not os.path.exists("/lib/x86_64-linux-gnu/libc.so.6"),
+    reason="madvise(MADV_POPULATE_READ) needs Linux 5.14+",
+)
+@pytest.mark.parametrize(
+    ("min_chunk_runs", "num_runs", "expected_chunks"),
+    [(1, 64, 1), (1, 72, 72), (8, 72, 9), (8, 2000, 8), (1, 2000, 8)],
+)
+def test_mmap_table_run_over_pages_chunks(
+    tmp_path, min_chunk_runs, num_runs, expected_chunks
+):
+    """Up to 64 runs go to `work` inline; more are split over the pool into
+    at most `4 * num_threads` chunks of at least `min_chunk_runs` runs, and
+    every run reaches `work` exactly once."""
+    dim = _evicted_shard(tmp_path)
+    table = MmapEngramTable(
+        str(tmp_path), 1, dim, 32, num_threads=2, min_chunk_runs=min_chunk_runs
+    )
+    pages = np.arange(num_runs) * 2  # one page per run, all separate
+    chunks = []
+    table._run_over_pages(pages, lambda runs: chunks.append(runs.copy()))
+    assert len(chunks) == expected_chunks
+    seen = np.concatenate(chunks)
+    assert seen.shape == (num_runs, 2)
+    assert (seen[:, 0] == pages).all() and (seen[:, 1] == 1).all()
+
+
+@pytest.mark.skipif(
+    not os.path.exists("/lib/aarch64-linux-gnu/libc.so.6")
+    and not os.path.exists("/lib/x86_64-linux-gnu/libc.so.6"),
+    reason="madvise(MADV_POPULATE_READ) needs Linux 5.14+",
+)
+def test_mmap_table_decode_async_prefault(tmp_path):
+    """`prefault(wait=False)` on a `decode_async` table returns before the
+    pages are populated and populates them in the background without
+    touching the prefetch state; with a release ring the table falls back
+    to the synchronous prefault."""
+    dim = _evicted_shard(tmp_path)
+    table = MmapEngramTable(
+        str(tmp_path), 1, dim, 32, num_threads=2, background=True, decode_async=True
+    )
+    resident = _mincore(table)
+    step_a, step_b, chunk = (
+        np.arange(0, 64),
+        np.arange(2048, 2112),
+        np.arange(3000, 3064),
+    )
+    pages_a, pages_b = table._pages_of(step_a), table._pages_of(step_b)
+    if any(resident(pages_b)):
+        pytest.skip("the shard's page cache cannot be evicted here (tmpfs?)")
+    table.prefetch(chunk)
+    table.prefault(step_a, wait=False)
+    assert table._pending_async is not None
+    assert table.last_sync_pages == 0
+    assert table._prefetched is not None and table._pending_prefetch is not None
+    table.drain()
+    assert table._pending_async is None
+    assert all(resident(pages_a))
+    # The next background prefault waits for the previous one first.
+    table.prefault(step_b, wait=False)
+    table.prefault(chunk)
+    table.drain()
+    assert all(resident(pages_b))
+    # `wait=True` (the prefill path) is synchronous as before.
+    step_c = np.arange(1000, 1064)
+    table.prefault(step_c)
+    assert all(resident(table._pages_of(step_c)))
+
+    ringed = MmapEngramTable(
+        str(tmp_path),
+        1,
+        dim,
+        32,
+        num_threads=2,
+        release_after_steps=1,
+        decode_async=True,
+    )
+    assert ringed._async_worker is None
+    ringed.prefault(np.arange(1500, 1564), wait=False)
+    assert ringed._pending_async is None
+    assert all(resident(ringed._pages_of(np.arange(1500, 1564))))

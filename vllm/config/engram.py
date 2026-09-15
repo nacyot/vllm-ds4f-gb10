@@ -52,6 +52,20 @@ class EngramConfig:
     prefault then finds its rows resident, so the forward no longer waits
     on the disk reads (about 0.3-0.8 s per 4K chunk on GB10)."""
 
+    mmap_decode_async: int = 0
+    """Decode-only steps (no prefill in the batch) populate the pages of
+    some tables in a background thread and launch the forward without
+    waiting for them: 0 waits for every table, 1 waits only for the first
+    table (the one the forward reads first) and populates the rest in the
+    background, 2 populates every table in the background and the lookup
+    faults in place whatever is still cold. Needs `mmap_release_after_steps`
+    0; the tables fall back to waiting otherwise."""
+
+    mmap_min_chunk_runs: int = 1
+    """Smallest number of page runs per thread-pool chunk of a prefault or
+    release. With 1 a decode-sized prefault of ~72 runs dispatches ~72
+    one-run chunks."""
+
     def verify_model_config(self, model_config: "ModelConfig | None") -> None:
         """Reject Engram configuration for models without n-gram embeddings."""
         from vllm.platforms import current_platform

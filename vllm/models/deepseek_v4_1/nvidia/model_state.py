@@ -54,7 +54,9 @@ class DeepseekV41ModelState(DefaultModelState):
 
     With mmap'd engram tables the step's hash ids are also computed here and
     their pages prefaulted before the forward runs, so the forward has no
-    host sync and can be captured in a CUDA graph. With
+    host sync and can be captured in a CUDA graph (``mmap_decode_async``
+    lets decode-only steps populate some or all tables in the background
+    instead of waiting). With
     ``mmap_prefetch_next_chunk`` the rows of the chunk each prefill continues
     with are hashed here too and populated in the background while this
     step runs.
@@ -96,6 +98,9 @@ class DeepseekV41ModelState(DefaultModelState):
             self.engram_prefault_targets
             and engram_config is not None
             and engram_config.mmap_prefetch_next_chunk
+        )
+        self.engram_decode_async = (
+            engram_config.mmap_decode_async if engram_config is not None else 0
         )
         self.max_num_batched_tokens = (
             vllm_config.scheduler_config.max_num_batched_tokens
@@ -143,7 +148,15 @@ class DeepseekV41ModelState(DefaultModelState):
             None,
             None,
         ).cpu()
-        for embed_tokens, layer_hash_index in self.engram_prefault_targets:
+        targets = self.engram_prefault_targets
+        num_waited = len(targets)
+        if self.engram_decode_async and not input_batch.has_prefill:
+            num_waited = 1 if self.engram_decode_async == 1 else 0
+        # The background tables go first so their reads overlap the waited
+        # ones; the targets are in layer order, the first is read first.
+        for embed_tokens, layer_hash_index in targets[num_waited:]:
+            embed_tokens.prefault(hashes[:, layer_hash_index], wait=False)
+        for embed_tokens, layer_hash_index in targets[:num_waited]:
             embed_tokens.prefault(hashes[:, layer_hash_index])
 
     def _prefetch_next_chunk(

@@ -74,7 +74,7 @@ ARGS=(
 )
 if [ "$ENGRAM_MMAP" = "1" ]; then
   PREFETCH=false; [ "${ENGRAM_PREFETCH:-0}" = "1" ] && PREFETCH=true
-  ARGS+=(--engram-config "{\"mmap\":true,\"mmap_prefault_threads\":$ENGRAM_THREADS,\"mmap_release_after_steps\":${ENGRAM_RELEASE:-3},\"mmap_prefetch_next_chunk\":$PREFETCH}")
+  ARGS+=(--engram-config "{\"mmap\":true,\"mmap_prefault_threads\":$ENGRAM_THREADS,\"mmap_release_after_steps\":${ENGRAM_RELEASE:-3},\"mmap_prefetch_next_chunk\":$PREFETCH,\"mmap_decode_async\":${ENGRAM_DECODE_ASYNC:-0},\"mmap_min_chunk_runs\":${ENGRAM_CHUNK_RUNS:-1}}")
 else
   ARGS+=(--engram-config '{"cpu_offload":false}')
 fi

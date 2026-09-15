@@ -679,6 +679,8 @@ class MmapEngramTable:
         num_threads: int,
         release_after_steps: int = 0,
         background: bool = False,
+        decode_async: bool = False,
+        min_chunk_runs: int = 1,
     ) -> None:
         index_path = os.path.join(model_dir, "model.safetensors.index.json")
         with open(index_path) as f:
@@ -728,6 +730,7 @@ class MmapEngramTable:
             )
         self.pool = ThreadPoolExecutor(num_threads, thread_name_prefix="engram-mmap")
         self.num_threads = num_threads
+        self.min_chunk_runs = max(1, min_chunk_runs)
         # Pages of the last `release_after_steps` prefaults, oldest first; a
         # prefault releases the pages that fall out of the ring unless a
         # newer step still needs them.
@@ -753,6 +756,22 @@ class MmapEngramTable:
         )
         self._pending: Future | None = None
         self._pending_prefetch: Future | None = None
+        # `decode_async`: `prefault(wait=False)` populates on this worker and
+        # returns at once; the lookup faults in place whatever is still cold.
+        # A release ring would race such a populate, so it needs no ring.
+        if decode_async and release_after_steps > 0:
+            logger.warning(
+                "engram mmap decode_async needs mmap_release_after_steps 0 "
+                "(got %d): decode prefaults stay synchronous",
+                release_after_steps,
+            )
+            decode_async = False
+        self._async_worker = (
+            ThreadPoolExecutor(1, thread_name_prefix="engram-async")
+            if decode_async
+            else None
+        )
+        self._pending_async: Future | None = None
         # Pages the last prefetch populated: the next prefault skips them.
         self._prefetched: np.ndarray | None = None
         self.last_sync_pages = 0
@@ -762,12 +781,33 @@ class MmapEngramTable:
         self.stats_pages = 0
         self.stats_released = 0
         self.stats_seconds = 0.0
+        # Decode-sized calls (under 2048 rows) on their own, with the time
+        # their background populates took off the step.
+        self.stats_decode_calls = 0
+        self.stats_decode_pages = 0
+        self.stats_decode_seconds = 0.0
+        self.stats_decode_async_seconds = 0.0
 
     def _record_stats(self, num_rows: int, num_pages: int, t0: float) -> None:
         self.stats_calls += 1
         self.stats_rows += num_rows
         self.stats_pages += num_pages
-        self.stats_seconds += time.perf_counter() - t0
+        seconds = time.perf_counter() - t0
+        self.stats_seconds += seconds
+        if num_rows < 2048:
+            self.stats_decode_calls += 1
+            self.stats_decode_pages += num_pages
+            self.stats_decode_seconds += seconds
+            if self.stats_decode_calls % 200 == 0:
+                logger.info(
+                    "engram mmap decode %s: %d prefaults, %.1f pages/call, "
+                    "%.2f ms/call on the step, %.2f ms/call in the background",
+                    os.path.basename(self.path),
+                    self.stats_decode_calls,
+                    self.stats_decode_pages / self.stats_decode_calls,
+                    1e3 * self.stats_decode_seconds / self.stats_decode_calls,
+                    1e3 * self.stats_decode_async_seconds / self.stats_decode_calls,
+                )
         if self.stats_calls % 200 == 0:
             logger.info(
                 "engram mmap %s: %d prefaults, %.1f rows/call, %.1f pages/call, "
@@ -808,7 +848,8 @@ class MmapEngramTable:
         if runs.shape[0] <= 64:
             work(runs)
         else:
-            splits = np.array_split(runs, min(self.num_threads * 4, runs.shape[0]))
+            chunks = -(-runs.shape[0] // self.min_chunk_runs)
+            splits = np.array_split(runs, min(self.num_threads * 4, chunks))
             list(self.pool.map(work, splits))
 
     def _populate(self, pages: np.ndarray) -> None:
@@ -829,12 +870,18 @@ class MmapEngramTable:
             self._pending.result()
             self._pending = None
 
+    def _drain_async(self) -> None:
+        if self._pending_async is not None:
+            self._pending_async.result()
+            self._pending_async = None
+
     def drain(self) -> None:
-        """Wait for the background release and prefetch to finish."""
+        """Wait for the background release, prefetch and decode populate."""
         self._drain_release()
         if self._pending_prefetch is not None:
             self._pending_prefetch.result()
             self._pending_prefetch = None
+        self._drain_async()
 
     def prefetch(self, rows: np.ndarray) -> None:
         """Populate the pages of `rows` (a later step's row ids, hashed
@@ -864,12 +911,36 @@ class MmapEngramTable:
 
         self._pending_prefetch = self._prefetch_worker.submit(job)
 
-    def prefault(self, rows: np.ndarray) -> None:
+    def _prefault_async(self, rows: np.ndarray) -> None:
+        """Populate the pages of `rows` on the async worker and return; the
+        lookup faults in place the pages still cold when it reaches them."""
+        t0 = time.perf_counter() if self.stats_enabled else 0.0
+        pages = self._pages_of(rows)
+        self._drain_async()
+
+        def job() -> None:
+            t_job = time.perf_counter()
+            self._populate(pages)
+            if self.stats_enabled:
+                self.stats_decode_async_seconds += time.perf_counter() - t_job
+
+        assert self._async_worker is not None
+        self._pending_async = self._async_worker.submit(job)
+        self.last_sync_pages = 0
+        if self.stats_enabled:
+            self._record_stats(rows.size, pages.size, t0)
+
+    def prefault(self, rows: np.ndarray, wait: bool = True) -> None:
         """Populate the page-table entries for `rows` (global row ids), so
         the GPU gather that follows finds every page resident. Then release
         the pages of the step that falls out of the ring (see
-        `release_after_steps`), in the background when there is one."""
+        `release_after_steps`), in the background when there is one.
+        With `wait=False` and a `decode_async` table the populate runs in
+        the background instead and this returns at once."""
         if rows.size == 0:
+            return
+        if not wait and self._async_worker is not None:
+            self._prefault_async(rows)
             return
         t0 = time.perf_counter() if self.stats_enabled else 0.0
         pages = self._pages_of(rows)
@@ -1093,14 +1164,15 @@ class ParallelEngramEmbedding(nn.Module):
         owned = (rows >= self.vocab_start_idx) & (rows < self.vocab_end_idx)
         return rows[owned]
 
-    def prefault(self, indices: torch.Tensor) -> None:
+    def prefault(self, indices: torch.Tensor, wait: bool = True) -> None:
         """mmap mode: map the pages of this rank's rows in `indices` before
         `lookup` reads them. A host sync (D2H of the ids); skipped while a
         CUDA graph is being captured, where the gather then faults in place.
+        `wait=False` populates in the background (see `MmapEngramTable`).
         """
         if self.mmap_table is None or torch.cuda.is_current_stream_capturing():
             return
-        self.mmap_table.prefault(self._local_rows(indices))
+        self.mmap_table.prefault(self._local_rows(indices), wait=wait)
 
     def prefetch(self, indices: torch.Tensor) -> None:
         """mmap mode: populate this rank's rows of a later step in the
@@ -1314,6 +1386,8 @@ class Engram(nn.Module):
                 engram_config.mmap_prefault_threads,
                 engram_config.mmap_release_after_steps,
                 background=engram_config.mmap_prefetch_next_chunk,
+                decode_async=engram_config.mmap_decode_async > 0,
+                min_chunk_runs=engram_config.mmap_min_chunk_runs,
             )
         self.embed_tokens = ParallelEngramEmbedding(
             layout.num_embeddings[layer_hash_index],
