@@ -1,0 +1,5 @@
+{"time": "2026-09-16 03:54:21", "start": "W1789498461", "model": "deepseek-v4.1-flash"}
+{"time": "2026-09-16 03:54:27", "request": "text-8k-greedy", "ok": true, "error": null, "ttft_s": 6.063, "elapsed_s": 6.181, "prompt_tokens": 11212, "completion_tokens": 2, "text": "12"}
+{"time": "2026-09-16 03:54:28", "request": "sampled-thinking", "ok": true, "error": null, "ttft_s": 0.351, "elapsed_s": 0.981, "prompt_tokens": 51, "completion_tokens": 32, "text": ""}
+{"time": "2026-09-16 03:54:29", "request": "image", "ok": true, "error": null, "ttft_s": 0.448, "elapsed_s": 0.529, "prompt_tokens": 206, "completion_tokens": 2, "text": "4"}
+{"time": "2026-09-16 03:54:29", "done": "W1789498461"}

@@ -1,0 +1,20 @@
+bash: warning: setlocale: LC_ALL: cannot change locale (en_US.UTF-8)
+2026-09-16T03:49:01+09:00
+gx10-37cc
+3d81648af247e874740c41d8c41b679fe522b2cd
+d9c18da5554fcfad75cd6b19cea8fa0645d44512
+fe96516fae30c4f81794c1349ec47ff1bb9136e7
+efa46ef241c6b2c458ea4c6ccbba4b14385998f0
+NRestarts=0
+Environment=
+ActiveState=active
+InvocationID=da00866214b944fca60a7219596ba6e0
+0 /home/nacyot/dsv41-prep/dsv41-override.env
+active
+1989 MHz, Enabled
+MemAvailable 7.539715 GiB
+6a4261f2271c79674c7c60b4819a8a5bbab07bd2408aa15def38c7203ff16bd3  deploy/gb10-cluster/dsv41/dsv41_ctl.sh
+bf773de643f20b5dee7d6c03dde79fb57ab836a7d41ba60c63bd6efc6d33102c  deploy/gb10-cluster/dsv41/dsv41_unit.sh
+0aafde1ab992b85b80f4c124f4eae743210cbe5df9573ed4c45a161d3e2c8149  deploy/gb10-cluster/dsv41/dsv41_lib.sh
+164cc0bde0874a9a621178393ddc515bc15ee2fd820baefaf4b0989308093fef  deploy/gb10-cluster/dsv41/dsv41.env
+16124a87bdb064a82c525badbd4496b95b5405a8c2cf42f538775550da5bd8cc  deploy/gb10-cluster/dsv41/serve-node.sh

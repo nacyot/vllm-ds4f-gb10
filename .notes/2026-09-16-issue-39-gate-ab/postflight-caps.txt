@@ -1,0 +1,5 @@
+HOST         SERVICE      PERSISTENCE  MAX_SM_MHZ
+gx10-6040    active       Enabled      1989
+gx10-f323    active       Enabled      1995
+gx10-37cc    active       Enabled      1989
+gx10-27c4    active       Enabled      1995

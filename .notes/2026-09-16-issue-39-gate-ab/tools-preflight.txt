@@ -1,0 +1,30 @@
+2026-09-16T03:49:19+09:00
+4c7304370760949db4cbd899abd5c196e5fbd027dc2490b90693dbe5c61af3bb  casebench.py
+d75e64b59164da574819a6de176f6644e345a4b634668c4f05ece71287ef58ad  decodebench.py
+ac51b3d4361e56b7709425239e796d69e638c49049de27afc2215c0402055eca  report_tables.py
+   203 results/casebench.jsonl
+   170 results/decode.jsonl
+   373 total
+health 200
+vllm:num_requests_running{engine="0",model_name="deepseek-v4.1-flash"} 0.0
+vllm:num_requests_waiting{engine="0",model_name="deepseek-v4.1-flash"} 0.0
+vllm:num_requests_waiting_by_reason{engine="0",model_name="deepseek-v4.1-flash",reason="capacity"} 0.0
+vllm:num_requests_waiting_by_reason{engine="0",model_name="deepseek-v4.1-flash",reason="deferred"} 0.0
+(APIServer pid=3451) INFO:     127.0.0.1:56674 - "POST /v1/chat/completions HTTP/1.1" 200 OK
+(APIServer pid=3451) INFO:     127.0.0.1:55404 - "POST /v1/chat/completions HTTP/1.1" 200 OK
+(APIServer pid=3451) INFO:     127.0.0.1:55414 - "POST /v1/chat/completions HTTP/1.1" 200 OK
+(APIServer pid=3451) INFO:     127.0.0.1:51562 - "POST /v1/chat/completions HTTP/1.1" 200 OK
+(APIServer pid=3451) INFO:     127.0.0.1:44248 - "POST /v1/chat/completions HTTP/1.1" 200 OK
+(APIServer pid=3451) INFO:     127.0.0.1:44258 - "POST /v1/chat/completions HTTP/1.1" 200 OK
+(APIServer pid=3451) INFO:     127.0.0.1:41836 - "POST /v1/chat/completions HTTP/1.1" 200 OK
+(APIServer pid=3451) INFO:     127.0.0.1:36342 - "POST /v1/chat/completions HTTP/1.1" 200 OK
+(APIServer pid=3451) INFO:     127.0.0.1:34234 - "POST /v1/chat/completions HTTP/1.1" 200 OK
+(APIServer pid=3451) INFO:     127.0.0.1:54820 - "POST /v1/chat/completions HTTP/1.1" 200 OK
+active
+NEXT                         LEFT LAST                              PASSED UNIT                           ACTIVATES
+Wed 2026-09-16 03:49:58 KST   39s Wed 2026-09-16 03:48:58 KST      20s ago dsv41-watchdog.timer           dsv41-watchdog.service
+Wed 2026-09-16 03:49:58 KST   39s Wed 2026-09-16 03:48:58 KST      20s ago uvm-stall-sentinel.timer       uvm-stall-sentinel.service
+Wed 2026-09-16 04:01:18 KST 11min Wed 2026-09-16 03:31:18 KST    18min ago kvfs-gc.timer                  kvfs-gc.service
+Thu 2026-09-17 00:54:16 KST   21h Wed 2026-09-16 00:54:16 KST 2h 55min ago launchpadlib-cache-clean.timer launchpadlib-cache-clean.service
+
+4 timers listed.

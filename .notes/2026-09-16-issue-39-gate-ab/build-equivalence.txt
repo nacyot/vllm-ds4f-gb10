@@ -1,0 +1,37 @@
+commit 0552479e2e0903ec7ede180285bbacd945a38b37
+Author:     Daegwon Nacyot Kim <propellerheaven@gmail.com>
+AuthorDate: Sat Sep 12 22:06:49 2026 +0900
+Commit:     Daegwon Nacyot Kim <propellerheaven@gmail.com>
+CommitDate: Sat Sep 12 22:06:49 2026 +0900
+
+    kv_offload: fix @override placement on state_epoch and has_pending_work
+    
+    The state_epoch insertion left has_pending_work without @override and
+    gave state_epoch a duplicate. Runtime behavior is unchanged.
+    
+    Co-Authored-By: Claude Opus 4.8 <noreply@anthropic.com>
+    Claude-Session: https://claude.ai/code/session_013iZNJfJNorvkix96X5G4nk
+    
+    Signed-off-by: Daegwon Nacyot Kim <propellerheaven@gmail.com>
+
+diff --git a/vllm/v1/kv_offload/tiering/manager.py b/vllm/v1/kv_offload/tiering/manager.py
+index 015ebeb07b..7410f68c87 100644
+--- a/vllm/v1/kv_offload/tiering/manager.py
++++ b/vllm/v1/kv_offload/tiering/manager.py
+@@ -847,13 +847,13 @@ class TieringOffloadingManager(OffloadingManager):
+                 continue
+             self._metrics.on_request_allocated(state.req_context)
+ 
+-    @override
+     @property
+     @override
+     def state_epoch(self) -> int:
+         # Secondary-tier changes surface as RETRY, which never shortcuts.
+         return self.primary_tier.state_epoch
+ 
++    @override
+     def has_pending_work(self) -> bool:
+         # In-flight primary<->secondary transfers (pending promotions are
+         # translated to transfer jobs in on_schedule_end), plus any work the
+00c09ca108ba35608b0204a20695aba3d4124fbb38cc6e7b2ebdd0e9a580a9be  -
+00c09ca108ba35608b0204a20695aba3d4124fbb38cc6e7b2ebdd0e9a580a9be  -

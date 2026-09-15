@@ -214,6 +214,7 @@ cython_debug/
 
 !.notes/2026-09-16-issue-10-kvfs-verify/
 !.notes/2026-09-16-issue-46-final-baseline/
+!.notes/2026-09-16-issue-39-gate-ab/
 
 # Results
 *.csv

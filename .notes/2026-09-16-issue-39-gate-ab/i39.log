@@ -1,0 +1,244 @@
+CELL_START 2026-09-16T03:54:53+09:00 i39-off warm
+MEM_BEFORE 4.941425 GiB
+{"tag": "i39-off-warm", "mode": "solo", "config": "i39-off", "ts": "2026-09-16T03:54:53", "prefills": [{"prompt_tokens": 15981, "wall_s": 8.6, "tok_per_s": 1858.8, "t0": 1789498493.3258975, "t1": 1789498501.9231791}], "aggregate": {"total_tokens": 15981, "span_s": 8.6, "tok_per_s": 1858.8}, "head_mem": {"start_gib": 4.93, "min_gib": 4.91, "end_gib": 4.91}}
+MEM_AFTER 4.913551 GiB
+NEW_ROWS case=1 decode=0
+CHECK health=200 attention=absent
+CELL_END 2026-09-16T03:55:01+09:00 i39-off warm rc=0
+CELL_START 2026-09-16T03:55:21+09:00 i39-off warm2
+MEM_BEFORE 4.905075 GiB
+{"tag": "i39-off-warm2", "mode": "mixed", "config": "i39-off", "ts": "2026-09-16T03:55:22", "prefills": [{"prompt_tokens": 6018, "wall_s": 3.89, "tok_per_s": 1547.3, "t0": 1789498530.4307642, "t1": 1789498534.3200002}], "aggregate": {"total_tokens": 6018, "span_s": 3.89, "tok_per_s": 1547.3}, "decode_before": {"lanes": 2, "sum_tok_per_s": 38.0, "mean_gap_s": 0.107, "worst_max_gap_s": 0.13}, "decode_before_lanes": [{"chunks": 56, "tok_per_s": 21.67, "mean_gap_s": 0.107, "p90_gap_s": 0.122, "max_gap_s": 0.13}, {"chunks": 56, "tok_per_s": 16.33, "mean_gap_s": 0.107, "p90_gap_s": 0.122, "max_gap_s": 0.13}], "decode_during": {"lanes": 2, "sum_tok_per_s": 4.88, "mean_gap_s": 0.953, "worst_max_gap_s": 2.533}, "decode_during_lanes": [{"chunks": 5, "tok_per_s": 2.31, "mean_gap_s": 0.953, "p90_gap_s": 2.533, "max_gap_s": 2.533}, {"chunks": 5, "tok_per_s": 2.57, "mean_gap_s": 0.953, "p90_gap_s": 2.533, "max_gap_s": 2.533}], "head_mem": {"start_gib": 4.9, "min_gib": 4.89, "end_gib": 4.89}}
+MEM_AFTER 4.907478 GiB
+NEW_ROWS case=1 decode=0
+CHECK health=200 attention=absent
+CELL_END 2026-09-16T03:55:37+09:00 i39-off warm2 rc=0
+CELL_START 2026-09-16T03:55:48+09:00 i39-off S128r1
+MEM_BEFORE 4.903019 GiB
+{"tag": "i39-off-S128r1", "mode": "solo", "config": "i39-off", "ts": "2026-09-16T03:55:48", "prefills": [{"prompt_tokens": 127996, "wall_s": 83.87, "tok_per_s": 1526.1, "t0": 1789498548.2630377, "t1": 1789498632.1356537}], "aggregate": {"total_tokens": 127996, "span_s": 83.87, "tok_per_s": 1526.1}, "head_mem": {"start_gib": 4.9, "min_gib": 3.51, "end_gib": 3.81}}
+MEM_AFTER 5.934792 GiB
+NEW_ROWS case=1 decode=0
+CHECK health=200 attention=absent
+CELL_END 2026-09-16T03:57:12+09:00 i39-off S128r1 rc=0
+CELL_START 2026-09-16T03:57:30+09:00 i39-off S128r2
+MEM_BEFORE 5.928234 GiB
+{"tag": "i39-off-S128r2", "mode": "solo", "config": "i39-off", "ts": "2026-09-16T03:57:30", "prefills": [{"prompt_tokens": 127727, "wall_s": 91.69, "tok_per_s": 1393.0, "t0": 1789498650.2896159, "t1": 1789498741.9837868}], "aggregate": {"total_tokens": 127727, "span_s": 91.69, "tok_per_s": 1393.0}, "head_mem": {"start_gib": 5.92, "min_gib": 3.6, "end_gib": 4.8}}
+MEM_AFTER 4.817924 GiB
+NEW_ROWS case=1 decode=0
+CHECK health=200 attention=absent
+CELL_END 2026-09-16T03:59:02+09:00 i39-off S128r2 rc=0
+CELL_START 2026-09-16T03:59:17+09:00 i39-off S128r3
+MEM_BEFORE 4.788780 GiB
+{"tag": "i39-off-S128r3", "mode": "solo", "config": "i39-off", "ts": "2026-09-16T03:59:17", "prefills": [{"prompt_tokens": 128037, "wall_s": 90.04, "tok_per_s": 1422.0, "t0": 1789498757.5500894, "t1": 1789498847.5917764}], "aggregate": {"total_tokens": 128037, "span_s": 90.04, "tok_per_s": 1422.0}, "head_mem": {"start_gib": 4.78, "min_gib": 3.74, "end_gib": 4.83}}
+MEM_AFTER 7.029034 GiB
+NEW_ROWS case=1 decode=0
+CHECK health=200 attention=absent
+CELL_END 2026-09-16T04:00:47+09:00 i39-off S128r3 rc=0
+CELL_START 2026-09-16T04:01:09+09:00 i39-off S32
+MEM_BEFORE 7.014397 GiB
+{"tag": "i39-off-S32", "mode": "solo", "config": "i39-off", "ts": "2026-09-16T04:01:09", "prefills": [{"prompt_tokens": 31898, "wall_s": 17.3, "tok_per_s": 1844.2, "t0": 1789498869.739118, "t1": 1789498887.0357962}], "aggregate": {"total_tokens": 31898, "span_s": 17.3, "tok_per_s": 1844.2}, "head_mem": {"start_gib": 7.0, "min_gib": 5.78, "end_gib": 5.78}}
+MEM_AFTER 5.793034 GiB
+NEW_ROWS case=1 decode=0
+CHECK health=200 attention=absent
+CELL_END 2026-09-16T04:01:27+09:00 i39-off S32 rc=0
+CELL_START 2026-09-16T04:01:58+09:00 i39-off decode
+MEM_BEFORE 5.783077 GiB
+{"tag": "i39-off", "type": "prose", "ts": "2026-09-16T04:02:02", "c": 1, "gen": 256, "streams_ok": 1, "errors": [], "per_stream_1": 44.2, "per_stream_1_min": 44.2, "window_agg_3": 44.2, "wall_agg_4": 42.31, "ttft_mean_s": 0.281, "ttft_median_s": 0.281, "tokens_per_chunk": 3.08, "completion_tokens": [256], "prompt_tokens": 32}
+{"tag": "i39-off", "type": "prose", "ts": "2026-09-16T04:02:11", "c": 2, "gen": 256, "streams_ok": 2, "errors": [], "per_stream_1": 33.24, "per_stream_1_min": 32.12, "window_agg_3": 64.24, "wall_agg_4": 62.25, "ttft_mean_s": 0.285, "ttft_median_s": 0.285, "tokens_per_chunk": 3.03, "completion_tokens": [256, 256], "prompt_tokens": 32}
+{"tag": "i39-off", "type": "prose", "ts": "2026-09-16T04:02:22", "c": 4, "gen": 256, "streams_ok": 4, "errors": [], "per_stream_1": 24.08, "per_stream_1_min": 23.45, "window_agg_3": 91.58, "wall_agg_4": 89.7, "ttft_mean_s": 0.619, "ttft_median_s": 0.686, "tokens_per_chunk": 3.08, "completion_tokens": [256, 256, 256, 256], "prompt_tokens": 32}
+{"tag": "i39-off", "type": "code", "ts": "2026-09-16T04:02:41", "c": 1, "gen": 256, "streams_ok": 1, "errors": [], "per_stream_1": 81.93, "per_stream_1_min": 81.93, "window_agg_3": 81.93, "wall_agg_4": 74.85, "ttft_mean_s": 0.308, "ttft_median_s": 0.308, "tokens_per_chunk": 5.82, "completion_tokens": [256], "prompt_tokens": 101}
+{"tag": "i39-off", "type": "code", "ts": "2026-09-16T04:02:47", "c": 2, "gen": 256, "streams_ok": 2, "errors": [], "per_stream_1": 61.31, "per_stream_1_min": 59.75, "window_agg_3": 115.0, "wall_agg_4": 108.0, "ttft_mean_s": 0.496, "ttft_median_s": 0.496, "tokens_per_chunk": 5.82, "completion_tokens": [256, 256], "prompt_tokens": 101}
+{"tag": "i39-off", "type": "code", "ts": "2026-09-16T04:02:55", "c": 4, "gen": 256, "streams_ok": 4, "errors": [], "per_stream_1": 50.35, "per_stream_1_min": 48.77, "window_agg_3": 187.56, "wall_agg_4": 178.35, "ttft_mean_s": 0.622, "ttft_median_s": 0.728, "tokens_per_chunk": 5.82, "completion_tokens": [256, 256, 256, 256], "prompt_tokens": 101}
+MEM_AFTER 6.591660 GiB
+NEW_ROWS case=0 decode=6
+CHECK health=200 attention=absent
+CELL_END 2026-09-16T04:03:04+09:00 i39-off decode rc=0
+CELL_START 2026-09-16T04:03:15+09:00 i39-off S128r4
+MEM_BEFORE 6.834591 GiB
+{"tag": "i39-off-S128r4", "mode": "solo", "config": "i39-off", "ts": "2026-09-16T04:03:15", "prefills": [{"prompt_tokens": 127999, "wall_s": 77.54, "tok_per_s": 1650.7, "t0": 1789498995.8205059, "t1": 1789499073.360836}], "aggregate": {"total_tokens": 127999, "span_s": 77.54, "tok_per_s": 1650.7}, "head_mem": {"start_gib": 6.79, "min_gib": 6.7, "end_gib": 7.31}}
+MEM_AFTER 9.426254 GiB
+NEW_ROWS case=1 decode=0
+CHECK health=200 attention=absent
+CELL_END 2026-09-16T04:04:33+09:00 i39-off S128r4 rc=0
+CELL_START 2026-09-16T04:08:32+09:00 i39-pf warm
+MEM_BEFORE 4.165451 GiB
+{"tag": "i39-pf-warm", "mode": "solo", "config": "i39-pf", "ts": "2026-09-16T04:08:32", "prefills": [{"prompt_tokens": 16130, "wall_s": 8.66, "tok_per_s": 1862.7, "t0": 1789499312.3913574, "t1": 1789499321.050741}], "aggregate": {"total_tokens": 16130, "span_s": 8.66, "tok_per_s": 1862.7}, "head_mem": {"start_gib": 3.96, "min_gib": 3.92, "end_gib": 4.78}}
+MEM_AFTER 4.785885 GiB
+NEW_ROWS case=1 decode=0
+CHECK health=200 attention=absent
+CELL_END 2026-09-16T04:08:41+09:00 i39-pf warm rc=0
+CELL_START 2026-09-16T04:08:48+09:00 i39-pf warm2
+MEM_BEFORE 4.738930 GiB
+{"tag": "i39-pf-warm2", "mode": "mixed", "config": "i39-pf", "ts": "2026-09-16T04:08:48", "prefills": [{"prompt_tokens": 5995, "wall_s": 3.84, "tok_per_s": 1562.7, "t0": 1789499336.9846935, "t1": 1789499340.8209794}], "aggregate": {"total_tokens": 5995, "span_s": 3.84, "tok_per_s": 1562.7}, "decode_before": {"lanes": 2, "sum_tok_per_s": 42.0, "mean_gap_s": 0.107, "worst_max_gap_s": 0.149}, "decode_before_lanes": [{"chunks": 57, "tok_per_s": 22.83, "mean_gap_s": 0.107, "p90_gap_s": 0.123, "max_gap_s": 0.148}, {"chunks": 57, "tok_per_s": 19.17, "mean_gap_s": 0.107, "p90_gap_s": 0.123, "max_gap_s": 0.149}], "decode_during": {"lanes": 2, "sum_tok_per_s": 6.0, "mean_gap_s": 0.937, "worst_max_gap_s": 2.523}, "decode_during_lanes": [{"chunks": 5, "tok_per_s": 3.39, "mean_gap_s": 0.937, "p90_gap_s": 2.523, "max_gap_s": 2.523}, {"chunks": 5, "tok_per_s": 2.61, "mean_gap_s": 0.937, "p90_gap_s": 2.523, "max_gap_s": 2.523}], "head_mem": {"start_gib": 4.84, "min_gib": 4.48, "end_gib": 4.7}}
+MEM_AFTER 4.699314 GiB
+NEW_ROWS case=1 decode=0
+CHECK health=200 attention=absent
+CELL_END 2026-09-16T04:09:03+09:00 i39-pf warm2 rc=0
+CELL_START 2026-09-16T04:09:15+09:00 i39-pf S128r1
+MEM_BEFORE 4.773556 GiB
+{"tag": "i39-pf-S128r1", "mode": "solo", "config": "i39-pf", "ts": "2026-09-16T04:09:16", "prefills": [{"prompt_tokens": 127930, "wall_s": 80.65, "tok_per_s": 1586.2, "t0": 1789499356.0348558, "t1": 1789499436.687578}], "aggregate": {"total_tokens": 127930, "span_s": 80.65, "tok_per_s": 1586.2}, "head_mem": {"start_gib": 4.77, "min_gib": 3.9, "end_gib": 5.76}}
+MEM_AFTER 7.928600 GiB
+NEW_ROWS case=1 decode=0
+CHECK health=200 attention=absent
+CELL_END 2026-09-16T04:10:36+09:00 i39-pf S128r1 rc=0
+CELL_START 2026-09-16T04:11:00+09:00 i39-pf S128r2
+MEM_BEFORE 8.040688 GiB
+{"tag": "i39-pf-S128r2", "mode": "solo", "config": "i39-pf", "ts": "2026-09-16T04:11:00", "prefills": [{"prompt_tokens": 128001, "wall_s": 92.36, "tok_per_s": 1385.9, "t0": 1789499460.9417589, "t1": 1789499553.3026657}], "aggregate": {"total_tokens": 128001, "span_s": 92.36, "tok_per_s": 1385.9}, "head_mem": {"start_gib": 8.03, "min_gib": 6.03, "end_gib": 6.75}}
+MEM_AFTER 8.847988 GiB
+NEW_ROWS case=1 decode=0
+CHECK health=200 attention=absent
+CELL_END 2026-09-16T04:12:33+09:00 i39-pf S128r2 rc=0
+CELL_START 2026-09-16T04:12:42+09:00 i39-pf S128r3
+MEM_BEFORE 8.815426 GiB
+{"tag": "i39-pf-S128r3", "mode": "solo", "config": "i39-pf", "ts": "2026-09-16T04:12:42", "prefills": [{"prompt_tokens": 128038, "wall_s": 87.59, "tok_per_s": 1461.7, "t0": 1789499562.7650273, "t1": 1789499650.3588464}], "aggregate": {"total_tokens": 128038, "span_s": 87.59, "tok_per_s": 1461.7}, "head_mem": {"start_gib": 8.8, "min_gib": 6.19, "end_gib": 8.76}}
+MEM_AFTER 8.759304 GiB
+NEW_ROWS case=1 decode=0
+CHECK health=200 attention=absent
+CELL_END 2026-09-16T04:14:10+09:00 i39-pf S128r3 rc=0
+CELL_START 2026-09-16T04:14:18+09:00 i39-pf S32
+MEM_BEFORE 8.745300 GiB
+{"tag": "i39-pf-S32", "mode": "solo", "config": "i39-pf", "ts": "2026-09-16T04:14:18", "prefills": [{"prompt_tokens": 32025, "wall_s": 17.16, "tok_per_s": 1866.2, "t0": 1789499658.2513487, "t1": 1789499675.412051}], "aggregate": {"total_tokens": 32025, "span_s": 17.16, "tok_per_s": 1866.2}, "head_mem": {"start_gib": 8.73, "min_gib": 6.94, "end_gib": 7.29}}
+MEM_AFTER 7.292835 GiB
+NEW_ROWS case=1 decode=0
+CHECK health=200 attention=absent
+CELL_END 2026-09-16T04:14:35+09:00 i39-pf S32 rc=0
+CELL_START 2026-09-16T04:14:46+09:00 i39-pf decode
+MEM_BEFORE 7.322487 GiB
+{"tag": "i39-pf", "type": "prose", "ts": "2026-09-16T04:14:49", "c": 1, "gen": 256, "streams_ok": 1, "errors": [], "per_stream_1": 44.65, "per_stream_1_min": 44.65, "window_agg_3": 44.65, "wall_agg_4": 42.85, "ttft_mean_s": 0.263, "ttft_median_s": 0.263, "tokens_per_chunk": 2.98, "completion_tokens": [256], "prompt_tokens": 32}
+{"tag": "i39-pf", "type": "prose", "ts": "2026-09-16T04:14:58", "c": 2, "gen": 256, "streams_ok": 2, "errors": [], "per_stream_1": 33.8, "per_stream_1_min": 33.45, "window_agg_3": 64.23, "wall_agg_4": 62.54, "ttft_mean_s": 0.405, "ttft_median_s": 0.405, "tokens_per_chunk": 3.07, "completion_tokens": [256, 256], "prompt_tokens": 32}
+{"tag": "i39-pf", "type": "prose", "ts": "2026-09-16T04:15:10", "c": 4, "gen": 256, "streams_ok": 4, "errors": [], "per_stream_1": 25.45, "per_stream_1_min": 23.99, "window_agg_3": 92.94, "wall_agg_4": 91.17, "ttft_mean_s": 0.517, "ttft_median_s": 0.604, "tokens_per_chunk": 3.11, "completion_tokens": [256, 256, 256, 256], "prompt_tokens": 32}
+{"tag": "i39-pf", "type": "code", "ts": "2026-09-16T04:15:28", "c": 1, "gen": 256, "streams_ok": 1, "errors": [], "per_stream_1": 86.19, "per_stream_1_min": 86.19, "window_agg_3": 86.19, "wall_agg_4": 78.58, "ttft_mean_s": 0.299, "ttft_median_s": 0.299, "tokens_per_chunk": 5.82, "completion_tokens": [256], "prompt_tokens": 101}
+{"tag": "i39-pf", "type": "code", "ts": "2026-09-16T04:15:34", "c": 2, "gen": 256, "streams_ok": 2, "errors": [], "per_stream_1": 61.96, "per_stream_1_min": 60.28, "window_agg_3": 116.27, "wall_agg_4": 108.89, "ttft_mean_s": 0.506, "ttft_median_s": 0.506, "tokens_per_chunk": 5.82, "completion_tokens": [256, 256], "prompt_tokens": 101}
+{"tag": "i39-pf", "type": "code", "ts": "2026-09-16T04:15:42", "c": 4, "gen": 256, "streams_ok": 4, "errors": [], "per_stream_1": 48.17, "per_stream_1_min": 46.01, "window_agg_3": 177.17, "wall_agg_4": 168.83, "ttft_mean_s": 0.687, "ttft_median_s": 0.757, "tokens_per_chunk": 5.82, "completion_tokens": [256, 256, 256, 256], "prompt_tokens": 101}
+MEM_AFTER 7.168015 GiB
+NEW_ROWS case=0 decode=6
+CHECK health=200 attention=absent
+CELL_END 2026-09-16T04:15:51+09:00 i39-pf decode rc=0
+CELL_START 2026-09-16T04:16:00+09:00 i39-pf S128r4
+MEM_BEFORE 7.175995 GiB
+{"tag": "i39-pf-S128r4", "mode": "solo", "config": "i39-pf", "ts": "2026-09-16T04:16:00", "prefills": [{"prompt_tokens": 127900, "wall_s": 76.57, "tok_per_s": 1670.5, "t0": 1789499760.8537338, "t1": 1789499837.419622}], "aggregate": {"total_tokens": 127900, "span_s": 76.57, "tok_per_s": 1670.5}, "head_mem": {"start_gib": 7.17, "min_gib": 6.05, "end_gib": 8.73}}
+MEM_AFTER 8.726219 GiB
+NEW_ROWS case=1 decode=0
+CHECK health=200 attention=absent
+CELL_END 2026-09-16T04:17:17+09:00 i39-pf S128r4 rc=0
+CELL_START 2026-09-16T04:21:13+09:00 i39-split warm
+MEM_BEFORE 4.779938 GiB
+{"tag": "i39-split-warm", "mode": "solo", "config": "i39-split", "ts": "2026-09-16T04:21:13", "prefills": [{"prompt_tokens": 16009, "wall_s": 8.54, "tok_per_s": 1873.9, "t0": 1789500073.7018628, "t1": 1789500082.2449825}], "aggregate": {"total_tokens": 16009, "span_s": 8.54, "tok_per_s": 1873.9}, "head_mem": {"start_gib": 4.77, "min_gib": 4.33, "end_gib": 4.33}}
+MEM_AFTER 4.324280 GiB
+NEW_ROWS case=1 decode=0
+CHECK health=200 attention=absent
+CELL_END 2026-09-16T04:21:22+09:00 i39-split warm rc=0
+CELL_START 2026-09-16T04:21:31+09:00 i39-split warm2
+MEM_BEFORE 4.315716 GiB
+{"tag": "i39-split-warm2", "mode": "mixed", "config": "i39-split", "ts": "2026-09-16T04:21:31", "prefills": [{"prompt_tokens": 6048, "wall_s": 3.8, "tok_per_s": 1590.1, "t0": 1789500099.8748715, "t1": 1789500103.6784883}], "aggregate": {"total_tokens": 6048, "span_s": 3.8, "tok_per_s": 1590.1}, "decode_before": {"lanes": 2, "sum_tok_per_s": 37.83, "mean_gap_s": 0.11, "worst_max_gap_s": 0.151}, "decode_before_lanes": [{"chunks": 55, "tok_per_s": 18.0, "mean_gap_s": 0.11, "p90_gap_s": 0.122, "max_gap_s": 0.151}, {"chunks": 55, "tok_per_s": 19.83, "mean_gap_s": 0.11, "p90_gap_s": 0.122, "max_gap_s": 0.151}], "decode_during": {"lanes": 2, "sum_tok_per_s": 7.89, "mean_gap_s": 0.934, "worst_max_gap_s": 2.51}, "decode_during_lanes": [{"chunks": 5, "tok_per_s": 4.21, "mean_gap_s": 0.934, "p90_gap_s": 2.51, "max_gap_s": 2.51}, {"chunks": 5, "tok_per_s": 3.68, "mean_gap_s": 0.934, "p90_gap_s": 2.51, "max_gap_s": 2.51}], "head_mem": {"start_gib": 4.3, "min_gib": 4.11, "end_gib": 4.12}}
+MEM_AFTER 4.116188 GiB
+NEW_ROWS case=1 decode=0
+CHECK health=200 attention=absent
+CELL_END 2026-09-16T04:21:46+09:00 i39-split warm2 rc=0
+CELL_START 2026-09-16T04:21:56+09:00 i39-split S128r1
+MEM_BEFORE 4.129627 GiB
+{"tag": "i39-split-S128r1", "mode": "solo", "config": "i39-split", "ts": "2026-09-16T04:21:56", "prefills": [{"prompt_tokens": 128059, "wall_s": 76.57, "tok_per_s": 1672.3, "t0": 1789500116.3015766, "t1": 1789500192.8763468}], "aggregate": {"total_tokens": 128059, "span_s": 76.57, "tok_per_s": 1672.3}, "head_mem": {"start_gib": 4.12, "min_gib": 3.99, "end_gib": 5.05}}
+MEM_AFTER 5.052647 GiB
+NEW_ROWS case=1 decode=0
+CHECK health=200 attention=absent
+CELL_END 2026-09-16T04:23:12+09:00 i39-split S128r1 rc=0
+CELL_START 2026-09-16T04:23:21+09:00 i39-split S128r2
+MEM_BEFORE 5.019318 GiB
+{"tag": "i39-split-S128r2", "mode": "solo", "config": "i39-split", "ts": "2026-09-16T04:23:21", "prefills": [{"prompt_tokens": 128302, "wall_s": 79.89, "tok_per_s": 1605.9, "t0": 1789500201.43084, "t1": 1789500281.3237805}], "aggregate": {"total_tokens": 128302, "span_s": 79.89, "tok_per_s": 1605.9}, "head_mem": {"start_gib": 5.01, "min_gib": 4.02, "end_gib": 4.97}}
+MEM_AFTER 6.126816 GiB
+NEW_ROWS case=1 decode=0
+CHECK health=200 attention=absent
+CELL_END 2026-09-16T04:24:41+09:00 i39-split S128r2 rc=0
+CELL_START 2026-09-16T04:24:48+09:00 i39-split S128r3
+MEM_BEFORE 6.115410 GiB
+{"tag": "i39-split-S128r3", "mode": "solo", "config": "i39-split", "ts": "2026-09-16T04:24:48", "prefills": [{"prompt_tokens": 127996, "wall_s": 69.57, "tok_per_s": 1839.9, "t0": 1789500288.4522812, "t1": 1789500358.0190196}], "aggregate": {"total_tokens": 127996, "span_s": 69.57, "tok_per_s": 1839.9}, "head_mem": {"start_gib": 6.1, "min_gib": 4.95, "end_gib": 6.99}}
+MEM_AFTER 6.998337 GiB
+NEW_ROWS case=1 decode=0
+CHECK health=200 attention=absent
+CELL_END 2026-09-16T04:25:58+09:00 i39-split S128r3 rc=0
+CELL_START 2026-09-16T04:26:04+09:00 i39-split S32
+MEM_BEFORE 6.995300 GiB
+{"tag": "i39-split-S32", "mode": "solo", "config": "i39-split", "ts": "2026-09-16T04:26:04", "prefills": [{"prompt_tokens": 31952, "wall_s": 17.85, "tok_per_s": 1790.4, "t0": 1789500364.6435688, "t1": 1789500382.489473}], "aggregate": {"total_tokens": 31952, "span_s": 17.85, "tok_per_s": 1790.4}, "head_mem": {"start_gib": 6.98, "min_gib": 6.0, "end_gib": 6.36}}
+MEM_AFTER 6.368919 GiB
+NEW_ROWS case=1 decode=0
+CHECK health=200 attention=absent
+CELL_END 2026-09-16T04:26:22+09:00 i39-split S32 rc=0
+CELL_START 2026-09-16T04:26:30+09:00 i39-split decode
+MEM_BEFORE 6.353123 GiB
+{"tag": "i39-split", "type": "prose", "ts": "2026-09-16T04:26:34", "c": 1, "gen": 256, "streams_ok": 1, "errors": [], "per_stream_1": 44.22, "per_stream_1_min": 44.22, "window_agg_3": 44.22, "wall_agg_4": 42.52, "ttft_mean_s": 0.254, "ttft_median_s": 0.254, "tokens_per_chunk": 3.05, "completion_tokens": [256], "prompt_tokens": 32}
+{"tag": "i39-split", "type": "prose", "ts": "2026-09-16T04:26:43", "c": 2, "gen": 256, "streams_ok": 2, "errors": [], "per_stream_1": 30.24, "per_stream_1_min": 29.78, "window_agg_3": 58.95, "wall_agg_4": 57.47, "ttft_mean_s": 0.43, "ttft_median_s": 0.43, "tokens_per_chunk": 2.86, "completion_tokens": [256, 256], "prompt_tokens": 32}
+{"tag": "i39-split", "type": "prose", "ts": "2026-09-16T04:26:55", "c": 4, "gen": 256, "streams_ok": 4, "errors": [], "per_stream_1": 23.04, "per_stream_1_min": 21.78, "window_agg_3": 87.11, "wall_agg_4": 84.23, "ttft_mean_s": 0.586, "ttft_median_s": 0.586, "tokens_per_chunk": 2.88, "completion_tokens": [256, 256, 256, 256], "prompt_tokens": 32}
+{"tag": "i39-split", "type": "code", "ts": "2026-09-16T04:27:14", "c": 1, "gen": 256, "streams_ok": 1, "errors": [], "per_stream_1": 84.21, "per_stream_1_min": 84.21, "window_agg_3": 84.21, "wall_agg_4": 76.18, "ttft_mean_s": 0.332, "ttft_median_s": 0.332, "tokens_per_chunk": 5.82, "completion_tokens": [256], "prompt_tokens": 101}
+{"tag": "i39-split", "type": "code", "ts": "2026-09-16T04:27:20", "c": 2, "gen": 256, "streams_ok": 2, "errors": [], "per_stream_1": 58.42, "per_stream_1_min": 54.89, "window_agg_3": 106.14, "wall_agg_4": 100.13, "ttft_mean_s": 0.653, "ttft_median_s": 0.653, "tokens_per_chunk": 5.82, "completion_tokens": [256, 256], "prompt_tokens": 101}
+{"tag": "i39-split", "type": "code", "ts": "2026-09-16T04:27:28", "c": 4, "gen": 256, "streams_ok": 4, "errors": [], "per_stream_1": 50.69, "per_stream_1_min": 49.16, "window_agg_3": 189.04, "wall_agg_4": 178.91, "ttft_mean_s": 0.639, "ttft_median_s": 0.743, "tokens_per_chunk": 5.82, "completion_tokens": [256, 256, 256, 256], "prompt_tokens": 101}
+MEM_AFTER 6.764725 GiB
+NEW_ROWS case=0 decode=6
+CHECK health=200 attention=absent
+CELL_END 2026-09-16T04:27:37+09:00 i39-split decode rc=0
+CELL_START 2026-09-16T04:27:41+09:00 i39-split S128r4
+MEM_BEFORE 6.740231 GiB
+{"tag": "i39-split-S128r4", "mode": "solo", "config": "i39-split", "ts": "2026-09-16T04:27:42", "prefills": [{"prompt_tokens": 128047, "wall_s": 69.17, "tok_per_s": 1851.3, "t0": 1789500462.0153484, "t1": 1789500531.182918}], "aggregate": {"total_tokens": 128047, "span_s": 69.17, "tok_per_s": 1851.3}, "head_mem": {"start_gib": 6.73, "min_gib": 6.13, "end_gib": 6.13}}
+MEM_AFTER 7.148720 GiB
+NEW_ROWS case=1 decode=0
+CHECK health=200 attention=absent
+CELL_END 2026-09-16T04:28:51+09:00 i39-split S128r4 rc=0
+CELL_START 2026-09-16T04:32:59+09:00 i39-prod warm
+MEM_BEFORE 4.161232 GiB
+{"tag": "i39-prod-warm", "mode": "solo", "config": "i39-prod", "ts": "2026-09-16T04:32:59", "prefills": [{"prompt_tokens": 15877, "wall_s": 8.44, "tok_per_s": 1880.7, "t0": 1789500779.4741728, "t1": 1789500787.9162393}], "aggregate": {"total_tokens": 15877, "span_s": 8.44, "tok_per_s": 1880.7}, "head_mem": {"start_gib": 4.15, "min_gib": 4.15, "end_gib": 4.78}}
+MEM_AFTER 4.791546 GiB
+NEW_ROWS case=1 decode=0
+CHECK health=200 attention=absent
+CELL_END 2026-09-16T04:33:07+09:00 i39-prod warm rc=0
+CELL_START 2026-09-16T04:33:15+09:00 i39-prod warm2
+MEM_BEFORE 4.741043 GiB
+{"tag": "i39-prod-warm2", "mode": "mixed", "config": "i39-prod", "ts": "2026-09-16T04:33:15", "prefills": [{"prompt_tokens": 6008, "wall_s": 3.88, "tok_per_s": 1546.7, "t0": 1789500803.8025308, "t1": 1789500807.6869323}], "aggregate": {"total_tokens": 6008, "span_s": 3.88, "tok_per_s": 1546.7}, "decode_before": {"lanes": 2, "sum_tok_per_s": 42.0, "mean_gap_s": 0.107, "worst_max_gap_s": 0.156}, "decode_before_lanes": [{"chunks": 56, "tok_per_s": 21.5, "mean_gap_s": 0.107, "p90_gap_s": 0.119, "max_gap_s": 0.156}, {"chunks": 56, "tok_per_s": 20.5, "mean_gap_s": 0.107, "p90_gap_s": 0.118, "max_gap_s": 0.156}], "decode_during": {"lanes": 2, "sum_tok_per_s": 5.4, "mean_gap_s": 0.949, "worst_max_gap_s": 2.518}, "decode_during_lanes": [{"chunks": 5, "tok_per_s": 2.57, "mean_gap_s": 0.949, "p90_gap_s": 2.518, "max_gap_s": 2.518}, {"chunks": 5, "tok_per_s": 2.83, "mean_gap_s": 0.949, "p90_gap_s": 2.518, "max_gap_s": 2.518}], "head_mem": {"start_gib": 4.73, "min_gib": 4.72, "end_gib": 4.73}}
+MEM_AFTER 4.737675 GiB
+NEW_ROWS case=1 decode=0
+CHECK health=200 attention=absent
+CELL_END 2026-09-16T04:33:30+09:00 i39-prod warm2 rc=0
+CELL_START 2026-09-16T04:33:40+09:00 i39-prod S128r1
+MEM_BEFORE 4.714668 GiB
+{"tag": "i39-prod-S128r1", "mode": "solo", "config": "i39-prod", "ts": "2026-09-16T04:33:40", "prefills": [{"prompt_tokens": 127957, "wall_s": 74.77, "tok_per_s": 1711.4, "t0": 1789500820.5535016, "t1": 1789500895.3196013}], "aggregate": {"total_tokens": 127957, "span_s": 74.77, "tok_per_s": 1711.4}, "head_mem": {"start_gib": 4.71, "min_gib": 4.28, "end_gib": 7.58}}
+MEM_AFTER 7.572350 GiB
+NEW_ROWS case=1 decode=0
+CHECK health=200 attention=absent
+CELL_END 2026-09-16T04:34:55+09:00 i39-prod S128r1 rc=0
+CELL_START 2026-09-16T04:35:10+09:00 i39-prod S128r2
+MEM_BEFORE 7.630569 GiB
+{"tag": "i39-prod-S128r2", "mode": "solo", "config": "i39-prod", "ts": "2026-09-16T04:35:10", "prefills": [{"prompt_tokens": 128369, "wall_s": 73.11, "tok_per_s": 1755.7, "t0": 1789500910.207486, "t1": 1789500983.3218179}], "aggregate": {"total_tokens": 128369, "span_s": 73.11, "tok_per_s": 1755.7}, "head_mem": {"start_gib": 7.63, "min_gib": 6.19, "end_gib": 9.36}}
+MEM_AFTER 9.374760 GiB
+NEW_ROWS case=1 decode=0
+CHECK health=200 attention=absent
+CELL_END 2026-09-16T04:36:23+09:00 i39-prod S128r2 rc=0
+CELL_START 2026-09-16T04:36:30+09:00 i39-prod S128r3
+MEM_BEFORE 9.485695 GiB
+{"tag": "i39-prod-S128r3", "mode": "solo", "config": "i39-prod", "ts": "2026-09-16T04:36:30", "prefills": [{"prompt_tokens": 128129, "wall_s": 73.21, "tok_per_s": 1750.1, "t0": 1789500990.1850743, "t1": 1789501063.3976912}], "aggregate": {"total_tokens": 128129, "span_s": 73.21, "tok_per_s": 1750.1}, "head_mem": {"start_gib": 9.47, "min_gib": 8.21, "end_gib": 8.43}}
+MEM_AFTER 9.576328 GiB
+NEW_ROWS case=1 decode=0
+CHECK health=200 attention=absent
+CELL_END 2026-09-16T04:37:43+09:00 i39-prod S128r3 rc=0
+CELL_START 2026-09-16T04:37:51+09:00 i39-prod S32
+MEM_BEFORE 9.713501 GiB
+{"tag": "i39-prod-S32", "mode": "solo", "config": "i39-prod", "ts": "2026-09-16T04:37:51", "prefills": [{"prompt_tokens": 32098, "wall_s": 17.28, "tok_per_s": 1857.0, "t0": 1789501071.346879, "t1": 1789501088.6313422}], "aggregate": {"total_tokens": 32098, "span_s": 17.28, "tok_per_s": 1857.0}, "head_mem": {"start_gib": 9.7, "min_gib": 7.69, "end_gib": 8.51}}
+MEM_AFTER 8.508141 GiB
+NEW_ROWS case=1 decode=0
+CHECK health=200 attention=absent
+CELL_END 2026-09-16T04:38:08+09:00 i39-prod S32 rc=0
+CELL_START 2026-09-16T04:38:16+09:00 i39-prod decode
+MEM_BEFORE 8.528458 GiB
+{"tag": "i39-prod", "type": "prose", "ts": "2026-09-16T04:38:20", "c": 1, "gen": 256, "streams_ok": 1, "errors": [], "per_stream_1": 46.97, "per_stream_1_min": 46.97, "window_agg_3": 46.97, "wall_agg_4": 45.08, "ttft_mean_s": 0.249, "ttft_median_s": 0.249, "tokens_per_chunk": 3.2, "completion_tokens": [256], "prompt_tokens": 32}
+{"tag": "i39-prod", "type": "prose", "ts": "2026-09-16T04:38:28", "c": 2, "gen": 256, "streams_ok": 2, "errors": [], "per_stream_1": 32.37, "per_stream_1_min": 32.31, "window_agg_3": 62.52, "wall_agg_4": 60.88, "ttft_mean_s": 0.385, "ttft_median_s": 0.385, "tokens_per_chunk": 2.99, "completion_tokens": [256, 256], "prompt_tokens": 32}
+{"tag": "i39-prod", "type": "prose", "ts": "2026-09-16T04:38:40", "c": 4, "gen": 256, "streams_ok": 4, "errors": [], "per_stream_1": 25.07, "per_stream_1_min": 23.78, "window_agg_3": 95.1, "wall_agg_4": 93.21, "ttft_mean_s": 0.552, "ttft_median_s": 0.649, "tokens_per_chunk": 3.16, "completion_tokens": [256, 256, 256, 256], "prompt_tokens": 32}
+{"tag": "i39-prod", "type": "code", "ts": "2026-09-16T04:38:57", "c": 1, "gen": 256, "streams_ok": 1, "errors": [], "per_stream_1": 85.57, "per_stream_1_min": 85.57, "window_agg_3": 85.57, "wall_agg_4": 77.92, "ttft_mean_s": 0.306, "ttft_median_s": 0.306, "tokens_per_chunk": 5.82, "completion_tokens": [256], "prompt_tokens": 101}
+{"tag": "i39-prod", "type": "code", "ts": "2026-09-16T04:39:04", "c": 2, "gen": 256, "streams_ok": 2, "errors": [], "per_stream_1": 60.17, "per_stream_1_min": 58.09, "window_agg_3": 112.17, "wall_agg_4": 105.46, "ttft_mean_s": 0.533, "ttft_median_s": 0.533, "tokens_per_chunk": 5.82, "completion_tokens": [256, 256], "prompt_tokens": 101}
+{"tag": "i39-prod", "type": "code", "ts": "2026-09-16T04:39:12", "c": 4, "gen": 256, "streams_ok": 4, "errors": [], "per_stream_1": 51.67, "per_stream_1_min": 50.17, "window_agg_3": 192.95, "wall_agg_4": 182.99, "ttft_mean_s": 0.608, "ttft_median_s": 0.707, "tokens_per_chunk": 5.82, "completion_tokens": [256, 256, 256, 256], "prompt_tokens": 101}
+MEM_AFTER 8.414883 GiB
+NEW_ROWS case=0 decode=6
+CHECK health=200 attention=absent
+CELL_END 2026-09-16T04:39:20+09:00 i39-prod decode rc=0
+CELL_START 2026-09-16T04:39:28+09:00 i39-prod S128r4
+MEM_BEFORE 8.455593 GiB
+{"tag": "i39-prod-S128r4", "mode": "solo", "config": "i39-prod", "ts": "2026-09-16T04:39:28", "prefills": [{"prompt_tokens": 127895, "wall_s": 74.0, "tok_per_s": 1728.3, "t0": 1789501168.449708, "t1": 1789501242.4515417}], "aggregate": {"total_tokens": 127895, "span_s": 74.0, "tok_per_s": 1728.3}, "head_mem": {"start_gib": 8.44, "min_gib": 8.37, "end_gib": 8.92}}
+MEM_AFTER 10.108128 GiB
+NEW_ROWS case=1 decode=0
+CHECK health=200 attention=absent
+CELL_END 2026-09-16T04:40:42+09:00 i39-prod S128r4 rc=0

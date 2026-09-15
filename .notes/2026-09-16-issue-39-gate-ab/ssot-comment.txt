@@ -1,0 +1,76 @@
+[claude_code] 2026-09-15T18:42:49Z — icmt-c6218ef6
+## 매니저 조사와 실행 레시피 (2026-09-16 03:5x KST, codex 용)
+
+### 범위 재정의: 브랜치도 빌드도 필요 없다
+
+이슈 본문의 세 수정은 지금 프로덕션 main d0f108eab6 에서 이미 다음 상태다.
+
+| 본문의 수정 | 지금 상태 | 게이트(환경변수, 기본값) |
+|---|---|---|
+| Engram prefault 비동기 (#37) | 채택, 기본값 켜짐 | `ENGRAM_DECODE_ASYNC=1`, `ENGRAM_CHUNK_RUNS=8` (꺼짐은 `0`, `1`) |
+| 인덱서 프리필 TP 분할 (#38) | 채택, 기본값 켜짐 | `DSV41_INDEXER_TP_SPLIT=1` (꺼짐은 `0`) |
+| vLLM PR 56562 token_to_req 커널 (#40) | 미채택, 코드 되돌림(main 11d6e1629a). 몫 +0.3% 는 #40 결과에 있음 | 게이트 없음. 이번 A/B 에서 뺀다 |
+
+그러므로 "브랜치 `dsv41-perf-0915` 에 게이트를 넣고 배포" 항목은 할 일이 없다. 노드 `~/vllm-dsv41` 은 건드리지 않는다(`git am` 없음, 코드 변경 0). 남은 일은 **같은 빌드에서 override 파일로 게이트만 바꿔 4 부팅을 재고 수정별 몫을 표로 만드는 것**이다. "채택 조합의 전체 스위트" 는 #46 의 `prod-final`(`.notes/2026-09-16-issue-46-final-baseline/results.md`) 이 이미 답했다.
+
+### 부팅 4 회 (마지막이 골든룰 복구를 겸한다)
+
+| 부팅 | config 태그 | `dsv41_ctl.sh start` 앞에 붙일 knob |
+|---|---|---|
+| A 모두 꺼짐 | `i39-off` | `ENGRAM_DECODE_ASYNC=0 ENGRAM_CHUNK_RUNS=1 DSV41_INDEXER_TP_SPLIT=0` |
+| B prefault 만 | `i39-pf` | `ENGRAM_DECODE_ASYNC=1 ENGRAM_CHUNK_RUNS=8 DSV41_INDEXER_TP_SPLIT=0` |
+| C 분할만 | `i39-split` | `ENGRAM_DECODE_ASYNC=0 ENGRAM_CHUNK_RUNS=1 DSV41_INDEXER_TP_SPLIT=1` |
+| D 둘 다 (프로덕션 기본값) | `i39-prod` | **knob 없음** (override 0 bytes, 이것이 골든룰 복구다) |
+
+A 의 비교 상대: 디코드는 `combo-nob12x`(09-15, b12x 보류 뒤 기본값), S128 은 #38 의 `i38-off`(r2·r3 평균 1,666). A 에는 #34 `SHORT_RESERVE=4096` 과 #36 `SPEC_BLOCK_DROP=0`/`ENGRAM_RELEASE=0` 이 그대로 들어 있다(solo 셀과 디코드 셀에는 영향 없음). 이 차이를 results.md 에 적는다.
+
+### 부팅 절차 (로컬 워크트리에서, 각 명령 전경)
+
+`CTL="/opt/homebrew/bin/bash deploy/gb10-cluster/dsv41/dsv41_ctl.sh"` (워크트리의 파일, main 과 같다. 워크스테이션에서 ssh 로 4 노드에 간다).
+
+0. 시작 전 1 회: `$CTL caps` 4 행 active 1989, `$CTL headroom` head ≥ 5.2 GiB, head `curl :8888/metrics` 의 `vllm:num_requests_running/waiting` 0, head `~/dsv41-prep/logs/dsv41-r0.log` 마지막 200 줄의 `POST /v1` 출처가 127.0.0.1 뿐인지(외부 클라이언트가 있으면 10 분 기다렸다 다시 본다). 그 뒤 head 에서 `systemctl --user stop dsv41-watchdog.timer` (벤치 프로브가 /metrics 에 섞이지 않게, #32 규칙). 4 노드 `git -C ~/vllm-dsv41 status --short | wc -l` 0 기록.
+1. 부팅: `<knob> $CTL start`. 그 뒤 `for i in $(seq 1 40); do code=$(ssh gx10-6040 curl -s -o /dev/null -w '%{http_code}' http://127.0.0.1:8888/health); [ "$code" = 200 ] && break; sleep 10; done` 처럼 상한 있는 전경 폴링(최대 약 7 분). #37/#38/#46 은 start → health 200 이 2.5~3.5 분이었다.
+2. 부팅 확인: 4 노드 `cat ~/dsv41-prep/dsv41-override.env` 가 같은 내용(D 는 0 bytes), head r0.log 의 부팅 인자에 `mmap_decode_async=<0|1>, mmap_min_chunk_runs=<1|8>` 이 의도대로, `DSV41_INDEXER_TP_SPLIT on` 줄이 4 랭크 로그에 켜짐이면 각 1 줄, 꺼짐이면 0 줄. 랭크 간 불일치면 서버가 스스로 죽는다(#38 §3) → override 를 확인하고 다시 start.
+3. 웜업 서비스 대기: head `~/dsv41-prep/logs/dsv41-warmup.log` 에 이번 부팅의 JSON 3 줄이 찍힐 때까지(보통 1 분).
+4. 셀 실행(아래).
+5. D 가 끝나면 골든룰 확인: 4 노드 override 0 bytes, `systemctl --user show dsv41-serve -p Environment` 비어 있음, health 200, `$CTL caps` 4 행 active 1989, `~/dsv41-prep/logs/dsv41-ATTENTION` 없음, head `systemctl --user start dsv41-watchdog.timer` 뒤 active. 노드 dirty 0 그대로.
+
+### 셀 (head `~/sglang-cmp`, 셀마다 ssh 한 번, 전경, `T=<config>`)
+
+`cb() { python3 casebench.py --base http://127.0.0.1:8888 --config "$T" --out results/casebench.jsonl "$@"; }` (#46 과 같은 도구·인자. 시스템 python3 은 이 벤치 스크립트의 관례다.)
+
+| 순서 | 셀 | 명령 | #46 실측 |
+|---|---|---|---|
+| 1 | warm | `cb --mode solo --tag $T-warm --prefill-tokens 16000` | 9 s |
+| 2 | warm2 | `cb --mode mixed --tag $T-warm2 --prefill-tokens 6000 --decodes 2` | 15 s |
+| 3~5 | S128 r1, r2, r3 | `cb --mode solo --tag $T-S128r1 --prefill-tokens 128000` (r2, r3 도 같은 형식) | 각 76~81 s |
+| 6 | S32 | `cb --mode solo --tag $T-S32 --prefill-tokens 32000` | 17 s |
+| 7 | decode | `python3 decodebench.py --base http://127.0.0.1:8888 --tag $T --types prose,code --levels 1,2,4 --gen 256 --out results/decode.jsonl` | 약 60 s |
+| 8 | S128 r4 | `cb --mode solo --tag $T-S128r4 --prefill-tokens 128000` | 76~81 s |
+
+S128 을 웜업 직후에 두는 이유: #46 의 S128 3 회(1,599~1,684) 가 #32 골든 1,894 보다 낮았는데, 22 분 연속 셀 뒤의 순서 효과인지 회차 편차인지 갈라야 한다. r1 은 부팅 뒤 첫 긴 프리필 벌점(2~15 s, #38 §4) 이 있으니 판정은 r2·r3 로 하고, r4(디코드 뒤) 와 r2·r3 의 차이가 순서 효과다.
+
+셀마다: 시작 전 head `MemAvailable`(128K 셀은 ≥ 3.0 GiB, 아니면 60 s 씩 3 번 기다린 뒤 건너뛰고 기록), 끝나면 rc, `results/*.jsonl` 에 새 행이 붙었는지, health 200, ATTENTION 없음. 로그는 `results/i39.log` 에 `CELL_START/CELL_END` 스탬프로 (#46 형식). 한 부팅은 약 12 분, 전체 약 50 분.
+
+### 중단 규칙
+
+- start 뒤 7 분 안에 health 200 이 안 오면 `$CTL log` 로 원인을 보고 같은 knob 으로 1 회만 재시도. 그래도 안 되면 knob 없이 `start` 로 복구하고 멈춘 뒤 결과에 적는다.
+- 셀 rc ≠ 0 이면 기록하고 다음 셀로. 같은 부팅에서 2 셀 연속 실패면 그 부팅을 접고 다음 부팅으로.
+- 어떤 경우에도 마지막은 knob 없는 `start` + 골든룰 확인 + 워치독 start.
+
+### 하지 않는 것
+
+코드 수정, 노드 `git am`, `nvidia-smi -pm/-lgc/-rgc`, `gpu-clock-cap.service` 조작, 어떤 `rm`, 라이브 노드 pytest/torch, 백그라운드 체인, sysctl/swapoff/drop_caches. `.notes/2026-09-16-issue-39-gate-ab/` 와 `.gitignore` 의 예외 한 줄만 커밋한다.
+
+### results.md 에 담을 것
+
+1. 부팅 표: 부팅 시각, health 까지 초, override 내용, r0.log 부팅 인자, split 로그 줄 수, head MemAvailable 최저.
+2. 구성별 표(A/B/C/D 행): S128 r1/r2/r3/r4 tok/s, S32, 산문·코드 c1/c2/c4 per_stream tok/s 와 `tokens_per_chunk`, 코드 c1 스텝 ms(= 1000 × tokens_per_chunk ÷ per_stream). `python3 report_tables.py results i39-off i39-pf i39-split i39-prod` 출력도 붙인다.
+3. 몫 표: 분할 효과 = C−A 와 D−B (S128 r2·r3 평균, S32), prefault 효과 = B−A 와 D−C (코드 c1 스텝, 산문 c1), 두 값이 다르면 상호작용으로 적는다. 비교 행으로 #38 i38-off 1,666 / i38-on 1,836, #37 i37-base 70.2·68.4 / i37-async1 69.1·67.0, #46 prod-final S128 1,684·1,599·1,633 과 코드 c1 86.0 tok/s, combo-nob12x 코드 c4 합 208.6.
+4. 순서 효과: 구성마다 S128 r4 − (r2·r3 평균). 4 구성 모두 같은 부호면 순서 효과, 흩어지면 회차 편차.
+5. 골든룰 확인 결과와 워치독 재개 시각.
+
+### validate 에서 볼 것
+
+`results/casebench.jsonl` 의 `config` 가 `i39-*` 인 행 28 개(부팅당 warm 2 + S128 4 + S32 1), `results/decode.jsonl` 의 `tag` 가 `i39-*` 인 행 24 개(부팅당 2 타입 × 3 레벨). 4 노드 override 0 bytes, health 200, 워치독 active, dirty 0.
+

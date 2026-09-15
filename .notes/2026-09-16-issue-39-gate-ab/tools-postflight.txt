@@ -1,0 +1,18 @@
+2026-09-16T04:41:31+09:00
+4c7304370760949db4cbd899abd5c196e5fbd027dc2490b90693dbe5c61af3bb  casebench.py
+d75e64b59164da574819a6de176f6644e345a4b634668c4f05ece71287ef58ad  decodebench.py
+ac51b3d4361e56b7709425239e796d69e638c49049de27afc2215c0402055eca  report_tables.py
+   231 results/casebench.jsonl
+   194 results/decode.jsonl
+   425 total
+NEXT                        LEFT LAST                              PASSED UNIT                           ACTIVATES
+Wed 2026-09-16 04:41:43 KST  11s Wed 2026-09-16 04:40:43 KST      48s ago uvm-stall-sentinel.timer       uvm-stall-sentinel.service
+Wed 2026-09-16 04:42:13 KST  42s Wed 2026-09-16 04:41:13 KST      17s ago dsv41-watchdog.timer           dsv41-watchdog.service
+Thu 2026-09-17 00:54:16 KST  20h Wed 2026-09-16 00:54:16 KST 3h 47min ago launchpadlib-cache-clean.timer launchpadlib-cache-clean.service
+-                              - Wed 2026-09-16 04:32:19 KST     9min ago kvfs-gc.timer                  kvfs-gc.service
+
+4 timers listed.
+Sep 16 04:02:18 gx10-6040 systemd[1970]: Starting kvfs-gc.service - KV offload fs tier GC (TTL 7 days, cap 3000 GiB on /mnt/kvdisk)...
+Sep 16 04:19:55 gx10-6040 systemd[1970]: Finished kvfs-gc.service - KV offload fs tier GC (TTL 7 days, cap 3000 GiB on /mnt/kvdisk).
+Sep 16 04:19:55 gx10-6040 systemd[1970]: kvfs-gc.service: Consumed 5min 8.802s CPU time.
+Sep 16 04:32:19 gx10-6040 systemd[1970]: Starting kvfs-gc.service - KV offload fs tier GC (TTL 7 days, cap 3000 GiB on /mnt/kvdisk)...

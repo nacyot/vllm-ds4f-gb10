@@ -1,0 +1,9 @@
+2026-09-16T04:41:13+09:00
+health 200
+vllm:num_requests_running{engine="0",model_name="deepseek-v4.1-flash"} 0.0
+vllm:num_requests_waiting{engine="0",model_name="deepseek-v4.1-flash"} 0.0
+vllm:num_requests_waiting_by_reason{engine="0",model_name="deepseek-v4.1-flash",reason="capacity"} 0.0
+vllm:num_requests_waiting_by_reason{engine="0",model_name="deepseek-v4.1-flash",reason="deferred"} 0.0
+ATTENTION_absent
+2026-09-16T04:41:13+09:00
+active

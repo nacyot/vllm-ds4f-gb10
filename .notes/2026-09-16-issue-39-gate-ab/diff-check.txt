@@ -1,0 +1,111 @@
+.notes/2026-09-16-issue-39-gate-ab/build-equivalence.txt:8: trailing whitespace.
++    
+.notes/2026-09-16-issue-39-gate-ab/build-equivalence.txt:11: trailing whitespace.
++    
+.notes/2026-09-16-issue-39-gate-ab/build-equivalence.txt:14: trailing whitespace.
++    
+.notes/2026-09-16-issue-39-gate-ab/build-equivalence.txt:24: trailing whitespace.
++ 
+.notes/2026-09-16-issue-39-gate-ab/build-equivalence.txt:31: trailing whitespace.
++ 
+.notes/2026-09-16-issue-39-gate-ab/i39-off-gx10-6040-boot.txt:27: trailing whitespace.
++(APIServer pid=3451) ERROR 09-16 03:50:44 [async_llm.py:829] AsyncLLM output_handler failed.
+.notes/2026-09-16-issue-39-gate-ab/i39-off-gx10-6040-boot.txt:28: trailing whitespace.
++(APIServer pid=3451) ERROR 09-16 03:50:44 [async_llm.py:829] Traceback (most recent call last):
+.notes/2026-09-16-issue-39-gate-ab/i39-off-gx10-6040-boot.txt:29: trailing whitespace.
++(APIServer pid=3451) ERROR 09-16 03:50:44 [async_llm.py:829]   File "/home/nacyot/vllm-dsv41/vllm/v1/engine/async_llm.py", line 775, in output_handler
+.notes/2026-09-16-issue-39-gate-ab/i39-off-gx10-6040-boot.txt:30: trailing whitespace.
++(APIServer pid=3451) ERROR 09-16 03:50:44 [async_llm.py:829]     outputs = await engine_core.get_output_async()
+.notes/2026-09-16-issue-39-gate-ab/i39-off-gx10-6040-boot.txt:31: trailing whitespace.
++(APIServer pid=3451) ERROR 09-16 03:50:44 [async_llm.py:829]               ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+.notes/2026-09-16-issue-39-gate-ab/i39-off-gx10-6040-boot.txt:32: trailing whitespace.
++(APIServer pid=3451) ERROR 09-16 03:50:44 [async_llm.py:829]   File "/home/nacyot/vllm-dsv41/vllm/v1/engine/core_client.py", line 1175, in get_output_async
+.notes/2026-09-16-issue-39-gate-ab/i39-off-gx10-6040-boot.txt:33: trailing whitespace.
++(APIServer pid=3451) ERROR 09-16 03:50:44 [async_llm.py:829]     raise self._format_exception(outputs) from None
+.notes/2026-09-16-issue-39-gate-ab/i39-off-gx10-6040-boot.txt:64: trailing whitespace.
++(APIServer pid=69715) INFO 09-16 03:52:01 [api_utils.py:347] 
+.notes/2026-09-16-issue-39-gate-ab/i39-off-gx10-6040-boot.txt:65: trailing whitespace.
++(APIServer pid=69715) INFO 09-16 03:52:01 [api_utils.py:347]        █     █     █▄   ▄█
+.notes/2026-09-16-issue-39-gate-ab/i39-off-gx10-6040-boot.txt:66: trailing whitespace.
++(APIServer pid=69715) INFO 09-16 03:52:01 [api_utils.py:347]  ▄▄ ▄█ █     █     █ ▀▄▀ █  version 0.28.1rc1.dev392+ge47aa780b
+.notes/2026-09-16-issue-39-gate-ab/i39-off-gx10-6040-boot.txt:67: trailing whitespace.
++(APIServer pid=69715) INFO 09-16 03:52:01 [api_utils.py:347]   █▄█▀ █     █     █     █  model   /home/nacyot/models/DeepSeek-V4.1-Flash
+.notes/2026-09-16-issue-39-gate-ab/i39-off-gx10-6040-boot.txt:68: trailing whitespace.
++(APIServer pid=69715) INFO 09-16 03:52:01 [api_utils.py:347]    ▀▀  ▀▀▀▀▀ ▀▀▀▀▀ ▀     ▀
+.notes/2026-09-16-issue-39-gate-ab/i39-off-gx10-6040-boot.txt:69: trailing whitespace.
++(APIServer pid=69715) INFO 09-16 03:52:01 [api_utils.py:347] 
+.notes/2026-09-16-issue-39-gate-ab/i39-off-gx10-6040-boot.txt:204: trailing whitespace.
++(Worker_TP0 pid=70145) 
+.notes/2026-09-16-issue-39-gate-ab/i39-off-gx10-6040-boot.txt:210: trailing whitespace.
++(Worker_TP0 pid=70145) 
+.notes/2026-09-16-issue-39-gate-ab/i39-off-gx10-6040-boot.txt:233: trailing whitespace.
++(Worker_TP0 pid=70145) 
+.notes/2026-09-16-issue-39-gate-ab/i39-pf-gx10-6040-boot.txt:58: trailing whitespace.
++(APIServer pid=77319) INFO 09-16 04:06:01 [api_utils.py:347] 
+.notes/2026-09-16-issue-39-gate-ab/i39-pf-gx10-6040-boot.txt:59: trailing whitespace.
++(APIServer pid=77319) INFO 09-16 04:06:01 [api_utils.py:347]        █     █     █▄   ▄█
+.notes/2026-09-16-issue-39-gate-ab/i39-pf-gx10-6040-boot.txt:60: trailing whitespace.
++(APIServer pid=77319) INFO 09-16 04:06:01 [api_utils.py:347]  ▄▄ ▄█ █     █     █ ▀▄▀ █  version 0.28.1rc1.dev392+ge47aa780b
+.notes/2026-09-16-issue-39-gate-ab/i39-pf-gx10-6040-boot.txt:61: trailing whitespace.
++(APIServer pid=77319) INFO 09-16 04:06:01 [api_utils.py:347]   █▄█▀ █     █     █     █  model   /home/nacyot/models/DeepSeek-V4.1-Flash
+.notes/2026-09-16-issue-39-gate-ab/i39-pf-gx10-6040-boot.txt:62: trailing whitespace.
++(APIServer pid=77319) INFO 09-16 04:06:01 [api_utils.py:347]    ▀▀  ▀▀▀▀▀ ▀▀▀▀▀ ▀     ▀
+.notes/2026-09-16-issue-39-gate-ab/i39-pf-gx10-6040-boot.txt:63: trailing whitespace.
++(APIServer pid=77319) INFO 09-16 04:06:01 [api_utils.py:347] 
+.notes/2026-09-16-issue-39-gate-ab/i39-pf-gx10-6040-boot.txt:197: trailing whitespace.
++(Worker_TP0 pid=77583) 
+.notes/2026-09-16-issue-39-gate-ab/i39-pf-gx10-6040-boot.txt:203: trailing whitespace.
++(Worker_TP0 pid=77583) 
+.notes/2026-09-16-issue-39-gate-ab/i39-pf-gx10-6040-boot.txt:226: trailing whitespace.
++(Worker_TP0 pid=77583) 
+.notes/2026-09-16-issue-39-gate-ab/i39-prod-gx10-6040-boot.txt:56: trailing whitespace.
++(APIServer pid=89974) INFO 09-16 04:30:14 [api_utils.py:347] 
+.notes/2026-09-16-issue-39-gate-ab/i39-prod-gx10-6040-boot.txt:57: trailing whitespace.
++(APIServer pid=89974) INFO 09-16 04:30:14 [api_utils.py:347]        █     █     █▄   ▄█
+.notes/2026-09-16-issue-39-gate-ab/i39-prod-gx10-6040-boot.txt:58: trailing whitespace.
++(APIServer pid=89974) INFO 09-16 04:30:14 [api_utils.py:347]  ▄▄ ▄█ █     █     █ ▀▄▀ █  version 0.28.1rc1.dev392+ge47aa780b
+.notes/2026-09-16-issue-39-gate-ab/i39-prod-gx10-6040-boot.txt:59: trailing whitespace.
++(APIServer pid=89974) INFO 09-16 04:30:14 [api_utils.py:347]   █▄█▀ █     █     █     █  model   /home/nacyot/models/DeepSeek-V4.1-Flash
+.notes/2026-09-16-issue-39-gate-ab/i39-prod-gx10-6040-boot.txt:60: trailing whitespace.
++(APIServer pid=89974) INFO 09-16 04:30:14 [api_utils.py:347]    ▀▀  ▀▀▀▀▀ ▀▀▀▀▀ ▀     ▀
+.notes/2026-09-16-issue-39-gate-ab/i39-prod-gx10-6040-boot.txt:61: trailing whitespace.
++(APIServer pid=89974) INFO 09-16 04:30:14 [api_utils.py:347] 
+.notes/2026-09-16-issue-39-gate-ab/i39-prod-gx10-6040-boot.txt:197: trailing whitespace.
++(Worker_TP0 pid=90410) 
+.notes/2026-09-16-issue-39-gate-ab/i39-prod-gx10-6040-boot.txt:203: trailing whitespace.
++(Worker_TP0 pid=90410) 
+.notes/2026-09-16-issue-39-gate-ab/i39-prod-gx10-6040-boot.txt:226: trailing whitespace.
++(Worker_TP0 pid=90410) 
+.notes/2026-09-16-issue-39-gate-ab/i39-split-gx10-6040-boot.txt:27: trailing whitespace.
++(APIServer pid=77319) ERROR 09-16 04:17:29 [async_llm.py:829] AsyncLLM output_handler failed.
+.notes/2026-09-16-issue-39-gate-ab/i39-split-gx10-6040-boot.txt:28: trailing whitespace.
++(APIServer pid=77319) ERROR 09-16 04:17:29 [async_llm.py:829] Traceback (most recent call last):
+.notes/2026-09-16-issue-39-gate-ab/i39-split-gx10-6040-boot.txt:29: trailing whitespace.
++(APIServer pid=77319) ERROR 09-16 04:17:29 [async_llm.py:829]   File "/home/nacyot/vllm-dsv41/vllm/v1/engine/async_llm.py", line 775, in output_handler
+.notes/2026-09-16-issue-39-gate-ab/i39-split-gx10-6040-boot.txt:30: trailing whitespace.
++(APIServer pid=77319) ERROR 09-16 04:17:29 [async_llm.py:829]     outputs = await engine_core.get_output_async()
+.notes/2026-09-16-issue-39-gate-ab/i39-split-gx10-6040-boot.txt:31: trailing whitespace.
++(APIServer pid=77319) ERROR 09-16 04:17:29 [async_llm.py:829]               ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+.notes/2026-09-16-issue-39-gate-ab/i39-split-gx10-6040-boot.txt:32: trailing whitespace.
++(APIServer pid=77319) ERROR 09-16 04:17:29 [async_llm.py:829]   File "/home/nacyot/vllm-dsv41/vllm/v1/engine/core_client.py", line 1175, in get_output_async
+.notes/2026-09-16-issue-39-gate-ab/i39-split-gx10-6040-boot.txt:33: trailing whitespace.
++(APIServer pid=77319) ERROR 09-16 04:17:29 [async_llm.py:829]     raise self._format_exception(outputs) from None
+.notes/2026-09-16-issue-39-gate-ab/i39-split-gx10-6040-boot.txt:64: trailing whitespace.
++(APIServer pid=83981) INFO 09-16 04:18:37 [api_utils.py:347] 
+.notes/2026-09-16-issue-39-gate-ab/i39-split-gx10-6040-boot.txt:65: trailing whitespace.
++(APIServer pid=83981) INFO 09-16 04:18:37 [api_utils.py:347]        █     █     █▄   ▄█
+.notes/2026-09-16-issue-39-gate-ab/i39-split-gx10-6040-boot.txt:66: trailing whitespace.
++(APIServer pid=83981) INFO 09-16 04:18:37 [api_utils.py:347]  ▄▄ ▄█ █     █     █ ▀▄▀ █  version 0.28.1rc1.dev392+ge47aa780b
+.notes/2026-09-16-issue-39-gate-ab/i39-split-gx10-6040-boot.txt:67: trailing whitespace.
++(APIServer pid=83981) INFO 09-16 04:18:37 [api_utils.py:347]   █▄█▀ █     █     █     █  model   /home/nacyot/models/DeepSeek-V4.1-Flash
+.notes/2026-09-16-issue-39-gate-ab/i39-split-gx10-6040-boot.txt:68: trailing whitespace.
++(APIServer pid=83981) INFO 09-16 04:18:37 [api_utils.py:347]    ▀▀  ▀▀▀▀▀ ▀▀▀▀▀ ▀     ▀
+.notes/2026-09-16-issue-39-gate-ab/i39-split-gx10-6040-boot.txt:69: trailing whitespace.
++(APIServer pid=83981) INFO 09-16 04:18:37 [api_utils.py:347] 
+.notes/2026-09-16-issue-39-gate-ab/i39-split-gx10-6040-boot.txt:205: trailing whitespace.
++(Worker_TP0 pid=84257) 
+.notes/2026-09-16-issue-39-gate-ab/i39-split-gx10-6040-boot.txt:211: trailing whitespace.
++(Worker_TP0 pid=84257) 
+.notes/2026-09-16-issue-39-gate-ab/i39-split-gx10-6040-boot.txt:234: trailing whitespace.
++(Worker_TP0 pid=84257) 
+.notes/2026-09-16-issue-39-gate-ab/ssot-comment.txt:76: new blank line at EOF.

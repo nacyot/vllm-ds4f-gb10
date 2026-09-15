@@ -1,0 +1,43 @@
+Implementation verification, 2026-09-16 KST
+
+/opt/homebrew/bin/bash -n .notes/2026-09-16-issue-39-gate-ab/run-cell.sh
+PASS (exit 0)
+
+jq -s -f .notes/2026-09-16-issue-39-gate-ab/summarize.jq .notes/2026-09-16-issue-39-gate-ab/casebench.jsonl .notes/2026-09-16-issue-39-gate-ab/decode.jsonl
+PASS (exit 0); output saved as summary.json.
+Exact per-config case tags and decode type/concurrency combinations match.
+All decode streams succeeded, errors=[], completion tokens=256 per stream.
+
+Independent JavaScript validation of i39.log and JSONL:
+32 cells in required order; all rc=0.
+32 post-cell health=200 / ATTENTION absent checks.
+28 casebench appends (1 per case), 4 decode appends (6 per cell).
+16 S128 starts >=3.0 GiB; minimum 4.129627 GiB.
+No skip, memory wait, cell retry, or boot retry.
+JavaScript aggregation exactly matches jq summary.json.
+
+jq -se '[.[] | select(has("request"))] | length == 3 and all(.[]; .ok == true and .error == null)' <each of four *-warmup.jsonl>
+PASS four times (true, exit 0).
+
+Observed boot gates:
+A: override 0/1/0 on all nodes, split on counts 0/0/0/0.
+B: override 1/8/0 on all nodes, split on counts 0/0/0/0.
+C: override 0/1/1 on all nodes, split on counts 1/1/1/1.
+D: override 0 bytes on all nodes, defaults 1/8/1, split counts 1/1/1/1.
+Final serve active, NRestarts=0, unit Environment empty, dirty lines=0 on all nodes.
+Final health 200, running/waiting 0, ATTENTION absent.
+Watchdog timer start/active at 04:41:13 KST.
+Node HEAD, engine/tests/csrc trees and deployment script hashes unchanged.
+Benchmark/report script hashes unchanged and match issue 46.
+
+git diff --cached --check -- .gitignore .notes/2026-09-16-issue-39-gate-ab/plan.md .notes/2026-09-16-issue-39-gate-ab/results.md .notes/2026-09-16-issue-39-gate-ab/run-cell.sh .notes/2026-09-16-issue-39-gate-ab/summarize.jq
+PASS (exit 0).
+The full staged diff check returns 2 for original log CR/trailing spaces and
+git-show context whitespace. Raw evidence is preserved; see diff-check.txt.
+
+pre-commit run --files .gitignore .notes/2026-09-16-issue-39-gate-ab/plan.md .notes/2026-09-16-issue-39-gate-ab/results.md .notes/2026-09-16-issue-39-gate-ab/run-cell.sh .notes/2026-09-16-issue-39-gate-ab/summarize.jq
+PASS (exit 0); typos, Markdown, ShellCheck and applicable repository checks passed.
+Full staged-file pre-commit output is in pre-commit.txt.
+
+No engine/source code change, node git am, live-node pytest/torch or build.
+Only notes artifacts and one .gitignore exception are staged.

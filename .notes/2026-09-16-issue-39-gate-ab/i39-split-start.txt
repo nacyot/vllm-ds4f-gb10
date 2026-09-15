@@ -1,0 +1,10 @@
+2026-09-16T04:17:23+0900
+1789499843
+HOST         SERVICE      PERSISTENCE  MAX_SM_MHZ
+gx10-6040    active       Enabled      1989
+gx10-f323    active       Enabled      1995
+gx10-37cc    active       Enabled      1989
+gx10-27c4    active       Enabled      1989
+== gx10-6040 override: 3 line(s)
+== gx10-6040 rank 0 restart (its pre-start restarts ranks 3, 2, 1 first)
+dsv41 TP=4 launched (head gx10-6040 :8888)

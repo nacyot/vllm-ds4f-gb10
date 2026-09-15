@@ -1,0 +1,11 @@
+--- .notes/2026-09-16-issue-39-gate-ab/local-vllm-tree.txt	2026-09-16 03:50:07
++++ .notes/2026-09-16-issue-39-gate-ab/node-vllm-tree.txt	2026-09-16 03:50:07
+@@ -2802,7 +2802,7 @@
+ 100644 blob c797a4464b04fb0382db1388969263dee148fdba	vllm/v1/kv_offload/tiering/fs/io.py
+ 100644 blob adc27a53662c2c771e2ee3e3298cf239de507457	vllm/v1/kv_offload/tiering/fs/manager.py
+ 100644 blob e2104d49170599481627e8ead10828b261fbc931	vllm/v1/kv_offload/tiering/fs/thread_pool.py
+-100644 blob 7410f68c87f79efe685f43b2e9a57cb92021dd8a	vllm/v1/kv_offload/tiering/manager.py
++100644 blob 015ebeb07b19bc41e07470877bbd1bac165746a4	vllm/v1/kv_offload/tiering/manager.py
+ 100644 blob 60907142ac38b426c04097fc0c37fe261c1c4f25	vllm/v1/kv_offload/tiering/metrics.py
+ 100644 blob e69de29bb2d1d6434b8b29ae775ad8c2e48c5391	vllm/v1/kv_offload/tiering/obj/__init__.py
+ 100644 blob 76a1ae29e55586ebe921310c33c582a349daf4ac	vllm/v1/kv_offload/tiering/obj/config.py
