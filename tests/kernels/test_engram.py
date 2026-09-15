@@ -1070,17 +1070,17 @@ def _evicted_shard(tmp_path, num_rows=4096, dim=64):
 )
 @pytest.mark.parametrize(
     ("min_chunk_runs", "num_runs", "expected_chunks"),
-    [(1, 64, 1), (1, 72, 72), (8, 72, 9), (8, 2000, 8), (1, 2000, 8)],
+    [(1, 64, 1), (1, 72, 72), (8, 72, 9), (8, 2000, 128), (1, 2000, 128)],
 )
 def test_mmap_table_run_over_pages_chunks(
     tmp_path, min_chunk_runs, num_runs, expected_chunks
 ):
     """Up to 64 runs go to `work` inline; more are split over the pool into
-    at most `4 * num_threads` chunks of at least `min_chunk_runs` runs, and
-    every run reaches `work` exactly once."""
+    at most `4 * num_threads` (here 128) chunks of at least `min_chunk_runs`
+    runs, and every run reaches `work` exactly once."""
     dim = _evicted_shard(tmp_path)
     table = MmapEngramTable(
-        str(tmp_path), 1, dim, 32, num_threads=2, min_chunk_runs=min_chunk_runs
+        str(tmp_path), 1, dim, 32, num_threads=32, min_chunk_runs=min_chunk_runs
     )
     pages = np.arange(num_runs) * 2  # one page per run, all separate
     chunks = []
