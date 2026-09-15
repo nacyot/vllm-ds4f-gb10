@@ -1,0 +1,12 @@
+dsv41-sglang-vs-vllm-2026-09-14
+  title           DS4.1F 서빙 엔진 통합 비교: SGLang 레시피, tonyd2wild vLLM, 우리 포크
+  description     같은 가중치와 클럭에서 네 구성을 재고, 우리 포크에서 노브 10개를 A/B했다. 결론은 엔진 전환이 아니라 포크 수정.
+  status          active
+  project         (global)
+  type            리포트
+  format          html
+  version         v5
+  uploader        ops
+  created         2026-09-14T14:03:02Z
+  url             https://hangar.tail39057.ts.net/p/dsv41-sglang-vs-vllm-2026-09-14/
+  info            https://hangar.tail39057.ts.net/i/dsv41-sglang-vs-vllm-2026-09-14

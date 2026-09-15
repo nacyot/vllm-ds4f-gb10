@@ -1,0 +1,1467 @@
+<!DOCTYPE html><html lang="ko"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>DS4.1F 서빙 엔진 통합 비교: SGLang 레시피, tonyd2wild vLLM, 우리 포크</title>
+<style>
+  :root{--paper:#faf9f7;--ink:#1c1c1c;--soft:#5b5b57;--faint:#b7b5ad;--rule:#e4e2da;--barbg:#eceae2;--bar:#cbc9bf;--bar-hi:#4a4a46;--box:#f3f2ec}
+  *{box-sizing:border-box}
+  body{margin:0;background:var(--paper);color:var(--ink);
+    font-family:"Pretendard GOV",Pretendard,"Noto Sans KR","Apple SD Gothic Neo","Malgun Gothic",system-ui,sans-serif;
+    font-size:18px;line-height:1.72;word-break:keep-all;overflow-wrap:anywhere}
+  .doc{max-width:42em;margin:0 auto;padding:4.5rem 1.5rem 7rem}
+  h1{font-size:1.7rem;font-weight:700;line-height:1.36;margin:0 0 1.4rem}
+  h2{font-size:1.18rem;font-weight:700;margin:2.6rem 0 .7rem;padding-top:.7rem;border-top:1px solid var(--rule)}
+  h3{font-size:1.02rem;font-weight:700;margin:1.6rem 0 .5rem}
+  p{margin:0 0 .95rem} strong{font-weight:700}
+  a{color:var(--ink)}
+  ul,ol{margin:.4rem 0 1.1rem;padding-left:1.1rem} li{margin:.5rem 0}
+  code{font-family:ui-monospace,Menlo,Consolas,monospace;font-size:.8em;color:#46443f;background:#efeee7;padding:0 .25em;border-radius:2px}
+  blockquote{margin:1.3rem 0 1.6rem;padding:.8rem 1.1rem;background:var(--box);border-radius:4px}
+  blockquote ul{margin:0;padding-left:1rem} blockquote li{margin:.3rem 0}
+  .tcap,.fcap{font-size:.84rem;color:var(--soft);margin:1.5rem 0 .55rem}
+  table{width:100%;border-collapse:collapse;font-size:.88rem;line-height:1.55;margin:0 0 1.2rem}
+  th,td{text-align:left;vertical-align:top;padding:.52rem .8rem .52rem 0}
+  thead th{border-bottom:1px solid var(--ink);font-weight:700;font-size:.82rem}
+  tbody tr+tr td{border-top:1px solid var(--rule)} td:first-child,th:first-child{font-weight:600}
+  details{margin:1rem 0;border-top:1px solid var(--rule);padding-top:.7rem}
+  summary{cursor:pointer;font-weight:700;list-style:none} summary::before{content:"▸ ";color:var(--faint)}
+  details[open] summary::before{content:"▾ "}
+  @media(max-width:640px){body{font-size:17px}.doc{padding:2.6rem 1.2rem 5rem}
+    table{display:block;overflow-x:auto}}
+</style></head><body><div class="doc">
+<h1>DS4.1F 서빙 엔진 통합 비교: SGLang 레시피, tonyd2wild vLLM, 우리 포크</h1>
+<p>gx10 4대에서 돌리는 DeepSeek-V4.1-Flash를 두고 두 가지를 정해야 한다. 프로덕션 엔진을 MiaAI-Lab의 SGLang 레시피로 옮길지, 그리고 우리 vLLM 포크에서 무엇을 고칠지다. 9월 14일 밤부터 15일 새벽까지 같은 가중치, 같은 GPU 클럭 상한, 같은 프롬프트로 네 가지 구성을 재고, SGLang과 tonyd2wild(이하 T2W)의 코드를 우리 포크와 대조했다.</p>
+<p>결론부터 말하면 엔진은 그대로 두고 우리 포크를 고치는 쪽을 권한다. 어제 저녁 SGLang과 우리 운영 설정만 비교했을 때는 전환이 나아 보였지만, 새벽에 같은 조건으로 T2W 구성과 노브 A/B를 돌리면서 격차의 출처가 엔진이 아니라는 것이 드러났다.</p>
+<blockquote>
+<ul>
+<li><strong>결정할 것:</strong> 프로덕션 <code>:8888</code>을 SGLang으로 옮길지, 아니면 포크를 고칠지.</li>
+<li><strong>권고:</strong> 포크를 고친다. 노브 세 개(<code>disable_eagle_block_drop</code>, MoE b12x, <code>ENGRAM_RELEASE=0</code>)가 각각 에이전트 작업을 235초에서 215~221초로 줄였고, 셋은 서로 다른 축을 건드린다. SGLang은 194~198초다.</li>
+<li><strong>근거 하나:</strong> 같은 vLLM 코어에 설정만 바꾼 T2W 구성이 프리필을 SGLang의 3% 안(2,034 대 2,102)으로 끌어올렸다.</li>
+<li><strong>잃지 않는 것:</strong> 디스크 오프로딩. 끄고 재 봤더니 상시 비용은 콜드 프리필 2~5%뿐이고 디코드와 에이전트는 차이가 없다.</li>
+<li><strong>네 축 한눈 비교:</strong> 바로 아래 표 1. 현재 포크, 노브를 넣은 기대치, SGLang, T2W를 같은 지표로 나란히 놓았다.</li>
+<li><strong>지금 상태:</strong> 03:41 프로덕션 복구 완료(health 200, 네 노드 active, 클럭 상한 유지). 측정에 쓴 노브는 하나도 반영하지 않았다.</li>
+</ul>
+</blockquote>
+<p>신뢰도는 중간이다. 항목마다 1~2회 측정이고, 부팅마다 디코드 수락률이 흔들리는 것을 오늘 밤에도 한 번 겪었다(뒤의 한계 참고).</p>
+<h2>네 축 한눈 비교</h2>
+<p>같은 가중치, 같은 클럭 상한, 같은 스위트로 잰 값이다. "우리 포크 현재"는 지금 프로덕션에 떠 있는 9월 13일 채택 설정이고, "우리 포크 기대치"는 뒤의 A/B에서 재 둔 노브 세 개를 넣었을 때 갈 자리다. T2W 열은 그들의 스피드런 설정(<code>t2w-best</code>)이고 괄호 안이 기본 설정(<code>t2w-boot10</code>)이다.</p>
+<p class="tcap">표 1. 네 구성의 주요 지표. 화살표가 좋아지는 방향</p>
+
+<table>
+<thead>
+<tr>
+<th>항목</th>
+<th style="text-align: right;">우리 포크 현재</th>
+<th style="text-align: right;">우리 포크 기대치</th>
+<th style="text-align: right;">MiaAI SGLang</th>
+<th style="text-align: right;">T2W (기본)</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>코드 디코드 동시 1 [1] tok/s ↑</td>
+<td style="text-align: right;">76.6</td>
+<td style="text-align: right;">약 80</td>
+<td style="text-align: right;">89.0</td>
+<td style="text-align: right;">88.8 (85.6)</td>
+</tr>
+<tr>
+<td>코드 디코드 동시 4 [3] tok/s ↑</td>
+<td style="text-align: right;">165.8</td>
+<td style="text-align: right;">약 170</td>
+<td style="text-align: right;">238.2</td>
+<td style="text-align: right;">270.3 (179.0)</td>
+</tr>
+<tr>
+<td>산문 디코드 동시 1 [1] tok/s ↑</td>
+<td style="text-align: right;">43.4</td>
+<td style="text-align: right;">약 47</td>
+<td style="text-align: right;">47.9</td>
+<td style="text-align: right;">34.3 (45.6)</td>
+</tr>
+<tr>
+<td>콜드 프리필 32K [A] tok/s ↑</td>
+<td style="text-align: right;">1,454</td>
+<td style="text-align: right;">약 1,640</td>
+<td style="text-align: right;">2,257</td>
+<td style="text-align: right;">2,124 (1,595)</td>
+</tr>
+<tr>
+<td>콜드 프리필 128K [A] tok/s ↑</td>
+<td style="text-align: right;">1,359</td>
+<td style="text-align: right;">약 1,500</td>
+<td style="text-align: right;">2,102</td>
+<td style="text-align: right;">2,034 (1,522)</td>
+</tr>
+<tr>
+<td>에이전트 4×6 총시간 (초) ↓</td>
+<td style="text-align: right;">232.8</td>
+<td style="text-align: right;">약 214</td>
+<td style="text-align: right;">196.2</td>
+<td style="text-align: right;">294.8 (232.1)</td>
+</tr>
+<tr>
+<td>158.5K 후속 턴 TTFT (초) ↓</td>
+<td style="text-align: right;">3.13</td>
+<td style="text-align: right;">1.17</td>
+<td style="text-align: right;">0.75</td>
+<td style="text-align: right;">71.3 (92.9)</td>
+</tr>
+<tr>
+<td>128K 프리필 중 짧은 요청 (초) ↓</td>
+<td style="text-align: right;">88.9</td>
+<td style="text-align: right;">미측정</td>
+<td style="text-align: right;">56.4</td>
+<td style="text-align: right;">61.3 (77.6)</td>
+</tr>
+<tr>
+<td>헤드 여유 최저 (GiB) ↑</td>
+<td style="text-align: right;">4.64</td>
+<td style="text-align: right;">3.0 아래로 예상</td>
+<td style="text-align: right;">15.08</td>
+<td style="text-align: right;">14.71 (7.65)</td>
+</tr>
+</tbody>
+</table>
+<p>기대치 열은 추정이다. 노브 셋을 한꺼번에 켠 구성은 아직 재지 않았다. 항목마다 그 축을 가장 크게 움직인 노브 하나의 실측 변화율을 현재 값에 옮겼고, 후속 턴 TTFT의 1.17초만 실측값 그대로다.</p>
+<p class="tcap">표 2. 기대치가 어디서 오나. 기준은 같은 새벽에 다시 부팅해 잰 `fork-base2`</p>
+
+<table>
+<thead>
+<tr>
+<th>노브</th>
+<th>움직이는 축</th>
+<th>실측 변화</th>
+<th style="text-align: right;">헤드 여유 (GiB)</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>disable_eagle_block_drop</code></td>
+<td>프리픽스 히트 경계</td>
+<td>후속 턴 TTFT 3.13 → 1.17초, 에이전트 235.6 → 216.1초</td>
+<td style="text-align: right;">4.32 → 3.53</td>
+</tr>
+<tr>
+<td><code>MOE_BACKEND=b12x</code></td>
+<td>MoE GEMM</td>
+<td>코드 동시 1 +4.0%, 동시 4 +7.8%, 산문 동시 1 +8.6%, 에이전트 → 217.2초</td>
+<td style="text-align: right;">4.32 → 2.96</td>
+</tr>
+<tr>
+<td><code>ENGRAM_RELEASE=0</code></td>
+<td>Engram 페이지 해제</td>
+<td>프리필 32K +13.0%, 128K +10.4%, 에이전트 → 220.7초</td>
+<td style="text-align: right;">4.32 → 4.03</td>
+</tr>
+</tbody>
+</table>
+<p>세 노브는 서로 다른 축을 건드리니 속도는 대체로 더해질 것이다. 반대로 헤드 여유는 셋 다 깎는 쪽이라 겹친다. MoE b12x 하나만으로 2.96 GiB까지 내려갔고 earlyoom이 워커를 죽이는 선이 2.43 GiB다. 그래서 셋을 동시에 켜는 구성은 실제로 재 보기 전에 프로덕션에 넣지 않는다.</p>
+<p>표를 세로로 읽으면 남는 격차가 보인다. 기대치까지 가도 코드 디코드는 SGLang의 90% 언저리이고 128K 프리필은 71%다. 프리필의 나머지는 엔진 문제가 아니라 메모리 예산 문제다. T2W가 같은 vLLM 코어에서 2,034 tok/s를 낸 설정은 컨텍스트 300K, 동시 8, 프리필 배치 8,192, 블록 128이다. 우리 설정(512K, 16, 4,096, 64)에서 프리필 배치만 8,192로 올려 봤더니 128K 프리필 도중 earlyoom이 워커를 SIGTERM으로 죽였다. 프리필을 2,000대로 올리려면 컨텍스트 길이나 동시 수를 먼저 내주어야 한다. 그 교환을 할지는 정하지 않았다.</p>
+<p>T2W 열에는 함정이 둘 있다. 스피드런 설정은 코드 디코드를 크게 올리는 대신 산문 디코드와 에이전트 작업을 망친다. 에이전트 총시간이 294.8초로 우리보다 62초 느리다. 그리고 두 T2W 설정 모두 긴 세션 후속 턴이 71~93초다. 우리 3.13초보다 한참 나쁘다. 표의 한 칸만 보고 고르면 안 되는 이유다.</p>
+<h2>무엇을 쟀나</h2>
+<p>네 구성 모두 노드마다 있는 같은 가중치(<code>~/models/DeepSeek-V4.1-Flash</code>, 48 샤드 476 G, HF 리비전 <code>fb2764a5</code>와 해시 일치)를 쓰고, 같은 스위트(<code>tools/run_suite.sh</code>)를 같은 순서로 돌렸다. GPU 클럭 상한은 네 대 모두 부하 중 1,989 MHz로 같다.</p>
+<p class="tcap">표 3. 비교한 네 구성</p>
+
+<table>
+<thead>
+<tr>
+<th>항목</th>
+<th>우리 포크 (vllm-prod)</th>
+<th>MiaAI SGLang (sglang-tp4)</th>
+<th>T2W boot10</th>
+<th>T2W best</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>코드</td>
+<td>포크 <code>dsv41-gb10</code> <code>5374d4f481</code></td>
+<td>SGLang <code>da64c5cb</code> + 레시피 <code>68b34cf</code></td>
+<td>vLLM <code>e47aa780b</code> + T2W 패치 5개</td>
+<td>같은 트리 + 스피드런 레버</td>
+</tr>
+<tr>
+<td>실행 방식</td>
+<td>우리 venv</td>
+<td>레시피 이미지</td>
+<td>우리 venv에 워크트리를 <code>PYTHONPATH</code>로</td>
+<td>같음</td>
+</tr>
+<tr>
+<td>병렬</td>
+<td>TP=4</td>
+<td>TP=4, EP=4</td>
+<td>TP=4</td>
+<td>TP=4</td>
+</tr>
+<tr>
+<td>최대 컨텍스트, 동시</td>
+<td>512K, 16</td>
+<td>1M, 8</td>
+<td>300K, 8</td>
+<td>300K, 8</td>
+</tr>
+<tr>
+<td>KV 배치</td>
+<td>GPU 16 GiB + 호스트 2 GiB + SSD 티어</td>
+<td>800만 토큰 고정(1,670.75 B/token)</td>
+<td>gmu 0.80, 107만 토큰</td>
+<td>gmu 0.80</td>
+</tr>
+<tr>
+<td>프리필 배치</td>
+<td>4,096 토큰</td>
+<td>청크 1,024</td>
+<td>8,192</td>
+<td>8,192</td>
+</tr>
+<tr>
+<td>블록</td>
+<td>64</td>
+<td>page 256</td>
+<td>128</td>
+<td>128</td>
+</tr>
+<tr>
+<td>CUDA 그래프</td>
+<td>FULL_DECODE_ONLY</td>
+<td>프리필 그래프 없음</td>
+<td>FULL_AND_PIECEWISE</td>
+<td>같음</td>
+</tr>
+<tr>
+<td>투기 디코딩</td>
+<td>DSpark k=5, probabilistic + block</td>
+<td>DSpark k=5, SPS 표 없음</td>
+<td>같음</td>
+<td>같음</td>
+</tr>
+<tr>
+<td>dense MXFP8</td>
+<td>FlashInfer CUTLASS</td>
+<td>b12x 어댑터</td>
+<td>CUTLASS</td>
+<td>CUTLASS</td>
+</tr>
+<tr>
+<td>MoE</td>
+<td>DeepGEMM MXFP4, EP 없음</td>
+<td>FlashInfer CUTLASS W4A8, EP4</td>
+<td>DeepGEMM MXFP4</td>
+<td>같음</td>
+</tr>
+<tr>
+<td>할당기</td>
+<td><code>expandable_segments:True</code></td>
+<td><code>False</code></td>
+<td><code>True</code></td>
+<td><code>False</code></td>
+</tr>
+<tr>
+<td>Engram</td>
+<td>mmap + prefetch, 32 스레드</td>
+<td>O_DIRECT row store, 96 스레드</td>
+<td>preadv 패치</td>
+<td>+ <code>DSV41_ENGRAM_FAST</code>, 128 스레드</td>
+</tr>
+<tr>
+<td>특징</td>
+<td>디스크 KV 오프로딩</td>
+<td>decoder SWA bounded replay</td>
+<td>부팅, 로딩 패치</td>
+<td>인덱서 TP 분할, NCCL 8채널</td>
+</tr>
+</tbody>
+</table>
+<p>T2W는 오너 제약(새 이미지 다운로드 금지)에 맞춰 이미지 대신 코드만 가져왔다. 그들의 패치가 겨냥한 커밋 <code>e47aa780b</code>(우리 포크의 조상)에 패치 파일을 얹은 워크트리를 만들고, 우리 venv와 같은 base에서 빌드한 확장을 그대로 쓰되 <code>PYTHONPATH</code>로 그 트리를 먼저 import하게 했다. 서빙 인자와 환경변수는 그들의 <code>launch/dsv41-tp4.sh</code>와 <code>launch/boot10-go.sh</code>를 따랐다. <code>t2w-best</code>는 9월 14일 스피드런 레버 중 새 다운로드가 필요 없는 것만 더했다. b12x RoCE one-shot all-reduce는 새 b12x 빌드가 필요해 넣지 못했다.</p>
+<p>벤치 프로토콜은 MiaAI가 표를 만든 sparkDash와 같다(같은 프롬프트, 온도 0, thinking 끔, 생성 256 토큰). 에이전트 작업은 9월 13일 프로덕션 튜닝에 쓴 시드 그대로 레인 4개가 6턴씩, 12K에서 시작해 턴마다 2~8K를 붙이고 150~900 토큰을 생성한다(thinking high, 기본 온도). thinking은 모든 요청에 값을 넣어 엔진 기본값 차이를 지웠다.</p>
+<p>숫자의 지표 라벨은 이렇다. <code>[1]</code> 스트림당 속도, <code>[3]</code> 창 합산 처리량, <code>[A]</code> 요청 전체 wall 기준.</p>
+<h2>결과</h2>
+<h3>디코드</h3>
+<p class="tcap">표 4. 디코드 속도(tok/s). 생성 256 토큰, 온도 0, thinking 끔. [1] 스트림당, [3] 창 합산</p>
+
+<table>
+<thead>
+<tr>
+<th>유형</th>
+<th style="text-align: right;">동시</th>
+<th style="text-align: right;">포크 [1]</th>
+<th style="text-align: right;">포크 [3]</th>
+<th style="text-align: right;">SGLang [1]</th>
+<th style="text-align: right;">SGLang [3]</th>
+<th style="text-align: right;">boot10 [1]</th>
+<th style="text-align: right;">boot10 [3]</th>
+<th style="text-align: right;">best [1]</th>
+<th style="text-align: right;">best [3]</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>산문</td>
+<td style="text-align: right;">1</td>
+<td style="text-align: right;">43.4</td>
+<td style="text-align: right;">43.4</td>
+<td style="text-align: right;">47.9</td>
+<td style="text-align: right;">47.9</td>
+<td style="text-align: right;">45.6</td>
+<td style="text-align: right;">45.6</td>
+<td style="text-align: right;">34.3</td>
+<td style="text-align: right;">34.3</td>
+</tr>
+<tr>
+<td>산문</td>
+<td style="text-align: right;">2</td>
+<td style="text-align: right;">30.6</td>
+<td style="text-align: right;">60.1</td>
+<td style="text-align: right;">36.8</td>
+<td style="text-align: right;">72.0</td>
+<td style="text-align: right;">33.2</td>
+<td style="text-align: right;">62.5</td>
+<td style="text-align: right;">30.4</td>
+<td style="text-align: right;">56.5</td>
+</tr>
+<tr>
+<td>산문</td>
+<td style="text-align: right;">4</td>
+<td style="text-align: right;">21.4</td>
+<td style="text-align: right;">78.6</td>
+<td style="text-align: right;">28.3</td>
+<td style="text-align: right;">106.9</td>
+<td style="text-align: right;">23.0</td>
+<td style="text-align: right;">86.5</td>
+<td style="text-align: right;">20.5</td>
+<td style="text-align: right;">76.6</td>
+</tr>
+<tr>
+<td>산문</td>
+<td style="text-align: right;">8</td>
+<td style="text-align: right;">16.6</td>
+<td style="text-align: right;">120.1</td>
+<td style="text-align: right;">21.3</td>
+<td style="text-align: right;">154.7</td>
+<td style="text-align: right;">16.9</td>
+<td style="text-align: right;">127.8</td>
+<td style="text-align: right;">15.1</td>
+<td style="text-align: right;">113.0</td>
+</tr>
+<tr>
+<td>코드</td>
+<td style="text-align: right;">1</td>
+<td style="text-align: right;">76.6</td>
+<td style="text-align: right;">76.6</td>
+<td style="text-align: right;">89.0</td>
+<td style="text-align: right;">89.0</td>
+<td style="text-align: right;">85.6</td>
+<td style="text-align: right;">85.6</td>
+<td style="text-align: right;">88.8</td>
+<td style="text-align: right;">88.8</td>
+</tr>
+<tr>
+<td>코드</td>
+<td style="text-align: right;">2</td>
+<td style="text-align: right;">56.6</td>
+<td style="text-align: right;">106.7</td>
+<td style="text-align: right;">83.8</td>
+<td style="text-align: right;">167.5</td>
+<td style="text-align: right;">61.7</td>
+<td style="text-align: right;">115.5</td>
+<td style="text-align: right;">64.4</td>
+<td style="text-align: right;">120.5</td>
+</tr>
+<tr>
+<td>코드</td>
+<td style="text-align: right;">4</td>
+<td style="text-align: right;">44.9</td>
+<td style="text-align: right;">165.8</td>
+<td style="text-align: right;">59.8</td>
+<td style="text-align: right;">238.2</td>
+<td style="text-align: right;">48.7</td>
+<td style="text-align: right;">179.0</td>
+<td style="text-align: right;">67.6</td>
+<td style="text-align: right;">270.3</td>
+</tr>
+<tr>
+<td>코드</td>
+<td style="text-align: right;">8</td>
+<td style="text-align: right;">41.7</td>
+<td style="text-align: right;">309.4</td>
+<td style="text-align: right;">48.8</td>
+<td style="text-align: right;">369.4</td>
+<td style="text-align: right;">37.0</td>
+<td style="text-align: right;">208.6</td>
+<td style="text-align: right;">46.3</td>
+<td style="text-align: right;">225.0</td>
+</tr>
+</tbody>
+</table>
+<p>투기 디코딩이 잘 맞는 코드 출력에서는 T2W best가 SGLang과 같은 급이다(C1 88.8 대 89.0, C4는 67.6로 오히려 앞선다). 산문은 반대로 T2W best가 네 구성 중 가장 느리다. 원인은 스텝당 수락 토큰이다. 같은 프롬프트에서 산문 한 스텝에 통과한 토큰이 우리 3.16, SGLang 3.05, boot10 3.01인데 best만 2.44다. best가 boot10에 더한 것은 환경변수 다섯 개뿐이므로, 그중 인덱서 TP 분할이나 Engram 빠른 스테이징이 모델이 보는 값을 바꿨을 가능성이 있다. 속도만의 문제가 아니라 출력이 달라지는 문제이므로 이식 전에 확인해야 한다.</p>
+<p>수락 토큰을 나눠 스텝 시간으로 환산하면 커널과 호스트 비용이 드러난다.</p>
+<p class="tcap">표 5. 디코드 스텝 시간(ms). 1000 x 스텝당 통과 토큰 / [1]</p>
+
+<table>
+<thead>
+<tr>
+<th>유형</th>
+<th style="text-align: right;">동시</th>
+<th style="text-align: right;">포크</th>
+<th style="text-align: right;">SGLang</th>
+<th style="text-align: right;">boot10</th>
+<th style="text-align: right;">best</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>산문</td>
+<td style="text-align: right;">1</td>
+<td style="text-align: right;">72.8</td>
+<td style="text-align: right;">63.6</td>
+<td style="text-align: right;">66.0</td>
+<td style="text-align: right;">71.1</td>
+</tr>
+<tr>
+<td>산문</td>
+<td style="text-align: right;">2</td>
+<td style="text-align: right;">99.8</td>
+<td style="text-align: right;">82.9</td>
+<td style="text-align: right;">91.3</td>
+<td style="text-align: right;">91.1</td>
+</tr>
+<tr>
+<td>산문</td>
+<td style="text-align: right;">4</td>
+<td style="text-align: right;">134.3</td>
+<td style="text-align: right;">107.2</td>
+<td style="text-align: right;">128.0</td>
+<td style="text-align: right;">125.7</td>
+</tr>
+<tr>
+<td>산문</td>
+<td style="text-align: right;">8</td>
+<td style="text-align: right;">179.4</td>
+<td style="text-align: right;">140.2</td>
+<td style="text-align: right;">178.9</td>
+<td style="text-align: right;">171.8</td>
+</tr>
+<tr>
+<td>코드</td>
+<td style="text-align: right;">1</td>
+<td style="text-align: right;">75.9</td>
+<td style="text-align: right;">65.4</td>
+<td style="text-align: right;">68.0</td>
+<td style="text-align: right;">65.6</td>
+</tr>
+<tr>
+<td>코드</td>
+<td style="text-align: right;">2</td>
+<td style="text-align: right;">102.8</td>
+<td style="text-align: right;">69.4</td>
+<td style="text-align: right;">94.3</td>
+<td style="text-align: right;">90.4</td>
+</tr>
+<tr>
+<td>코드</td>
+<td style="text-align: right;">4</td>
+<td style="text-align: right;">129.7</td>
+<td style="text-align: right;">97.3</td>
+<td style="text-align: right;">119.4</td>
+<td style="text-align: right;">86.1</td>
+</tr>
+<tr>
+<td>코드</td>
+<td style="text-align: right;">8</td>
+<td style="text-align: right;">139.5</td>
+<td style="text-align: right;">119.3</td>
+<td style="text-align: right;">157.1</td>
+<td style="text-align: right;">125.8</td>
+</tr>
+</tbody>
+</table>
+<p>우리 포크가 모든 칸에서 가장 느리다. 동시 요청이 1에서 2로 갈 때 스텝이 우리는 27 ms 늘고 SGLang은 4 ms만 느는 것이 특징이다.</p>
+<p>동시 8에서 T2W 두 구성은 첫 토큰이 3.2초와 3.7초로 튄다(다른 구성은 0.8~0.9초). 두 구성 모두 동시 요청 상한이 8이라 여덟 번째 요청이 기다린 것으로 보인다. 우리 운영값은 16이므로 이 항목은 코드가 아니라 그쪽 설정의 성질이다.</p>
+<h3>콜드 프리필</h3>
+<p class="tcap">표 6. 콜드 프리필([A] tok/s). 단독 요청, 출력 1 토큰</p>
+
+<table>
+<thead>
+<tr>
+<th>프롬프트</th>
+<th style="text-align: right;">포크</th>
+<th style="text-align: right;">SGLang</th>
+<th style="text-align: right;">boot10</th>
+<th style="text-align: right;">best</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>8K</td>
+<td style="text-align: right;">1,680</td>
+<td style="text-align: right;">2,250</td>
+<td style="text-align: right;">1,587</td>
+<td style="text-align: right;">2,062</td>
+</tr>
+<tr>
+<td>32K</td>
+<td style="text-align: right;">1,454</td>
+<td style="text-align: right;">2,257</td>
+<td style="text-align: right;">1,595</td>
+<td style="text-align: right;">2,124</td>
+</tr>
+<tr>
+<td>128K</td>
+<td style="text-align: right;">1,359</td>
+<td style="text-align: right;">2,102</td>
+<td style="text-align: right;">1,522</td>
+<td style="text-align: right;">2,034</td>
+</tr>
+</tbody>
+</table>
+<p>이 표가 오늘 밤의 핵심이다. T2W best는 우리와 같은 vLLM 코어, 같은 런타임, 같은 가중치로 돌았고 SGLang의 bounded replay도 b12x RoCE all-reduce도 없다. 그런데 128K에서 2,034 tok/s로 SGLang 2,102과 3% 차이까지 붙었고, 우리 포크 1,359보다 50% 빠르다. boot10과 best의 차이는 환경변수 다섯 개(Engram 빠른 스테이징, 읽기 스레드 128, 인덱서 프리필 TP 분할, NCCL 채널 8, <code>expandable_segments:False</code>)뿐이다.</p>
+<p>따라서 프리필 격차를 "SGLang이 근사 계산을 하니까"로 설명할 수 없다. 우리 쪽 Engram 읽기 경로와 설정이 더 큰 몫을 차지한다는 뜻이고, 이것은 엔진을 바꾸지 않고도 손댈 수 있는 부분이다.</p>
+<h3>긴 프리필과 겹치는 요청</h3>
+<p class="tcap">표 7. 128K 프리필과 그 5초 뒤에 들어온 짧은 요청</p>
+
+<table>
+<thead>
+<tr>
+<th>항목</th>
+<th style="text-align: right;">포크</th>
+<th style="text-align: right;">SGLang</th>
+<th style="text-align: right;">boot10</th>
+<th style="text-align: right;">best</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>128K 프리필 [A] tok/s</td>
+<td style="text-align: right;">1,371</td>
+<td style="text-align: right;">2,081</td>
+<td style="text-align: right;">1,548</td>
+<td style="text-align: right;">1,931</td>
+</tr>
+<tr>
+<td>짧은 요청이 답까지 (초)</td>
+<td style="text-align: right;">88.89</td>
+<td style="text-align: right;">56.44</td>
+<td style="text-align: right;">77.63</td>
+<td style="text-align: right;">61.29</td>
+</tr>
+<tr>
+<td>32K 프리필 [C] tok/s</td>
+<td style="text-align: right;">1,404</td>
+<td style="text-align: right;">2,255</td>
+<td style="text-align: right;">1,610</td>
+<td style="text-align: right;">2,037</td>
+</tr>
+<tr>
+<td>그 프리필 중 디코드 3레인 합 (tok/s)</td>
+<td style="text-align: right;">3.1</td>
+<td style="text-align: right;">0.9</td>
+<td style="text-align: right;">1.6</td>
+<td style="text-align: right;">2.7</td>
+</tr>
+</tbody>
+</table>
+<p>네 구성 모두 짧은 요청을 앞으로 당기는 경로가 켜져 있지 않다. 그래서 대기 시간은 사실상 프리필 처리량의 함수다.</p>
+<h3>에이전트 작업과 긴 세션</h3>
+<p>사용 패턴에 가장 가까운 지표다. 여기서 결과가 뒤집힌다.</p>
+<p class="tcap">표 8. 에이전트 4레인 x 6턴(2회)과 158.5K 니들</p>
+
+<table>
+<thead>
+<tr>
+<th>항목</th>
+<th style="text-align: right;">포크</th>
+<th style="text-align: right;">SGLang</th>
+<th style="text-align: right;">boot10</th>
+<th style="text-align: right;">best</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>총시간 (초)</td>
+<td style="text-align: right;">235.0 / 230.6</td>
+<td style="text-align: right;">194.3 / 198.2</td>
+<td style="text-align: right;">234.9 / 229.3</td>
+<td style="text-align: right;">291.0 / 298.5</td>
+</tr>
+<tr>
+<td>레인당 디코드 tok/s</td>
+<td style="text-align: right;">19.0 / 19.8</td>
+<td style="text-align: right;">23.2 / 22.6</td>
+<td style="text-align: right;">18.8 / 19.5</td>
+<td style="text-align: right;">15.0 / 14.2</td>
+</tr>
+<tr>
+<td>첫 토큰 평균 (초)</td>
+<td style="text-align: right;">4.32 / 4.47</td>
+<td style="text-align: right;">3.56 / 3.69</td>
+<td style="text-align: right;">4.68 / 4.71</td>
+<td style="text-align: right;">3.81 / 4.39</td>
+</tr>
+<tr>
+<td>니들 콜드 TTFT (초)</td>
+<td style="text-align: right;">106.02</td>
+<td style="text-align: right;">80.39</td>
+<td style="text-align: right;">95.79</td>
+<td style="text-align: right;">80.18</td>
+</tr>
+<tr>
+<td>니들 콜드 [A] tok/s</td>
+<td style="text-align: right;">1,495</td>
+<td style="text-align: right;">1,972</td>
+<td style="text-align: right;">1,655</td>
+<td style="text-align: right;">1,977</td>
+</tr>
+<tr>
+<td>같은 기록에 질문 하나 더 (초)</td>
+<td style="text-align: right;">3.13</td>
+<td style="text-align: right;">0.75</td>
+<td style="text-align: right;">92.86</td>
+<td style="text-align: right;">71.25</td>
+</tr>
+<tr>
+<td>헤드 여유 메모리 최저 (GiB)</td>
+<td style="text-align: right;">4.64</td>
+<td style="text-align: right;">15.08</td>
+<td style="text-align: right;">7.65</td>
+<td style="text-align: right;">14.71</td>
+</tr>
+</tbody>
+</table>
+<p>T2W best는 프리필 모양의 지표를 전부 SGLang과 같은 급으로 끌어올린다(콜드 158K 1,977 대 1,972). 그런데 에이전트 작업은 291초로 우리 포크 235초보다 25% 느리다. 산문 수락 토큰이 낮아진 것과 같은 방향이다. 그리고 두 T2W 구성 모두 같은 기록에 질문을 하나 더 붙이면 71초와 93초를 쓴다. 프리픽스 재사용이 사실상 없다는 뜻이다. 우리 포크는 같은 상황에서 3.13초다.</p>
+<p>정리하면 T2W 레버 묶음은 통째로 가져올 물건이 아니다. 프리필 쪽 이득은 크지만, 수락률과 프리픽스 재사용이라는 우리가 이미 잘하고 있는 부분을 깎는다. 가져올 것은 프리필 이득을 내면서 그 둘을 건드리지 않는 조각이다.</p>
+<h3>운영 차이</h3>
+<p>성능 밖에서 달라지는 것들이다. 엔진을 옮기든 레버를 가져오든 이 줄들을 같이 감수해야 한다.</p>
+<p class="tcap">표 9. 운영 차이</p>
+
+<table>
+<thead>
+<tr>
+<th>항목</th>
+<th>우리 포크</th>
+<th>SGLang 레시피</th>
+<th>T2W 구성(우리 런타임)</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>기동</td>
+<td>2.5분</td>
+<td>13.7분(스모크와 웜업 포함)</td>
+<td>8.9분</td>
+</tr>
+<tr>
+<td>헤드 여유 메모리 최저</td>
+<td>4.64 GiB</td>
+<td>15.08 GiB</td>
+<td>7.65 GiB(boot10), 14.93 GiB(best)</td>
+</tr>
+<tr>
+<td>재기동 뒤 긴 세션</td>
+<td>SSD에서 복원</td>
+<td>사라짐, 재계산</td>
+<td>사라짐, 재계산</td>
+</tr>
+<tr>
+<td>최대 컨텍스트, 동시 요청</td>
+<td>512K, 16</td>
+<td>1M, 8</td>
+<td>300K, 8</td>
+</tr>
+<tr>
+<td>thinking 기본값</td>
+<td>켬</td>
+<td>끔</td>
+<td>끔</td>
+</tr>
+<tr>
+<td><code>/metrics</code></td>
+<td>켬</td>
+<td>끔(<code>--enable-metrics</code> 필요)</td>
+<td>켬</td>
+</tr>
+<tr>
+<td>노드마다 추가 디스크</td>
+<td>없음</td>
+<td>이미지 33 GB, Engram 샤드 48 GB</td>
+<td>없음(코드만 얹음)</td>
+</tr>
+</tbody>
+</table>
+<p>SGLang 이미지는 지금 f323 한 대에만 남아 있다. 나머지 세 대는 실험 뒤 정리했으므로, 전환하려면 노드마다 33 GB를 다시 받아야 한다.</p>
+<h2>격차는 어디에서 오나</h2>
+<p>서브에이전트 두 팀이 SGLang <code>da64c5cb</code>, 레시피 <code>68b34cf</code>, T2W 패치, 우리 포크를 대조했다. 전문은 <code>analysis-mialab-sglang.md</code>와 <code>analysis-tonyd2wild.md</code>에 있다. 여기서는 측정된 격차와 이어지는 것만 옮긴다.</p>
+<h3>긴 세션 후속 턴: 프리픽스 히트 경계 결함</h3>
+<p>158.5K 세션에 질문을 하나 더 붙였을 때 SGLang은 0.75초, 우리 포크는 3.13초, T2W boot10은 92.86초가 걸렸다. 우리 포크의 원인은 KV 캐시 그룹의 경계 정렬이다.</p>
+<p>스케줄러 블록은 64와 128의 최소공배수인 128이고(<code>vllm/v1/core/kv_cache_utils.py:731</code>), DSpark 드래프트의 SWA 그룹이 eagle 그룹이 된다(<code>kv_cache_utils.py:2130-2137</code>). 캐시된 블록을 오른쪽부터 찾는 루프는 경계가 정렬 토큰의 배수가 아니면 그 후보를 건너뛴다(<code>vllm/v1/core/single_type_kv_cache_manager.py:979-981</code>). 프롬프트 길이를 128로 나눈 나머지가 1~64면 eagle 그룹이 그 경계를 서빙하지 못하고, 고정점 루프가 모든 그룹을 직전 8,192 보존 꼬리까지 끌어내린다(<code>kv_cache_coordinator.py:820-886</code>). 158K 세션에서 2,885 토큰을 다시 계산한 이유다. 오프로드 커넥터도 같은 마스크로 거르기 때문에(<code>offloading/scheduler.py:171-209</code>) 외부 히트도 0이 된다.</p>
+<p>T2W가 92.86초인 것은 같은 결함이 보존 꼬리 없이 드러난 모습으로 보인다. SGLang은 page 256 radix에 SWA 검증기가 매칭 끝에서 128 이상만 요구해(<code>swa_component.py:299</code>) 69 토큰만 다시 계산했다.</p>
+<p>시뮬레이션에 따르면 <code>disable_eagle_block_drop</code>을 켜면 재계산이 2,885에서 69 토큰으로 줄고, 에이전트 4×6의 로컬 계산 토큰이 177,245에서 153,181로 14% 준다. 오늘 밤 <code>hit-eagle</code> A/B가 이것을 실측한다.</p>
+<h3>콜드 프리필: bounded replay</h3>
+<p>SGLang은 8K에서 34%, 32K와 128K에서 55% 빨랐다. 레시피가 켜는 <code>--enable-decoder-swa-bounded-replay</code>가 가장 큰 후보다. 마지막 KV source 층이 20이라 층 21~39(40층 중 19층)는 프리필 청크마다 요청별 마지막 128행만 통과한다(<code>sglang:srt/models/deepseek_v4.py:3544</code>, <code>3666-3690</code>). 최대 약 1.7배까지 설명할 수 있다.</p>
+<p>이 기법은 근사 계산이다. 플래그 도움말도 "Main and indexer KV stay exact"까지만 말하고, 층 22 이후 꼬리 앞쪽 행의 SWA 창이 잘린다. vLLM 쪽 대응 PR은 인코더 #56227과 디코더 #56752 두 개이고 아직 머지되지 않았다. 디코더만 이식하면 늦은 층 SWA 슬롯 대부분이 미기록으로 남아 우리 오프로드가 오염된 창을 복원하게 된다.</p>
+<p>몫을 실측하려 SGLang에서 이 플래그만 끄고 재는 ablation을 두 번 시도했으나 둘 다 37cc 노드에서 실패했다(자세한 것은 <code>README.md</code>). 그래서 비율은 추정으로 남는다.</p>
+<p>공개 수치와의 차이는 따로 정리해 둔다. MiaAI가 README에 올린 4노드 프리필은 128K에서 3,251 tok/s인데, 그 표를 만든 sparkDash는 채우개로 <code>" the"</code> 한 토큰을 반복하고 프리필 속도를 TTFT로 나눠 구한다. Engram은 n-gram 행을 4 KiB 직접 읽기로 가져오고 캐시를 0으로 두기 때문에(README가 "n-gram rows have ~0% reuse"라고 적은 그 설정) 같은 토큰이 반복되면 행 재사용이 사실상 100%가 된다. MiaAI 자신이 내용이 다른 프롬프트로 잰 값은 <code>docs/chunked-prefill-memory.md</code>에 "2.0-2.2k tok/s (measured)", "1.5-1.7k tok/s (measured)"로 적혀 있어 우리가 같은 레시피에서 잰 2,102~2,257과 겹친다. 다른 공개 4노드 측정(tonyd2wild 902~1,538, yunwei37 1,371~1,590, magicbear vLLM 1,502~1,664)도 모두 우리 급이다. 그러니 우리 포크가 뒤진 상대는 3,251이 아니라 같은 프롬프트로 잰 2,102이다.</p>
+<h3>디코드 스텝: dense MXFP8 커널과 호스트 동기화</h3>
+<p>디코드 C1 스텝은 우리가 코드 75.9 ms, SGLang 65.4 ms다. 유력한 순서는 이렇다.</p>
+<ol>
+<li>타깃 dense MXFP8 GEMM이 우리는 CUTLASS 128행 타일 커널이고(<code>vllm/model_executor/kernels/linear/mxfp8/flashinfer.py:101-107</code>) 레시피는 b12x 16/32행 타일이다(<code>recipe:adapter/mxfp8_b12x.py:25-45</code>). 레시피 저자가 TP3에서 52 ms를 17 ms로 줄였다고 적은 그 커널이다.</li>
+<li>Engram 조회가 매 스텝 <code>engram_hash(...).cpu()</code>로 GPU 완료를 기다린다(<code>vllm/models/deepseek_v4_1/nvidia/model_state.py:130-145</code>). 레시피는 그래프 안 <code>cudaLaunchHostFunc</code> 콜백과 O_DIRECT 읽기로 이 동기화가 없다.</li>
+<li>검증 뒤처리(logits, 거부 샘플러, 드래프트 context KV)가 우리는 그래프 밖 eager이고 SGLang은 greedy일 때 검증 그래프 안에서 끝낸다(<code>sglang:srt/speculative/dspark_components/dspark_verify.py:580-613</code>).</li>
+</ol>
+<p>동시 요청이 1에서 2로 갈 때 스텝이 우리는 27 ms 늘고 SGLang은 4 ms만 느는 것도 2번과 3번의 지문이다. CUTLASS는 M이 128 이하면 평평하므로 커널 자체로는 설명되지 않는다.</p>
+<h3>긴 프리필 중의 다른 요청: 스케줄러 정책 차이</h3>
+<p>SGLang은 청크 프리필이 남아 있으면 프리필을 먼저 돌리고 mixed chunk를 끈다(<code>sglang:srt/managers/scheduler.py:3526-3535</code>, <code>3635-3638</code>). 그래서 128K 프리필 뒤에 온 짧은 요청이 56.4초 만에 끝나지만 그동안 디코드 레인은 거의 멈춘다. 우리는 running 루프가 먼저 돌아 레인마다 6토큰씩 흘리고 짧은 요청은 88.9초를 기다린다. 이것은 결함이 아니라 9월 초 A/B로 고른 값이다(<code>deploy/gb10-cluster/dsv41/README.md:63-72</code>: mixed cap 2048은 프리필 33% 손해, 8,192/6,144/4 조합은 HOL 87초를 7초로 줄이지만 128K 프리필이 878 tok/s로 내려가고 총시간이 329초에서 364초가 된다).</p>
+<h3>헤드 메모리: MoE 패딩</h3>
+<p>헤드 여유 메모리 최저가 우리 4.64 GiB, SGLang 15.08 GiB다. 가장 큰 항목은 MoE 가중치 패딩이다. DeepGEMM MXFP4 경로가 전문가 중간 폭 576을 128 배수인 640으로 올린다(<code>vllm/model_executor/layers/fused_moe/oracle/mxfp4.py:744</code>, <code>mxfp4_round_up_hidden_size_and_intermediate_size</code>). 전문가당 0.498 MiB × 384 × 40층이면 랭크당 7.47 GiB다. 그 다음이 KV 풀 차이 3.6 GiB, 호스트 오프로드 티어 2 GiB다. <code>EP=1</code>로 FlashInfer CUTLASS 경로를 타면 패딩을 회수할 수 있는지 오늘 밤 <code>fork-ep1</code>이 확인한다.</p>
+<h2>우리 포크에서 돌린 A/B</h2>
+<p>같은 스위트를 우리 포크에 노브만 바꿔 가며 돌렸다. 한 줄이 한 번의 재기동이고, 각 구성 사이에 서버를 완전히 내렸다 올렸다. 마지막에는 채택 설정으로 되돌려 프로덕션을 복구한다.</p>
+<table>
+<thead>
+<tr>
+<th>태그</th>
+<th>바꾼 것</th>
+<th>무엇을 보는가</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>fork-base</code></td>
+<td>없음(9월 13일 채택 설정)</td>
+<td>어제 저녁 측정과 오늘 새벽 사이의 드리프트</td>
+</tr>
+<tr>
+<td><code>hit-eagle</code></td>
+<td><code>disable_eagle_block_drop</code></td>
+<td>158K 후속 턴 TTFT와 에이전트 총시간</td>
+</tr>
+<tr>
+<td><code>fork-eth128</code></td>
+<td>Engram 읽기 스레드 32에서 128</td>
+<td>콜드 프리필. T2W가 이 레버로 8K 1,665에서 1,897을 얻었다</td>
+</tr>
+<tr>
+<td><code>fork-mnbt8192</code></td>
+<td>프리필 배치 4,096에서 8,192</td>
+<td>콜드 프리필과 긴 프리필 중 디코드</td>
+</tr>
+<tr>
+<td><code>prof-base</code></td>
+<td>프로파일러와 Engram 통계</td>
+<td>디코드 스텝의 시간 귀속</td>
+</tr>
+<tr>
+<td><code>fork-ep1</code></td>
+<td><code>EP=1</code></td>
+<td>MoE 패딩 회수와 그 대가</td>
+</tr>
+<tr>
+<td><code>fork-linb12x</code></td>
+<td>dense MXFP8을 b12x로</td>
+<td>SGLang의 최대 디코드 레버가 vLLM에서도 먹히는가</td>
+</tr>
+<tr>
+<td><code>fork-nokvoff</code></td>
+<td>호스트 오프로드 티어 끔</td>
+<td>오프로드가 평상시 속도에 매기는 값</td>
+</tr>
+<tr>
+<td><code>fork-moeb12x</code></td>
+<td>MoE를 b12x로</td>
+<td>디코드</td>
+</tr>
+<tr>
+<td><code>fork-rel0</code></td>
+<td>Engram 페이지 해제 끔</td>
+<td>반복 읽기와 헤드 메모리의 교환</td>
+</tr>
+</tbody>
+</table>
+<h3>히트 경계 노브</h3>
+<p class="tcap">표 10. `disable_eagle_block_drop` 켜기(hit-eagle) 대 기본값</p>
+
+<table>
+<thead>
+<tr>
+<th>항목</th>
+<th style="text-align: right;">기본값(어제 저녁 측정)</th>
+<th style="text-align: right;">hit-eagle</th>
+<th style="text-align: right;">SGLang(참고)</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>158.5K 니들 콜드 TTFT (초)</td>
+<td style="text-align: right;">106.02</td>
+<td style="text-align: right;">105.62</td>
+<td style="text-align: right;">80.39</td>
+</tr>
+<tr>
+<td>콜드 [A] tok/s</td>
+<td style="text-align: right;">1,495</td>
+<td style="text-align: right;">1,501</td>
+<td style="text-align: right;">1,972</td>
+</tr>
+<tr>
+<td>같은 기록에 질문 하나 더 (초)</td>
+<td style="text-align: right;">3.135</td>
+<td style="text-align: right;"><strong>1.17</strong></td>
+<td style="text-align: right;">0.75</td>
+</tr>
+<tr>
+<td>니들 정답</td>
+<td style="text-align: right;">맞음</td>
+<td style="text-align: right;">맞음</td>
+<td style="text-align: right;">맞음</td>
+</tr>
+<tr>
+<td>코드 C1 [1] tok/s</td>
+<td style="text-align: right;">76.6</td>
+<td style="text-align: right;">77.2</td>
+<td style="text-align: right;">89.0</td>
+</tr>
+<tr>
+<td>코드 C1 스텝당 수락 토큰</td>
+<td style="text-align: right;">5.82</td>
+<td style="text-align: right;">5.82</td>
+<td style="text-align: right;">5.82</td>
+</tr>
+<tr>
+<td>에이전트 4×6 총시간 (초, 2회)</td>
+<td style="text-align: right;">235.0 / 230.6</td>
+<td style="text-align: right;"><strong>214.9 / 217.2</strong></td>
+<td style="text-align: right;">194.3 / 198.2</td>
+</tr>
+<tr>
+<td>에이전트 첫 토큰 평균 (초)</td>
+<td style="text-align: right;">4.32 / 4.47</td>
+<td style="text-align: right;">3.71 / 3.77</td>
+<td style="text-align: right;">3.56 / 3.69</td>
+</tr>
+</tbody>
+</table>
+<p>후속 턴이 63% 빨라졌고 에이전트 작업 총시간이 7.8% 줄었다. 콜드 프리필과 디코드는 그대로다. 수락 토큰이 5.82로 같으므로 드래프트가 손해를 보지 않았다. 시뮬레이션이 예측한 0.5초보다는 느리지만(재계산 69 토큰이면 더 짧아야 한다) 방향과 크기는 맞았다. 남은 0.42초 차이는 SGLang의 page 256 radix와 우리 128 정렬의 차이로 보인다.</p>
+<h3>Engram 읽기 스레드</h3>
+<p class="tcap">표 11. 읽기 스레드 32에서 128로(fork-eth128)</p>
+
+<table>
+<thead>
+<tr>
+<th>콜드 프리필 [A] tok/s</th>
+<th style="text-align: right;">기본</th>
+<th style="text-align: right;">eth128</th>
+<th>참고: T2W가 같은 레버로 얻은 값</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>8K</td>
+<td style="text-align: right;">1,680</td>
+<td style="text-align: right;">1,765</td>
+<td>1,665에서 1,897 (+14%)</td>
+</tr>
+<tr>
+<td>32K</td>
+<td style="text-align: right;">1,454</td>
+<td style="text-align: right;">1,367</td>
+<td>1,751에서 1,983 (+13%)</td>
+</tr>
+<tr>
+<td>128K</td>
+<td style="text-align: right;">1,359</td>
+<td style="text-align: right;">1,222</td>
+<td>니들 131K +6.3%</td>
+</tr>
+</tbody>
+</table>
+<p>우리 코드에서는 이득이 없다. 이유는 읽기 경로의 구조다. Engram은 필요한 페이지를 런 단위로 묶어 populate하는데, 런이 64개 이하면 스레드 풀을 쓰지 않고 그대로 실행한다(<code>vllm/models/deepseek_v4_1/common/engram.py</code> <code>_run_over_pages</code>). 스레드를 올려도 일이 나뉘지 않는다.</p>
+<p>그러므로 T2W의 프리필 이득은 스레드 수가 아니라 그들이 함께 켠 빠른 스테이징 경로에서 온다고 봐야 한다. 가져오려면 노브가 아니라 코드를 옮겨야 한다. 에이전트 작업도 231.6초로 기준(235.0과 230.6초)과 같아서 이 레버는 중립이다.</p>
+<h3>프리필 배치 8,192</h3>
+<p>T2W가 쓰는 값을 우리 설정에 그대로 넣었더니 서버가 죽었다. 128K 프리필 도중 헤드 여유 메모리가 1.96%까지 내려가 earlyoom이 워커를 종료시켰다.</p>
+<pre><code>02:21:56 earlyoom: mem avail: 2440 of 124546 MiB (1.96%)
+02:21:56 earlyoom: sending SIGTERM to &quot;VLLM::Worker_TP&quot; badness 833, VmRSS 7021 MiB
+02:22:03 process exited after 7.1 seconds
+</code></pre>
+<p>죽기 전 수치도 좋지 않았다. 8K 1,616(기준 1,680), 32K 1,047(기준 1,454)이다. 부팅 직후 헤드 여유가 5.03 GiB였고 디코드 중 2.92 GiB, 프리필 중 2.88 GiB까지 내려갔다.</p>
+<p>T2W가 같은 값을 쓸 수 있는 이유는 메모리 프로필이 더 헐겁기 때문이다. 컨텍스트 300K, 동시 요청 8, 호스트 오프로드 티어 없음이다. 우리는 512K에 동시 16이고 헤드에 2 GiB 오프로드 티어를 둔다. 이 레버는 우리 설정에서 채택하지 않는다.</p>
+<h3>디코드 스텝의 시간 귀속 (프로파일)</h3>
+<p>프로파일러를 켜고 코드 디코드 한 스트림을 128 토큰 돌렸다. 정상 구간의 스텝 하나는 span 약 80 ms이고 이렇게 쪼개진다.</p>
+<p class="tcap">표 12. 코드 디코드 스텝의 구성(c=1, 프로파일 steps 11~31 평균)</p>
+
+<table>
+<thead>
+<tr>
+<th>항목</th>
+<th style="text-align: right;">스텝당</th>
+<th style="text-align: right;">비중</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>MoE GEMM</td>
+<td style="text-align: right;">약 30 ms</td>
+<td style="text-align: right;">43%</td>
+</tr>
+<tr>
+<td>attention</td>
+<td style="text-align: right;">약 17 ms</td>
+<td style="text-align: right;">24%</td>
+</tr>
+<tr>
+<td>NCCL all-reduce</td>
+<td style="text-align: right;">약 13 ms</td>
+<td style="text-align: right;">19%</td>
+</tr>
+<tr>
+<td>dense GEMM</td>
+<td style="text-align: right;">약 12 ms</td>
+<td style="text-align: right;">17%</td>
+</tr>
+<tr>
+<td>GPU 유휴 갭</td>
+<td style="text-align: right;">약 10 ms</td>
+<td style="text-align: right;">스텝의 12%</td>
+</tr>
+<tr>
+<td>Engram 커널</td>
+<td style="text-align: right;">0.02 ms</td>
+<td style="text-align: right;">0.1%</td>
+</tr>
+</tbody>
+</table>
+<p>두 가지가 분명해졌다.</p>
+<p>첫째, <strong>유휴 갭의 정체가 Engram 호스트 동기화다.</strong> 갭 목록에서 <code>Memcpy DtoH (Device -&gt; Pageable)</code> 직후에 30회, 합계 309.9 ms(회당 약 10.3 ms)가 찍혔다. 스텝마다 도는 <code>engram_hash(...).cpu()</code>와 그 뒤 페이지 populate가 그대로 보인다. Engram 커널 자체는 전체 GPU 시간의 0.1%인데 호스트 왕복이 스텝의 12%를 먹는다. 산문 프로파일도 같다. 같은 갭이 52회 528.6 ms로 회당 10.2 ms이고, 산문 스텝(약 75 ms)의 13.6%다. 워크로드와 무관하게 스텝마다 약 10 ms가 여기서 샌다.</p>
+<p>둘째, <strong>호스트 갭을 0으로 만들어도 SGLang을 따라잡지 못한다.</strong> GPU가 바쁜 시간만 약 70 ms인데 SGLang의 코드 스텝 전체가 65.4 ms다. MoE GEMM 30 ms와 NCCL 13 ms를 함께 줄여야 한다. MoE는 패딩된 폭 640의 DeepGEMM MXFP4를 쓰고 있고(SGLang은 EP4에 FlashInfer CUTLASS W4A8), NCCL은 T2W가 RoCE one-shot all-reduce로 공략한 바로 그 항목이다.</p>
+<h3>전문가 병렬 (EP=1)</h3>
+<p>MoE 패딩을 회수하는 대신 all2all이 RoCE를 탄다. 예측이 맞았다.</p>
+<p class="tcap">표 13. `EP=1` 대 기본값</p>
+
+<table>
+<thead>
+<tr>
+<th>항목</th>
+<th style="text-align: right;">기본</th>
+<th style="text-align: right;">EP=1</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>랭크당 파라미터 합계</td>
+<td style="text-align: right;">78.63 GiB</td>
+<td style="text-align: right;">71.39 GiB</td>
+</tr>
+<tr>
+<td>헤드 여유 메모리 최저</td>
+<td style="text-align: right;">4.64 GiB</td>
+<td style="text-align: right;">10.64 GiB</td>
+</tr>
+<tr>
+<td>콜드 프리필 8K / 32K / 128K</td>
+<td style="text-align: right;">1,680 / 1,454 / 1,359</td>
+<td style="text-align: right;">1,747 / 1,490 / 1,387</td>
+</tr>
+<tr>
+<td>산문 C1 스텝 (ms)</td>
+<td style="text-align: right;">72.8</td>
+<td style="text-align: right;">81.7</td>
+</tr>
+<tr>
+<td>코드 C1 스텝 (ms)</td>
+<td style="text-align: right;">75.9</td>
+<td style="text-align: right;">83.7</td>
+</tr>
+<tr>
+<td>코드 C4 스텝 (ms)</td>
+<td style="text-align: right;">129.7</td>
+<td style="text-align: right;">123.3</td>
+</tr>
+<tr>
+<td>에이전트 총시간 (초)</td>
+<td style="text-align: right;">235.0 / 230.6</td>
+<td style="text-align: right;">235.9</td>
+</tr>
+<tr>
+<td>에이전트 첫 토큰 평균 (초)</td>
+<td style="text-align: right;">4.32 / 4.47</td>
+<td style="text-align: right;">4.64</td>
+</tr>
+</tbody>
+</table>
+<p>가중치가 줄어든 폭 7.24 GiB는 코드 분석이 계산한 7.47 GiB와 거의 같고, SGLang의 랭크 0 가중치 71.07 GB와도 같은 수준이다. 부하 중 헤드 여유가 6 GiB 늘었다.</p>
+<p>대가는 단일 스트림 디코드다. C1이 10~12% 느려진다. 반대로 동시 4 코드는 5% 빨라지고, 에이전트 작업 총시간은 사실상 같다(235.9초 대 235.0과 230.6초).</p>
+<p>우리는 헤드 메모리에 만성적으로 쫓긴다. 오늘 밤 MNBT 8192가 죽은 것도, 9월 13일 오프로드 티어를 3 GiB에서 2 GiB로 줄인 것도 같은 이유다. 그 관점에서 EP=1은 에이전트 체감을 유지한 채 6 GiB를 주는 카드다. 다만 pi처럼 단일 스트림으로 쓰는 순간에는 10% 손해가 그대로 느껴진다. 채택은 그 둘 중 무엇을 우선할지의 문제다.</p>
+<h3>dense MXFP8을 b12x로</h3>
+<p>SGLang 레시피가 디코드에서 가장 크게 재미를 본 레버인데, 우리 쪽에서는 투기 디코딩을 망가뜨린다.</p>
+<p class="tcap">표 14. `LINEAR_BACKEND=b12x` 대 기본값. tpc는 스텝당 통과 토큰</p>
+
+<table>
+<thead>
+<tr>
+<th>항목</th>
+<th>기본 tpc / tok/s</th>
+<th>b12x tpc / tok/s</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>산문 C1</td>
+<td>3.16 / 43.4</td>
+<td>1.53 / 20.8</td>
+</tr>
+<tr>
+<td>산문 C4</td>
+<td>2.87 / 21.4</td>
+<td>2.85 / 22.0</td>
+</tr>
+<tr>
+<td>코드 C1</td>
+<td>5.82 / 76.6</td>
+<td>3.20 / 43.7</td>
+</tr>
+<tr>
+<td>코드 C4</td>
+<td>5.82 / 44.9</td>
+<td>5.51 / 42.9</td>
+</tr>
+</tbody>
+</table>
+<p>부팅 로그에서 커널은 제대로 잡혔다(<code>Using B12xMxfp8LinearKernel for MXFP8 GEMM</code>, 시그니처 7개 워밍업). 다만 일부 레이어에는 b12x 커널이 없어 자동 선택으로 남는다는 경고도 함께 찍혔다.</p>
+<p>스텝 시간 자체는 정상 범위다(산문 C1 73.5 ms 대 기본 72.8 ms). 떨어진 것은 스텝당 통과 토큰이다. 즉 커널이 느린 것이 아니라 드래프트와 검증이 서로 다른 값을 보게 되어 투기 디코딩이 무력화됐다. 일부 레이어만 커널이 바뀌는 혼합 상태가 원인으로 보인다.</p>
+<p>무너지는 곳은 단일 스트림뿐이다. 레인 4개가 함께 도는 에이전트 작업은 233.7초로 기준(235.0과 230.6초)과 같고, 콜드 프리필도 8K 1,724, 32K 1,419, 128K 1,327로 차이가 없다. 배치가 가장 작을 때만 b12x 커널이 쓰이면서 드래프트와 검증이 갈리는 것으로 보인다.</p>
+<p>그래도 채택하지 않는다. pi처럼 한 스트림으로 쓰는 순간이 우리 주된 사용 패턴이고, 거기서 코드 응답이 76.6에서 43.7 tok/s로 떨어진다. T2W도 같은 레버를 vLLM에서 시험하고 "C1 +0.5%에 프리필 손해"라며 버렸다.</p>
+<h3>디스크 오프로딩의 상시 비용</h3>
+<p>이번 밤에 가장 직접적인 답을 준 A/B다. 호스트 티어를 끄고 같은 스위트를 돌렸다.</p>
+<p class="tcap">표 15. 오프로드 티어를 끈 구성(fork-nokvoff)</p>
+
+<table>
+<thead>
+<tr>
+<th>항목</th>
+<th style="text-align: right;">오프로드 켬(기본)</th>
+<th style="text-align: right;">오프로드 끔</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>산문 C1 스텝 (ms)</td>
+<td style="text-align: right;">72.8</td>
+<td style="text-align: right;">72.1</td>
+</tr>
+<tr>
+<td>코드 C1 스텝 (ms)</td>
+<td style="text-align: right;">75.9</td>
+<td style="text-align: right;">74.4</td>
+</tr>
+<tr>
+<td>코드 C4 스텝 (ms)</td>
+<td style="text-align: right;">129.7</td>
+<td style="text-align: right;">118.4</td>
+</tr>
+<tr>
+<td>콜드 프리필 8K / 32K / 128K</td>
+<td style="text-align: right;">1,680 / 1,454 / 1,359</td>
+<td style="text-align: right;">1,760 / 1,489 / 1,396</td>
+</tr>
+<tr>
+<td>에이전트 총시간 (초)</td>
+<td style="text-align: right;">235.0 / 230.6</td>
+<td style="text-align: right;">234.5</td>
+</tr>
+<tr>
+<td>에이전트 첫 토큰 평균 (초)</td>
+<td style="text-align: right;">4.32 / 4.47</td>
+<td style="text-align: right;">4.46</td>
+</tr>
+<tr>
+<td>헤드 여유 메모리 최저 (GiB)</td>
+<td style="text-align: right;">4.64</td>
+<td style="text-align: right;">5.26</td>
+</tr>
+</tbody>
+</table>
+<p>디코드와 에이전트 작업은 차이가 없고 콜드 프리필만 2~5% 빨라진다. 즉 성능이 기대만 못한 이유가 디스크 오프로딩 때문이 아니다. 이 기능을 켜 두는 값은 프리필 몇 퍼센트이고, 그 대가로 재기동 뒤 긴 세션을 SSD에서 되살린다(493K 세션 7.8초, 재계산이면 390초).</p>
+<h3>MoE를 b12x로</h3>
+<p>프로파일에서 스텝의 43%를 먹던 MoE GEMM을 바꿨더니 오늘 밤 가장 큰 디코드 이득이 나왔다.</p>
+<p class="tcap">표 16. `MOE_BACKEND=b12x` 대 기본값</p>
+
+<table>
+<thead>
+<tr>
+<th>항목</th>
+<th style="text-align: right;">기본</th>
+<th style="text-align: right;">MoE b12x</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>산문 C1 스텝 (ms)</td>
+<td style="text-align: right;">72.8</td>
+<td style="text-align: right;">68.5</td>
+</tr>
+<tr>
+<td>산문 C4 스텝 (ms)</td>
+<td style="text-align: right;">134.3</td>
+<td style="text-align: right;">115.5</td>
+</tr>
+<tr>
+<td>코드 C1 스텝 (ms)</td>
+<td style="text-align: right;">75.9</td>
+<td style="text-align: right;">71.1</td>
+</tr>
+<tr>
+<td>코드 C4 스텝 (ms)</td>
+<td style="text-align: right;">129.7</td>
+<td style="text-align: right;">110.9</td>
+</tr>
+<tr>
+<td>코드 C1 [1] tok/s</td>
+<td style="text-align: right;">76.6</td>
+<td style="text-align: right;">81.9</td>
+</tr>
+<tr>
+<td>코드 C4 [1] tok/s</td>
+<td style="text-align: right;">44.9</td>
+<td style="text-align: right;">52.5</td>
+</tr>
+<tr>
+<td>콜드 프리필 8K / 32K / 128K</td>
+<td style="text-align: right;">1,680 / 1,454 / 1,359</td>
+<td style="text-align: right;">1,765 / 1,440 / 1,335</td>
+</tr>
+<tr>
+<td>에이전트 총시간 (초)</td>
+<td style="text-align: right;">235.0 / 230.6</td>
+<td style="text-align: right;"><strong>217.2</strong></td>
+</tr>
+<tr>
+<td>에이전트 레인당 디코드 tok/s</td>
+<td style="text-align: right;">19.0 / 19.8</td>
+<td style="text-align: right;">21.0</td>
+</tr>
+<tr>
+<td>헤드 여유 메모리 최저 (GiB)</td>
+<td style="text-align: right;">4.64</td>
+<td style="text-align: right;">2.96</td>
+</tr>
+</tbody>
+</table>
+<p>스텝이 동시 1에서 6%, 동시 4에서 14% 줄었고 수락 토큰은 그대로다(코드 5.82). dense를 b12x로 바꿨을 때 수락률이 무너진 것과 정반대다. 에이전트 작업도 217.2초로 7.5% 빨라져 <code>hit-eagle</code>과 같은 급이다. 프리필은 중립이다.</p>
+<p>대가는 메모리다. 부하 중 헤드 여유 최저가 2.96 GiB로 기본보다 1.7 GiB 낮고, earlyoom이 워커를 죽이는 2.43 GiB에 가깝다. 채택한다면 메모리를 벌어 주는 레버(<code>EP=1</code> 또는 KV 풀 축소)와 함께 묶어야 한다.</p>
+<h3>Engram 페이지를 놓아 주지 않기</h3>
+<p>읽은 n-gram 페이지를 몇 스텝 뒤 해제하던 것을 끄고 그대로 둔 구성이다. 오늘 밤 콜드 프리필을 실제로 끌어올린 유일한 노브다.</p>
+<p class="tcap">표 17. `ENGRAM_RELEASE=0` 대 기본값(3)</p>
+
+<table>
+<thead>
+<tr>
+<th>항목</th>
+<th style="text-align: right;">기본</th>
+<th style="text-align: right;">rel0</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>콜드 프리필 8K</td>
+<td style="text-align: right;">1,680</td>
+<td style="text-align: right;">1,819</td>
+</tr>
+<tr>
+<td>콜드 프리필 32K</td>
+<td style="text-align: right;">1,454</td>
+<td style="text-align: right;">1,649</td>
+</tr>
+<tr>
+<td>콜드 프리필 128K</td>
+<td style="text-align: right;">1,359</td>
+<td style="text-align: right;">1,505</td>
+</tr>
+<tr>
+<td>코드 C1 스텝 (ms)</td>
+<td style="text-align: right;">75.9</td>
+<td style="text-align: right;">70.7</td>
+</tr>
+<tr>
+<td>코드 C4 스텝 (ms)</td>
+<td style="text-align: right;">129.7</td>
+<td style="text-align: right;">116.2</td>
+</tr>
+<tr>
+<td>에이전트 총시간 (초)</td>
+<td style="text-align: right;">235.0 / 230.6</td>
+<td style="text-align: right;">220.7</td>
+</tr>
+<tr>
+<td>에이전트 레인당 디코드 tok/s</td>
+<td style="text-align: right;">19.0 / 19.8</td>
+<td style="text-align: right;">20.5</td>
+</tr>
+<tr>
+<td>헤드 여유 메모리 최저 (GiB)</td>
+<td style="text-align: right;">4.64</td>
+<td style="text-align: right;">4.03</td>
+</tr>
+</tbody>
+</table>
+<p>프리필이 8~13% 빨라지고 에이전트 작업도 6% 줄었다. 대가는 헤드 여유 0.6 GiB다. T2W가 Engram 읽기를 아예 캐시 없이 가져가면서도 페이지를 붙잡아 두는 쪽을 택한 것과 방향이 같다.</p>
+<p>주의할 점은 메모리다. 우리가 이 노브를 3으로 둔 이유가 헤드 메모리였다. 0.6 GiB는 지금 여유에서는 감당되지만, MoE b12x(2.96 GiB)처럼 메모리를 더 쓰는 레버와 동시에 켜면 earlyoom 사정권에 들어간다.</p>
+<h3>A/B 요약</h3>
+<p class="tcap">표 18. 노브 하나씩 바꿔 본 결과. 기준은 9월 13일 채택 설정</p>
+
+<table>
+<thead>
+<tr>
+<th>태그</th>
+<th>바꾼 것</th>
+<th>얻은 것</th>
+<th>잃은 것</th>
+<th>판단</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>hit-eagle</code></td>
+<td><code>disable_eagle_block_drop</code></td>
+<td>158K 후속 턴 3.13 → 1.17초, 에이전트 235 → 215초</td>
+<td>없음(수락 토큰 불변)</td>
+<td>채택</td>
+</tr>
+<tr>
+<td><code>fork-moeb12x</code></td>
+<td>MoE를 b12x로</td>
+<td>코드 C1 스텝 −6%, C4 −14%, 에이전트 235 → 217초</td>
+<td>헤드 여유 4.64 → 2.96 GiB</td>
+<td>메모리 확보와 함께 채택</td>
+</tr>
+<tr>
+<td><code>fork-rel0</code></td>
+<td>Engram 페이지 해제 끔</td>
+<td>콜드 프리필 +8~13%, 에이전트 235 → 221초</td>
+<td>헤드 여유 4.64 → 4.03 GiB</td>
+<td>채택 후보</td>
+</tr>
+<tr>
+<td><code>fork-ep1</code></td>
+<td>전문가 병렬</td>
+<td>랭크 가중치 −7.24 GiB, 헤드 여유 +6 GiB</td>
+<td>단일 스트림 디코드 −10~12%</td>
+<td>메모리가 급할 때</td>
+</tr>
+<tr>
+<td><code>fork-nokvoff</code></td>
+<td>오프로드 티어 끔</td>
+<td>콜드 프리필 +2~5%</td>
+<td>재기동 뒤 세션 복원</td>
+<td>유지(끄지 않음)</td>
+</tr>
+<tr>
+<td><code>fork-eth128</code></td>
+<td>Engram 읽기 스레드 128</td>
+<td>없음</td>
+<td>없음</td>
+<td>중립</td>
+</tr>
+<tr>
+<td><code>fork-linb12x</code></td>
+<td>dense를 b12x로</td>
+<td>없음</td>
+<td>단일 스트림 수락률 붕괴</td>
+<td>채택 불가</td>
+</tr>
+<tr>
+<td><code>fork-mnbt8192</code></td>
+<td>프리필 배치 8,192</td>
+<td>없음</td>
+<td>128K 프리필 중 earlyoom</td>
+<td>채택 불가</td>
+</tr>
+</tbody>
+</table>
+<p>기준선이 둘이라 폭을 함께 본다. 어제 저녁 측정과 오늘 새벽 재측정(<code>fork-base2</code>)의 차이가 코드 C1에서 2.7%, 코드 C4에서 8.5%다. 같은 설정 재기동 사이의 잡음이 그만큼이라는 뜻이다.</p>
+<p class="tcap">표 19. 두 기준선과 나란히 본 디코드 스텝(ms)</p>
+
+<table>
+<thead>
+<tr>
+<th>구성</th>
+<th style="text-align: right;">코드 C1</th>
+<th style="text-align: right;">코드 C4</th>
+<th style="text-align: right;">산문 C1</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>기준 A(어제 저녁)</td>
+<td style="text-align: right;">75.9</td>
+<td style="text-align: right;">129.7</td>
+<td style="text-align: right;">72.8</td>
+</tr>
+<tr>
+<td>기준 B(새벽 재측정)</td>
+<td style="text-align: right;">73.9</td>
+<td style="text-align: right;">119.5</td>
+<td style="text-align: right;">72.6</td>
+</tr>
+<tr>
+<td>MoE b12x</td>
+<td style="text-align: right;">71.1</td>
+<td style="text-align: right;">110.9</td>
+<td style="text-align: right;">68.5</td>
+</tr>
+<tr>
+<td><code>ENGRAM_RELEASE=0</code></td>
+<td style="text-align: right;">70.7</td>
+<td style="text-align: right;">116.2</td>
+<td style="text-align: right;">84.1</td>
+</tr>
+<tr>
+<td><code>EP=1</code></td>
+<td style="text-align: right;">83.7</td>
+<td style="text-align: right;">123.3</td>
+<td style="text-align: right;">81.7</td>
+</tr>
+<tr>
+<td>오프로드 끔</td>
+<td style="text-align: right;">74.4</td>
+<td style="text-align: right;">118.4</td>
+<td style="text-align: right;">72.1</td>
+</tr>
+<tr>
+<td>읽기 스레드 128</td>
+<td style="text-align: right;">75.1</td>
+<td style="text-align: right;">119.8</td>
+<td style="text-align: right;">73.9</td>
+</tr>
+<tr>
+<td><code>disable_eagle_block_drop</code></td>
+<td style="text-align: right;">75.4</td>
+<td style="text-align: right;">128.9</td>
+<td style="text-align: right;">72.1</td>
+</tr>
+</tbody>
+</table>
+<p>그래서 MoE b12x의 디코드 이득은 코드 C1에서 4~6%, C4에서 7~14%로 읽는 것이 정직하다. <code>ENGRAM_RELEASE=0</code>의 산문 84.1 ms는 같은 부팅에서 산문을 먼저 재서 페이지 캐시가 덜 데워진 것으로 보인다(같은 부팅의 코드 값은 70.7 ms다). 반면 프리필은 재현이 잘 되므로 8~13%는 그대로 믿을 만하다.</p>
+<p>세 레버(<code>hit-eagle</code>, MoE b12x, <code>rel0</code>)가 서로 다른 축을 건드린다. 히트 경계는 프리픽스 재사용, MoE는 디코드 커널, Engram 해제는 프리필 읽기다. 각각 에이전트 작업을 235초에서 215~221초로 줄였으니 합치면 200초 아래를 기대할 수 있다(SGLang 194~198초). 다만 메모리 합계가 관건이라 EP=1이나 KV 축소와 함께 묶어야 한다. 조합 측정은 다음 작업이다.</p>
+<h2>개선 계획</h2>
+<p>오늘 밤 측정으로 순서가 바뀌었다. 노브만으로 되는 것이 먼저이고, 그다음이 코드, 마지막이 승인이 필요한 것이다.</p>
+<p class="tcap">표 20. 채택 후보(측정 반영)</p>
+
+<table>
+<thead>
+<tr>
+<th>#</th>
+<th>후보</th>
+<th>근거</th>
+<th>노력</th>
+<th>위험</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>1</td>
+<td><code>disable_eagle_block_drop</code></td>
+<td>실측: 후속 턴 3.13 → 1.17초, 에이전트 235 → 215초, 대가 없음</td>
+<td>노브</td>
+<td>낮음</td>
+</tr>
+<tr>
+<td>2</td>
+<td>MoE를 b12x로</td>
+<td>실측: 코드 스텝 C1 −6%, C4 −14%, 에이전트 217초</td>
+<td>노브</td>
+<td>헤드 여유 2.96 GiB</td>
+</tr>
+<tr>
+<td>3</td>
+<td><code>ENGRAM_RELEASE=0</code></td>
+<td>실측: 콜드 프리필 +8~13%, 에이전트 221초</td>
+<td>노브</td>
+<td>헤드 여유 4.03 GiB</td>
+</tr>
+<tr>
+<td>4</td>
+<td>1~3 조합 재측정</td>
+<td>축이 달라 합산 기대</td>
+<td>재기동 한 번</td>
+<td>메모리 합계</td>
+</tr>
+<tr>
+<td>5</td>
+<td>Engram 호스트 동기화 제거</td>
+<td>프로파일: <code>Memcpy DtoH</code> 뒤 유휴가 스텝의 12%(회당 10.2~10.3 ms)</td>
+<td>중간</td>
+<td>중간</td>
+</tr>
+<tr>
+<td>6</td>
+<td>업스트림 #56562 cherry-pick</td>
+<td>9월 12일 머지, PR 실측 배치 1 TPOT −15.1%, C1 출력 1.22배</td>
+<td>낮음</td>
+<td>낮음</td>
+</tr>
+<tr>
+<td>7</td>
+<td>T2W Engram 준비 단계 이식</td>
+<td>T2W 구성이 같은 런타임에서 프리필 2,034까지(우리 1,359)</td>
+<td>중간</td>
+<td>산문 수락률 확인 필요</td>
+</tr>
+<tr>
+<td>8</td>
+<td><code>EP=1</code></td>
+<td>실측: 랭크 −7.24 GiB, 헤드 여유 +6 GiB, 단일 스트림 −10~12%</td>
+<td>노브</td>
+<td>속도 교환</td>
+</tr>
+<tr>
+<td>9</td>
+<td>RoCE one-shot all-reduce</td>
+<td>프로파일: NCCL이 스텝의 19%. PR 실측 스텝 지연 −5~19%</td>
+<td>큼</td>
+<td>새 b12x 빌드, libibverbs 설치(오너 승인)</td>
+</tr>
+<tr>
+<td>10</td>
+<td>SWA bounded replay</td>
+<td>프리필 1.4~1.8배(추정)</td>
+<td>큼</td>
+<td>근사 계산, 오프로드 재설계</td>
+</tr>
+</tbody>
+</table>
+<p><strong>손대지 않을 것.</strong> dense를 b12x로 바꾸는 것은 단일 스트림 수락률을 무너뜨린다. 프리필 배치 8,192는 우리 메모리 프로필에서 서버가 죽는다. Engram 읽기 스레드는 중립이다. 프리필 청크 1,024와 <code>expandable_segments:False</code>는 SGLang과 T2W가 메모리 때문에 고른 값이지 속도 레버가 아니다. NCCL 버퍼 축소는 <code>NCCL_LEAN=1</code>로 이미 쓰고 있다.</p>
+<h2>공개 수치를 어떻게 읽을 것인가</h2>
+<p>같은 하드웨어의 공개 기록이 여럿 있어서 서브에이전트가 1차 자료로 대조했다(전문은 <code>research/verification-0915.md</code>). 환각은 없었고 모든 수치가 실재했지만, 조건이 달라 그대로 비교하면 안 되는 것이 많다.</p>
+<p><strong>MiaAI의 128K 프리필 3,251 tok/s는 우리 2,102과 같은 조건이 아니다.</strong> 그 표를 만든 sparkDash는 채우개로 <code>" the"</code> 한 토큰을 반복하고, 프리필 속도를 TTFT로 나눠 구한다. Engram이 n-gram 행을 캐시 없이 직접 읽는 설계라 같은 토큰이 반복되면 행 재사용이 사실상 100%가 된다. MiaAI 자신이 내용이 다른 프롬프트로 잰 값은 2.0~2.2k와 1.5~1.7k로 우리 측정과 겹친다. 다른 공개 4노드 측정(tonyd2wild 902~1,538, yunwei37 1,371~1,590, magicbear vLLM 1,502~1,664)도 모두 우리 급이다.</p>
+<p><strong>T2W 스피드런의 레버별 표는 유용하지만 체크포인트가 다르다.</strong> EXL3 3.5bpw abliterated 기준이고 릴리스 MXFP4가 아니다. 그 표에서 Engram 빠른 스테이징과 읽기 스레드 128이 프리필을 1,443에서 1,897로 올린 것, b12x dense 커널이 "노이즈에서 손해"로 버려진 것이 우리 측정과 방향이 같다.</p>
+<p><strong>방향이 반대인 자료도 있다.</strong> magicbear가 같은 4노드, 같은 공식 체크포인트, 같은 프롬프트로 잰 교차 점검에서는 vLLM 단일 스트림 디코드가 91.98 / 75.54 / 30.79로 SGLang의 71.04 / 57.92 / 27.37보다 빨랐다. 다만 그쪽 SGLang은 컨텍스트 8,192이라 메모리 영역이 우리와 전혀 다르고, 인용된 요청별 원자료가 저장소에 없다.</p>
+<p><strong>업스트림 상태도 확인했다.</strong> SWA bounded replay는 인코더 #56227과 디코더 #56752 모두 열려 있고 처리량 수치가 없다. 입력 메타데이터 Triton 융합 #56562는 9월 12일 머지됐고 배치 1 TPOT를 15.1% 줄였다고 적혀 있다. b12x RoCE shim은 local-inference-lab/vllm #597로 9월 3일 머지됐고 디코드 스텝 지연 5~19% 감소를 보고한다. FlashInfer #5015는 PR이 아니라 열린 이슈이고, T2W가 adaptive verification을 꺼 두는 이유다.</p>
+<h2>한계와 실패한 실험</h2>
+<ul>
+<li>항목마다 1~2회만 쟀다. 프리필은 재현이 잘 된다(같은 설정 재기동에서 5% 안). 디코드는 아니다.</li>
+<li><strong>부팅마다 수락률이 흔들린다.</strong> 오늘 밤 기준선 재측정(<code>fork-base</code>)에서 코드 C1 스텝당 통과 토큰이 5.82에서 3.46으로 떨어지고 에이전트가 385초까지 늘어난 부팅이 하나 나왔다. 같은 설정의 다음 부팅들은 모두 정상이었다. tonyd2wild 저장소도 "거의 같은 설정의 부팅들에서 JSON C1이 59에서 84까지 흔들렸다"고 적어 두었다. 그래서 그 부팅은 기준선에서 제외했고, 디코드 A/B는 스텝 시간과 수락 토큰을 함께 봐야 한다.</li>
+<li>SGLang은 출하 상태로 쟀다. 레시피가 동시 2 이상에서 이득이 난다고 설명하는 DSpark 비용표(SPS)는 프로파일링하지 않았다.</li>
+<li>bounded replay를 끈 SGLang 측정은 두 번 다 실패했다(23:45 marshal 오류, 00:10 NVRM out of memory와 tilelang 컴파일 오류, 둘 다 37cc). 프리필 격차에서 replay의 몫은 추정으로 남는다.</li>
+<li>T2W는 이미지가 아니라 코드만 이식해 쟀다. 그들의 이미지에 들어 있는 다른 빌드 차이(예: FlashInfer 0.7.0rc1 조합)는 재현하지 않았다.</li>
+<li>품질은 비교하지 않았다. 스모크와 니들 정답까지만 확인했다.</li>
+<li>공개 자료 중에는 방향이 반대인 것도 있다. magicbear가 같은 4노드, 같은 공식 체크포인트, 같은 프롬프트로 잰 교차 점검에서는 vLLM 단일 스트림 디코드가 91.98 / 75.54 / 30.79(계수, 코드, 산문)로 SGLang의 71.04 / 57.92 / 27.37보다 빨랐다. 다만 그쪽 SGLang은 컨텍스트 8,192으로 우리와 메모리 영역이 전혀 다르고, 인용된 요청별 원자료가 저장소에 없다. 1차 자료 검증은 <code>research/verification-0915.md</code>에 있다.</li>
+</ul>
+<h2>부록</h2>
+<details>
+<summary>밤샘 작업 기록</summary>
+<ul>
+<li>00:34~01:05 T2W boot10 구성 측정, 01:07~01:34 T2W best 측정. 이미지 없이 그들의 패치 트리를 우리 venv에 <code>PYTHONPATH</code>로 올렸다.</li>
+<li>01:35~03:37 fork A/B 큐 10개 구성. 각 구성마다 서버를 완전히 내렸다 올렸다.</li>
+<li>03:37:49 큐가 비면서 채택 설정으로 재기동, 03:41 health 200. 네 노드 active, 클럭 상한 1,989 MHz 유지, 헤드 여유 5.88 GiB.</li>
+<li>프로덕션은 오너 허가로 00:10부터 03:41까지 내려가 있었다.</li>
+</ul>
+</details>
+<details>
+<summary>도구와 원자료</summary>
+<p>max10의 포크 체크아웃 노트 <code>.notes/2026-09-14-sglang-mialab-vs-vllm/</code>에 있다(커밋하지 않는 노트).</p>
+<ul>
+<li><code>tools/run_suite.sh</code> 전체 스위트, <code>tools/ab_suite.sh</code> 설정 A/B용 단축 스위트, <code>tools/hit_suite.sh</code> 프리픽스 히트용 스위트, <code>tools/profile_decode.sh</code> 디코드 프로파일.</li>
+<li><code>tools/t2w/</code> T2W 워크트리 빌드와 기동, <code>tools/env.tp4</code>와 <code>tools/sglang_ctl.sh</code> SGLang 준비와 제어.</li>
+<li><code>raw/</code> 측정 원자료(<code>decode.jsonl</code>, <code>casebench.jsonl</code>, <code>longctx.jsonl</code>)와 실행 로그.</li>
+<li><code>analysis-mialab-sglang.md</code>, <code>analysis-tonyd2wild.md</code> 코드 분석 전문.</li>
+</ul>
+</details>
+</div></body></html>

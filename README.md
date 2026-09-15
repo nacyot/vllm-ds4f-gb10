@@ -31,16 +31,16 @@ flowchart LR
 - **Relay restore.** Only rank 0 has the host and disk tiers. Loaded blocks are broadcast from rank 0's GPU to the other ranks in 64 MiB windows, since the MLA KV is the same on every TP rank. Only the head needs the disk.
 - **Failure handling.** A block that is missing or fails its checksum is recomputed instead of failing the request.
 - **Retention.** A systemd timer deletes store files older than 7 days, then the oldest files while the store exceeds 3000 GiB.
-- **Engram tables.** V4.1's 203 GB of Engram tables stay in the checkpoint files and are memory-mapped read-only. Rows are prefaulted per step, the next prefill chunk is prefetched in the background, and pages are released after 3 steps.
+- **Engram tables.** V4.1's 203 GB of Engram tables stay in the checkpoint files and are memory-mapped read-only. Rows are prefaulted per step, the next prefill chunk is prefetched in the background, and reclaim is left to the kernel.
 
 ### Added in this fork
 
 | Area | Change |
 | --- | --- |
 | KV offload | Rank 0 relay restore for multi-node TP, per-group host tier rows, batched CRC32 check (`csrc/fs_io.cpp`), no re-scan of a request waiting on a promotion |
-| Engram | Read-only mmap tables with per-step prefault, background prefetch and page release |
-| GB10 (SM121) | Page-size fixes in attention, sparse FlashInfer and indexer paths |
-| Scheduler | Env-gated prefill caps, off by default |
+| Engram | Read-only mmap tables with per-step prefault, background prefetch, and a decode-step prefault issued asynchronously so the forward does not wait on cold pages |
+| GB10 (SM121) | Page-size fixes in attention, sparse FlashInfer and indexer paths, and an indexer prefill that splits its rows across the TP ranks |
+| Scheduler | Env-gated prefill caps, off by default, and a reserved slice of the prefill batch for short requests queued behind a long one |
 | Deploy | Launcher, defaults, probes and benchmarks in `deploy/gb10-cluster/dsv41/` |
 
 ## Measured
@@ -55,6 +55,9 @@ Production configuration, GPU clocks capped at 2000 MHz.
 | Seven 493K sessions resident on the GPU | 1.8 to 2.3 s per switch | 2026-09-11 |
 | Prefill, 8K and 32K prompts | 1,737 and 1,464 tok/s | 2026-09-13 |
 | Decode, 1 stream and 4 streams | 38.6 tok/s and 78.6 tok/s in total | 2026-09-13 |
+| Prefill, 128K prompt | 1,599 to 1,894 tok/s, run to run | 2026-09-16 |
+| Decode, 1 stream, prose and code | 45.2 and 86.0 tok/s | 2026-09-16 |
+| Short request queued behind a 128K prefill | 7 to 15 s to the answer | 2026-09-16 |
 
 ## Setup
 
