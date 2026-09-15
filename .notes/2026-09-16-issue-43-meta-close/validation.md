@@ -85,11 +85,16 @@ $ hangar upload -slug dsv41-meta-issue-43-close-2026-09-16 -type 리포트 repor
 uploaded /p/dsv41-meta-issue-43-close-2026-09-16/ (id=dsv41-meta-issue-43-close-2026-09-16,
          files=1, status=active, version=1)
 title adopted from the document: "메타 이슈 #43 마감: 다섯 주제가 어떻게 끝났나"
-verified /p/dsv41-meta-issue-43-close-2026-09-16/ - serves the same bytes as report.html
-         (sha256 51ddd64ea650, 23.0 KiB)
+verified ... serves the same bytes as report.html (sha256 51ddd64ea650, 23.0 KiB)
+
+$ hangar upload -slug dsv41-meta-issue-43-close-2026-09-16 -type 리포트 --replace report.html
+replaced /p/dsv41-meta-issue-43-close-2026-09-16/ (status=active, version=2)
+verified ... serves the same bytes as report.html (sha256 e7956605cbd0, 23.1 KiB)
 ```
 
-`hangar info` 확인: status `active`, type `리포트`, format `html`, version `v1`, created 2026-09-15T21:01:38Z(= 09-16 06:01 KST).
+v2 는 검증 단계에서 찾은 본문 오류 두 건을 고친 판이다(아래 8 절). 같은 세션에서 몇 분 전 올린 같은 슬러그를 고친 것이라 남의 문서를 덮지 않았다.
+
+`hangar info` 확인: status `active`, type `리포트`, format `html`, version `v2`, 첫 업로드 2026-09-15T21:01:38Z(= 09-16 06:01 KST).
 URL: <https://hangar.tail39057.ts.net/p/dsv41-meta-issue-43-close-2026-09-16/>
 
 새 슬러그다. 업로드 전 `hangar info` 가 404 였으므로 기존 문서를 덮지 않았다.
@@ -120,3 +125,16 @@ URL: <https://hangar.tail39057.ts.net/p/dsv41-meta-issue-43-close-2026-09-16/>
 | Forgejo `origin` `main` | `caa6475829` |
 
 `git merge-base --is-ancestor caa6475829 main` 통과, 미푸시 1 커밋으로 둘 다 fast-forward 다. `--force` 는 쓰지 않는다. 노드 sync 는 하지 않는다.
+
+## 8. 검증 단계에서 고친 것
+
+`git diff dfc7f53104..HEAD` 를 계획과 요청 원문에 대조하면서 `report.md` 의 수치를 근거 노트와 다시 맞췄다. 실질 오류 두 건을 그 자리에서 고쳤다.
+
+| 위치 | 고치기 전 | 고친 뒤 | 근거 |
+| --- | --- | --- | --- |
+| 리드 문단 | "열두 건이 전부 닫혔고", "산문 94.4, 코드 94 대 97" | "열두 건 중 열한 건이 닫혔다", "산문 c1 94.4, 코드 c1 96.5, 코드 c4 합산 81.5" | #29 가 열려 있으므로 12 건 중 11 건이다. 점수 다섯 개는 issue-46 `results.md` 135 절의 94.37 / 96.54 / 81.54 / 80.10 / 102.29 이고 "94 대 97" 은 어느 값도 아니었다 |
+| 주제 2, 동일성 검증 문단 | "8K 프롬프트는 첫 토큰이 거의 동점이라(logprob 차 0.3 nats 안)" | 8K 는 두 후보 logprob 이 회차마다 뒤바뀔 만큼 가깝다고 쓰고, 32K 는 차순위와 4.5 nats 이상 벌어진다고 구분 | 0.13~0.35 nats 는 8K 첫 토큰이 아니라 32K 공통 접두 top-1 의 차다. 8K 첫 토큰 차는 0.5~1.0 nats 다. 근거: issue-38 `results.md` 4 절 greedy 대조군 |
+
+고친 뒤 `report.html` 을 다시 렌더하고 hangar 를 v2 로 교체했다. `plan.md` 의 결과 대장에는 같은 오류가 없었다(8K 는 "near-tie 라 판정에 못 쓴다" 로만 적혀 있었다).
+
+인용 경로 점검도 했다. `plan.md`, `report.md`, `validation.md` 가 가리키는 `.notes/**` 경로 14 개가 모두 실재한다.
