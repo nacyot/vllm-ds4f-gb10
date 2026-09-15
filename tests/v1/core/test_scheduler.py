@@ -6429,7 +6429,9 @@ def test_decode_steps_per_prefill_defers_prefill_chunks(
 
 
 def _short_reserve_scheduler() -> Scheduler:
-    return create_scheduler(max_num_batched_tokens=1024, max_num_seqs=4)
+    # Budget and prompts stay well inside opt-125m's 2048-token model length, so
+    # the chunk sizes below come from the reservation and nothing else.
+    return create_scheduler(max_num_batched_tokens=256, max_num_seqs=4)
 
 
 def test_short_reserve_admits_waiting_short_request(monkeypatch: pytest.MonkeyPatch):
@@ -6442,7 +6444,7 @@ def test_short_reserve_admits_waiting_short_request(monkeypatch: pytest.MonkeyPa
     def two_steps() -> list[dict[str, int]]:
         scheduler = _short_reserve_scheduler()
         (prefill,) = create_requests(
-            num_requests=1, num_tokens=5000, req_ids=["prefill"]
+            num_requests=1, num_tokens=2000, req_ids=["prefill"]
         )
         (short,) = create_requests(num_requests=1, num_tokens=8, req_ids=["short"])
         scheduler.add_request(prefill)
@@ -6450,10 +6452,10 @@ def test_short_reserve_admits_waiting_short_request(monkeypatch: pytest.MonkeyPa
         scheduler.add_request(short)
         return [first, dict(scheduler.schedule().num_scheduled_tokens)]
 
-    assert two_steps() == [{"prefill": 1024}, {"prefill": 1024}]
+    assert two_steps() == [{"prefill": 256}, {"prefill": 256}]
 
-    monkeypatch.setattr(sched_module, "DSPARK_SHORT_RESERVE", 4096)
-    assert two_steps() == [{"prefill": 1024}, {"prefill": 1016, "short": 8}]
+    monkeypatch.setattr(sched_module, "DSPARK_SHORT_RESERVE", 64)
+    assert two_steps() == [{"prefill": 256}, {"prefill": 248, "short": 8}]
 
 
 def test_short_reserve_feeds_decode_behind_prefill(monkeypatch: pytest.MonkeyPatch):
@@ -6463,7 +6465,7 @@ def test_short_reserve_feeds_decode_behind_prefill(monkeypatch: pytest.MonkeyPat
     prefill ahead of it takes the budget again and its wait covers the whole
     prefill, not just the admission.
     """
-    monkeypatch.setattr(sched_module, "DSPARK_SHORT_RESERVE", 4096)
+    monkeypatch.setattr(sched_module, "DSPARK_SHORT_RESERVE", 64)
     scheduler = _short_reserve_scheduler()
     requests: dict[str, Request] = {}
 
@@ -6488,18 +6490,18 @@ def test_short_reserve_feeds_decode_behind_prefill(monkeypatch: pytest.MonkeyPat
         )
         return dict(output.num_scheduled_tokens)
 
-    (prefill,) = create_requests(num_requests=1, num_tokens=5000, req_ids=["prefill"])
+    (prefill,) = create_requests(num_requests=1, num_tokens=2000, req_ids=["prefill"])
     (short,) = create_requests(
         num_requests=1, num_tokens=8, max_tokens=100, req_ids=["short"]
     )
     requests.update({"prefill": prefill, "short": short})
     scheduler.add_request(prefill)
-    assert step() == {"prefill": 1024}
+    assert step() == {"prefill": 256}
     scheduler.add_request(short)
-    assert step() == {"prefill": 1016, "short": 8}
-    # The prefill has 2952 tokens left, so it alone would still fill the budget.
-    assert step() == {"prefill": 1023, "short": 1}
-    assert step() == {"prefill": 1023, "short": 1}
+    assert step() == {"prefill": 248, "short": 8}
+    # The prefill still has 1496 tokens to go, so it alone would fill the budget.
+    assert step() == {"prefill": 255, "short": 1}
+    assert step() == {"prefill": 255, "short": 1}
 
 
 def test_short_reserve_off_matches_baseline(monkeypatch: pytest.MonkeyPatch):
@@ -6507,12 +6509,12 @@ def test_short_reserve_off_matches_baseline(monkeypatch: pytest.MonkeyPatch):
     monkeypatch.setattr(sched_module, "DSPARK_SHORT_RESERVE", 0)
     scheduler = _short_reserve_scheduler()
     for request in create_requests(
-        num_requests=1, num_tokens=5000, req_ids=["prefill"]
+        num_requests=1, num_tokens=2000, req_ids=["prefill"]
     ) + create_requests(num_requests=1, num_tokens=8, req_ids=["short"]):
         scheduler.add_request(request)
     assert [scheduler.schedule().num_scheduled_tokens for _ in range(2)] == [
-        {"prefill": 1024},
-        {"prefill": 1024},
+        {"prefill": 256},
+        {"prefill": 256},
     ]
 
 
@@ -6522,11 +6524,11 @@ def test_short_reserve_ignores_long_waiting_request(monkeypatch: pytest.MonkeyPa
     This is what keeps a single long prefill's throughput untouched: with
     nothing short waiting there is nothing to hold back.
     """
-    monkeypatch.setattr(sched_module, "DSPARK_SHORT_RESERVE", 4096)
+    monkeypatch.setattr(sched_module, "DSPARK_SHORT_RESERVE", 64)
     scheduler = _short_reserve_scheduler()
-    (prefill,) = create_requests(num_requests=1, num_tokens=5000, req_ids=["prefill"])
+    (prefill,) = create_requests(num_requests=1, num_tokens=2000, req_ids=["prefill"])
     scheduler.add_request(prefill)
-    assert scheduler.schedule().num_scheduled_tokens == {"prefill": 1024}
-    (other,) = create_requests(num_requests=1, num_tokens=8000, req_ids=["other"])
+    assert scheduler.schedule().num_scheduled_tokens == {"prefill": 256}
+    (other,) = create_requests(num_requests=1, num_tokens=1000, req_ids=["other"])
     scheduler.add_request(other)
-    assert scheduler.schedule().num_scheduled_tokens == {"prefill": 1024}
+    assert scheduler.schedule().num_scheduled_tokens == {"prefill": 256}
