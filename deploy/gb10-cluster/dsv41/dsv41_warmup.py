@@ -108,7 +108,7 @@ def send(name, model, body):
                 usage = data.get("usage") or usage
                 for choice in data.get("choices", []):
                     delta = choice.get("delta", {})
-                    if delta.get("content") or delta.get("reasoning_content"):
+                    if delta.get("content") or delta.get("reasoning"):
                         first = first or time.perf_counter()
                     text.append(delta.get("content") or "")
     except (OSError, ValueError, http.client.HTTPException) as exc:
