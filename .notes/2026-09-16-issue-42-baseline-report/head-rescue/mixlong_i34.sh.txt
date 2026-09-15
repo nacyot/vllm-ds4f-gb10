@@ -1,0 +1,14 @@
+#!/bin/bash
+# mixlong.sh <tag> <config-label> <port>: the pi-like AG4 workload with a 128K cold prefill
+# injected 60 s in (one agent resuming a long session). Both records go to casebench.jsonl;
+# total time runs from the agent start to whichever of the two finishes last.
+T=$1; C=$2; P=$3
+D=/home/nacyot/vllm-dsv41/deploy/gb10-cluster/dsv41; B=http://127.0.0.1:$P
+python3 $D/casebench.py --base $B --config "$C" --out /home/nacyot/sglang-cmp/results/casebench.jsonl --mode agent --tag "$T-MX4" --lanes 4 --turns 6 --stagger 8 \
+  --start-tokens 12000 --turn-tokens-min 2000 --turn-tokens-max 8000 --gen-min 150 --gen-max 900 \
+  --work-seed w1 --thinking high --temperature default &
+AG=$!
+sleep 60
+python3 $D/casebench.py --base $B --config "$C" --out /home/nacyot/sglang-cmp/results/casebench.jsonl --mode solo --tag "$T-MXL" --prefill-tokens 128000
+wait "$AG"
+echo MIX DONE

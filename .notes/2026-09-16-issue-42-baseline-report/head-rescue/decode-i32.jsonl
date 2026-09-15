@@ -1,0 +1,1 @@
+{"tag": "prod-i32", "type": "code", "ts": "2026-09-16T01:02:13", "c": 1, "gen": 256, "streams_ok": 1, "errors": [], "per_stream_1": 85.31, "per_stream_1_min": 85.31, "window_agg_3": 85.31, "wall_agg_4": 77.66, "ttft_mean_s": 0.307, "ttft_median_s": 0.307, "tokens_per_chunk": 5.82, "completion_tokens": [256], "prompt_tokens": 101}
