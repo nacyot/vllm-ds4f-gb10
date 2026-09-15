@@ -1,0 +1,191 @@
+#!/usr/bin/env python3
+"""Issue #41: attribute decode-step time of V4.1 torch traces, per rank (stdlib only).
+
+Usage: prof_summary_i41.py <tag dir> --name "generation_2(12)" [--skip 3]
+       [--cats-dir deploy/gb10-cluster/dsv41] [--json out.json]
+
+<tag dir> holds the per-rank traces (*.pt.trace.json.gz, any depth; the rank comes
+from "rankN" in the file name). A step is the CPU interval between two
+execute_context annotations; a kernel belongs to the step whose interval holds the
+runtime call that launched it (CUPTI correlation). Steady steps are the annotations
+whose name contains --name, minus the first --skip and the last. Per step:
+
+  window       first kernel launched by the step .. first kernel of the next step
+  busy         union of the kernels inside the window
+  engram_wait  idle gaps >= 0.5 ms that follow a Memcpy DtoH (Device -> Pageable),
+               i.e. the runner's hash .cpu() before the Engram prefault
+  host_idle    other idle gaps >= 0.5 ms
+  small_gaps   idle gaps < 0.5 ms
+  cat:*        kernel time by prof_summary.CATS
+  phase:*      target_graph / draft_graph = kernels of a cudaGraphLaunch inside /
+               after the annotation (execute_model / sample_tokens + propose);
+               eager_in / eager_after = every other kernel, same split
+  moe          sm120 grouped GEMM calls per step and mean duration per kernel shape
+  nccl         NCCL kernel time
+
+Steps are matched across ranks by order; NCCL is split into transfer (per-step
+minimum over ranks) and wait (rank minus that minimum).
+"""
+
+import argparse
+import bisect
+import collections
+import glob
+import gzip
+import json
+import os
+import re
+import statistics
+import sys
+
+MOE_RE = re.compile(r"gemm_1d1d_impl<0u, ?(\d+)u, ?(\d+)u")
+GAP_US = 500.0
+
+
+def rank_steps(path, name, skip, cat_of):
+    ev = json.load(gzip.open(path))["traceEvents"]
+    kern = sorted(
+        (e for e in ev if e.get("cat") in ("kernel", "gpu_memcpy", "gpu_memset")),
+        key=lambda e: e["ts"],
+    )
+    runtime = {}
+    for e in ev:
+        if e.get("cat") in ("cuda_runtime", "cuda_driver"):
+            c = (e.get("args") or {}).get("correlation")
+            if c is not None:
+                runtime.setdefault(c, e)
+    ann = sorted(
+        (
+            e
+            for e in ev
+            if e.get("cat") == "user_annotation"
+            and e["name"].startswith("execute_context")
+        ),
+        key=lambda e: e["ts"],
+    )
+    del ev
+    starts = [a["ts"] for a in ann]
+    launched = collections.defaultdict(list)
+    for k in kern:
+        r = runtime.get((k.get("args") or {}).get("correlation"))
+        launch = r["ts"] if r else k["ts"]
+        i = bisect.bisect_right(starts, launch) - 1
+        if i >= 0:
+            launched[i].append((k, r["name"] if r else "", launch))
+    first = {i: min(x[0]["ts"] for x in v) for i, v in launched.items()}
+    kts = [k["ts"] for k in kern]
+    steady = [
+        i
+        for i, a in enumerate(ann)
+        if name in a["name"] and i in first and i + 1 in first
+    ][skip:-1]
+    rows = []
+    for i in steady:
+        a_end = ann[i]["ts"] + ann[i]["dur"]
+        w0, w1 = first[i], first[i + 1]
+        row = collections.defaultdict(float)
+        row["name"] = ann[i]["name"]
+        row["window"] = (w1 - w0) / 1e3
+        row["cpu_annot"] = ann[i]["dur"] / 1e3
+        cur_s = cur_e = None
+        last = None
+
+        def gap(g, before, row=row):
+            if g < GAP_US:
+                row["small_gaps"] += g / 1e3
+            elif "DtoH" in before["name"] and "Pageable" in before["name"]:
+                row["engram_wait"] += g / 1e3
+            else:
+                row["host_idle"] += g / 1e3
+
+        for k in kern[bisect.bisect_left(kts, w0) : bisect.bisect_left(kts, w1)]:
+            s, e = k["ts"], k["ts"] + k["dur"]
+            if cur_e is None:
+                cur_s, cur_e, last = s, e, k
+            elif s > cur_e:
+                row["busy"] += (cur_e - cur_s) / 1e3
+                gap(s - cur_e, last)
+                cur_s, cur_e, last = s, e, k
+            elif e >= cur_e:
+                cur_e, last = e, k
+        row["busy"] += (cur_e - cur_s) / 1e3
+        if w1 > cur_e:
+            gap(w1 - cur_e, last)
+        moe = collections.defaultdict(lambda: [0, 0.0])
+        for k, rname, launch in launched[i]:
+            inside = launch < a_end
+            if rname == "cudaGraphLaunch":
+                phase = "target_graph" if inside else "draft_graph"
+            else:
+                phase = "eager_in" if inside else "eager_after"
+            row["phase:" + phase] += k["dur"] / 1e3
+            row["cat:" + cat_of(k["name"])] += k["dur"] / 1e3
+            if "nccl" in k["name"].lower():
+                row["nccl"] += k["dur"] / 1e3
+            m = MOE_RE.search(k["name"])
+            if m:
+                key = f"{phase.split('_')[0]}:{m.group(1)}x{m.group(2)}"
+                moe[key][0] += 1
+                moe[key][1] += k["dur"]
+        row["moe"] = dict(moe)
+        rows.append(row)
+    return rows
+
+
+def mean_rows(rows):
+    keys = sorted({k for r in rows for k in r if k not in ("name", "moe")})
+    out = {k: statistics.mean(r.get(k, 0.0) for r in rows) for k in keys}
+    moe = collections.defaultdict(lambda: [0, 0.0])
+    for r in rows:
+        for key, (n, us) in r["moe"].items():
+            moe[key][0] += n
+            moe[key][1] += us
+    for key, (n, us) in sorted(moe.items()):
+        out[f"moe_calls:{key}"] = n / len(rows)
+        out[f"moe_us:{key}"] = us / n
+    return out
+
+
+def main():
+    ap = argparse.ArgumentParser()
+    ap.add_argument("tag_dir")
+    ap.add_argument("--name", required=True)
+    ap.add_argument("--skip", type=int, default=3)
+    ap.add_argument("--cats-dir", default="deploy/gb10-cluster/dsv41")
+    ap.add_argument("--json")
+    a = ap.parse_args()
+    sys.path.insert(0, a.cats_dir)
+    from prof_summary import cat_of
+
+    paths = {}
+    for p in glob.glob(os.path.join(a.tag_dir, "**", "*.pt.trace.json*"), recursive=True):
+        m = re.search(r"rank(\d+)", os.path.basename(p))
+        if m:
+            paths[int(m.group(1))] = p
+    per_rank = {r: rank_steps(p, a.name, a.skip, cat_of) for r, p in sorted(paths.items())}
+    ranks = sorted(per_rank)
+    n = min(len(v) for v in per_rank.values())
+    names = {tuple(x["name"] for x in per_rank[r][:n]) for r in ranks}
+    print(
+        f"== {a.tag_dir}: ranks {ranks}, steps {[len(per_rank[r]) for r in ranks]}, "
+        f"aligned {n}, step names agree across ranks: {len(names) == 1}"
+    )
+    means = {r: mean_rows(per_rank[r][:n]) for r in ranks}
+    transfer = [min(per_rank[r][j]["nccl"] for r in ranks) for j in range(n)]
+    for r in ranks:
+        means[r]["nccl_transfer"] = statistics.mean(transfer)
+        means[r]["nccl_wait"] = statistics.mean(
+            per_rank[r][j]["nccl"] - transfer[j] for j in range(n)
+        )
+    keys = sorted({k for r in ranks for k in means[r]})
+    print(f"{'metric':34s}" + "".join(f"{'rank' + str(r):>10s}" for r in ranks))
+    for k in keys:
+        fmt = "{:10.0f}" if k.startswith("moe_us") else "{:10.2f}"
+        print(f"{k:34s}" + "".join(fmt.format(means[r].get(k, 0.0)) for r in ranks))
+    if a.json:
+        with open(a.json, "w") as f:
+            json.dump({"tag_dir": a.tag_dir, "steps": n, "ranks": means}, f, indent=1)
+
+
+if __name__ == "__main__":
+    main()

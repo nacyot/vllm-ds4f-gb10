@@ -1,0 +1,177 @@
+#!/usr/bin/env python3
+"""Per decode step view of a V4.1 torch trace (stdlib only).
+
+Steps are the CPU user_annotation execute_context_* spans; a step's GPU window runs
+from its first kernel to the next step's first kernel. For steady steady-state steps
+(name filter) prints means of: window, GPU busy, idle split by gap size, category
+sums (prof_summary.CATS), MoE GEMM per-call times per kernel shape, NCCL, and what
+CPU op launched the kernel right after each idle gap >= 0.5 ms.
+"""
+
+import argparse
+import bisect
+import collections
+import gzip
+import json
+import re
+import statistics
+import sys
+
+sys.path.insert(0, sys.argv.pop(1))
+from prof_summary import CATS, cat_of  # noqa: E402
+
+
+def main():
+    ap = argparse.ArgumentParser()
+    ap.add_argument("trace")
+    ap.add_argument("--name", default="generation_")
+    ap.add_argument("--skip", type=int, default=3)
+    a = ap.parse_args()
+    ev = json.load(gzip.open(a.trace))["traceEvents"]
+    kern = sorted(
+        (e for e in ev if e.get("cat") in ("kernel", "gpu_memcpy", "gpu_memset")),
+        key=lambda e: e["ts"],
+    )
+    kts = [e["ts"] for e in kern]
+    steps = sorted(
+        (
+            e
+            for e in ev
+            if e.get("cat") == "user_annotation"
+            and e["name"].startswith("execute_context")
+        ),
+        key=lambda e: e["ts"],
+    )
+    # CPU launch op per kernel via correlation id
+    corr_rt = {}
+    for e in ev:
+        if e.get("cat") in ("cuda_runtime", "cuda_driver"):
+            c = (e.get("args") or {}).get("correlation")
+            if c is not None:
+                corr_rt[c] = e
+    ops = sorted(
+        (e for e in ev if e.get("cat") in ("cpu_op", "user_annotation")),
+        key=lambda e: e["ts"],
+    )
+    ops_ts = [e["ts"] for e in ops]
+
+    def launcher(k):
+        c = (k.get("args") or {}).get("correlation")
+        rt = corr_rt.get(c)
+        if rt is None:
+            return "?"
+        i = bisect.bisect_right(ops_ts, rt["ts"])
+        best = None
+        for o in ops[max(0, i - 200) : i][::-1]:
+            if o["ts"] <= rt["ts"] <= o["ts"] + o["dur"]:
+                if best is None or o["dur"] < best["dur"]:
+                    best = o
+        return best["name"][:60] if best else "none"
+
+    firsts = []
+    for s in steps:
+        j = bisect.bisect_left(kts, s["ts"])
+        firsts.append(j)
+    rows = []
+    for si, s in enumerate(steps):
+        if a.name not in s["name"]:
+            continue
+        lo = firsts[si]
+        hi = firsts[si + 1] if si + 1 < len(steps) else len(kern)
+        ks = kern[lo:hi]
+        if len(ks) < 50:
+            continue
+        w0 = ks[0]["ts"]
+        w1 = kern[hi]["ts"] if hi < len(kern) else max(e["ts"] + e["dur"] for e in ks)
+        busy = 0.0
+        cur_s = cur_e = None
+        gaps = []
+        for e in ks:
+            st, en = e["ts"], e["ts"] + e["dur"]
+            if cur_e is None:
+                cur_s, cur_e = st, en
+            elif st > cur_e:
+                busy += cur_e - cur_s
+                gaps.append((st - cur_e, e))
+                cur_s, cur_e = st, en
+            else:
+                cur_e = max(cur_e, en)
+        busy += cur_e - cur_s
+        if w1 > cur_e:
+            gaps.append((w1 - cur_e, kern[hi] if hi < len(kern) else ks[-1]))
+        per = collections.defaultdict(float)
+        moe = collections.defaultdict(list)
+        nccl = []
+        for e in ks:
+            per[cat_of(e["name"])] += e["dur"]
+            if "gemm_1d1d" in e["name"] or "fp8_fp4_gemm" in e["name"]:
+                m = re.search(r"<0u, ?(\d+)u, ?(\d+)u", e["name"])
+                moe[m.groups() if m else e["name"][:40]].append(e["dur"])
+            if "nccl" in e["name"].lower():
+                nccl.append(e["dur"])
+        rows.append(
+            dict(
+                si=si,
+                name=s["name"],
+                cpu_ms=s["dur"] / 1e3,
+                win=(w1 - w0) / 1e3,
+                busy=busy / 1e3,
+                g_small=sum(g for g, _ in gaps if g < 500) / 1e3,
+                g_big=sum(g for g, _ in gaps if g >= 500) / 1e3,
+                n_small=sum(1 for g, _ in gaps if g < 500),
+                big=[(g / 1e3, launcher(k)) for g, k in gaps if g >= 500],
+                per={c: v / 1e3 for c, v in per.items()},
+                moe={k: (len(v), sum(v) / len(v) / 1e3) for k, v in moe.items()},
+                nccl=(len(nccl), sum(nccl) / 1e3),
+                nk=len(ks),
+            )
+        )
+    rows = rows[a.skip :]
+    if not rows:
+        print("no steps")
+        return
+    names = collections.Counter(r["name"] for r in rows)
+    print(f"steps used {len(rows)} {dict(names)}")
+
+    def mean(f):
+        return statistics.mean(f(r) for r in rows)
+
+    print(
+        f"window {mean(lambda r: r['win']):.1f} ms (median "
+        f"{statistics.median(r['win'] for r in rows):.1f}), cpu annot "
+        f"{mean(lambda r: r['cpu_ms']):.1f}, busy {mean(lambda r: r['busy']):.1f}, "
+        f"idle<0.5 {mean(lambda r: r['g_small']):.2f} (n {mean(lambda r: r['n_small']):.0f}), "
+        f"idle>=0.5 {mean(lambda r: r['g_big']):.2f}, kernels {mean(lambda r: r['nk']):.0f}"
+    )
+    print(
+        "cats: "
+        + ", ".join(
+            f"{c[0]} {mean(lambda r, c=c: r['per'].get(c[0], 0.0)):.2f}"
+            for c in CATS + [("other", "")]
+        )
+    )
+    shapes = collections.defaultdict(list)
+    for r in rows:
+        for k, (n, avg) in r["moe"].items():
+            shapes[k].append((n, avg))
+    for k, v in shapes.items():
+        print(
+            f"moe {k}: calls/step {statistics.mean(x[0] for x in v):.1f}, "
+            f"per call {statistics.mean(x[1] for x in v) * 1e3:.0f} us"
+        )
+    print(
+        f"nccl calls/step {mean(lambda r: r['nccl'][0]):.1f}, "
+        f"ms/step {mean(lambda r: r['nccl'][1]):.2f}"
+    )
+    big = collections.defaultdict(lambda: [0, 0.0])
+    for r in rows:
+        for g, who in r["big"]:
+            big[who][0] += 1
+            big[who][1] += g
+    print("idle>=0.5 by next launcher (per step):")
+    for who, (n, t) in sorted(big.items(), key=lambda kv: -kv[1][1])[:8]:
+        print(f"  {t / len(rows):6.2f} ms n={n} {who}")
+
+
+if __name__ == "__main__":
+    main()

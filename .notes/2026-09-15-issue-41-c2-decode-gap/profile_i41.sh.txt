@@ -1,0 +1,37 @@
+#!/usr/bin/env bash
+# profile_i41.sh <tag> <kind> <mode>: torch-profile one decodebench_i41.py wave (gen 128) on gx10-6040 (issue #41).
+# The server must run with PROFILER_DIR=/home/nacyot/dsv41-prep/prof-i41-base. Unlike profile_one.sh this deletes
+# nothing: it refuses to start while the profiler dir holds top-level files on any node, and once the traces stop
+# growing it moves the new top-level files into <dir>/<tag>/ on every node. Summaries run on the workstation.
+set -u
+T=${1:?tag}; KIND=${2:?kind}; MODE=${3:?mode}
+B=http://127.0.0.1:8888
+P=/home/nacyot/dsv41-prep/prof-i41-base
+HERE=/home/nacyot/dsv41-prep
+NODES="local 10.100.0.32 10.100.0.48 10.100.0.64"
+on() { if [ "$1" = local ]; then bash -c "$2"; else ssh -n -o BatchMode=yes -o ConnectTimeout=10 "$1" "$2"; fi; }
+avail() { awk '/MemAvailable/ {printf "%.2f", $2/1048576}' /proc/meminfo; }
+for n in $NODES; do
+  c=$(on "$n" "find $P -maxdepth 1 -type f | wc -l")
+  [ "$c" = 0 ] || { echo "$n: $c top-level files already in $P; move them before profiling" >&2; exit 2; }
+  on "$n" "test ! -e $P/$T" || { echo "$n: $P/$T exists" >&2; exit 2; }
+done
+echo "$(date +%T) profile $T ($KIND $MODE) | head MemAvailable $(avail) GiB"
+curl -s -m 60 -X POST "$B/start_profile" >/dev/null
+sleep 2
+python3 "$HERE/decodebench_i41.py" --tag "i41-prof-$T" --kind "$KIND" --modes "$MODE" --gen 128 --gap 1 --out "$HERE/decode_i41.jsonl"
+curl -s -m 600 -X POST "$B/stop_profile" >/dev/null
+echo "$(date +%T) stopped $T | head MemAvailable $(avail) GiB"
+prev=""; stable=0
+for _ in $(seq 1 40); do
+  sleep 10
+  cur=$(for n in $NODES; do on "$n" "du -sb $P | cut -f1"; done | tr '\n' ' ')
+  echo "$(date +%T) sizes $cur| head MemAvailable $(avail) GiB"
+  if [ "$cur" = "$prev" ]; then stable=$((stable + 1)); else stable=0; fi
+  prev=$cur
+  [ "$stable" -ge 2 ] && break
+done
+for n in $NODES; do
+  on "$n" "mkdir $P/$T && find $P -maxdepth 1 -type f -exec mv -n -t $P/$T/ {} + && echo \$(hostname): \$(ls $P/$T | tr '\n' ' ')"
+done
+echo "$(date +%T) PROFILE DONE $T | head MemAvailable $(avail) GiB"

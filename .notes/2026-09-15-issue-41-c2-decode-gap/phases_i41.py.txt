@@ -1,0 +1,76 @@
+#!/usr/bin/env python3
+"""Split steady decode steps of a V4.1 trace by where the CPU launched each kernel.
+
+Every GPU kernel carries the CUPTI correlation of the runtime call that launched
+it; kernels of a CUDA graph replay point at a cudaGraphLaunch call. A step is the
+CPU interval from one execute_context annotation to the next. Runtime calls inside
+the annotation (execute_model) launch the target forward; the ones after it
+(sample_tokens: logits, rejection sampler, postprocess; propose: draft forward)
+belong to verification and drafting. Prints per step means of GPU kernel time for
+target graph, eager inside execute_model, draft graph and eager after it.
+
+Usage: phases_i41.py <trace.json.gz> --name "generation_2(12)" [--skip 3]
+"""
+
+import argparse
+import gzip
+import json
+import statistics
+
+
+def main():
+    ap = argparse.ArgumentParser()
+    ap.add_argument("trace")
+    ap.add_argument("--name", default="generation_")
+    ap.add_argument("--skip", type=int, default=3)
+    a = ap.parse_args()
+    ev = json.load(gzip.open(a.trace))["traceEvents"]
+    by_corr = {}
+    for e in ev:
+        if e.get("cat") in ("kernel", "gpu_memcpy", "gpu_memset"):
+            c = (e.get("args") or {}).get("correlation")
+            by_corr.setdefault(c, []).append(e)
+    runtime = sorted(
+        (e for e in ev if e.get("cat") in ("cuda_runtime", "cuda_driver")),
+        key=lambda e: e["ts"],
+    )
+    ann = sorted(
+        (
+            e
+            for e in ev
+            if e.get("cat") == "user_annotation"
+            and e["name"].startswith("execute_context")
+        ),
+        key=lambda e: e["ts"],
+    )
+    steady = [i for i, x in enumerate(ann) if a.name in x["name"]][a.skip : -1]
+    cols = ("target_graph", "eager_in", "draft_graph", "eager_after")
+    rows = []
+    for i in steady:
+        lo, hi, nxt = ann[i]["ts"], ann[i]["ts"] + ann[i]["dur"], ann[i + 1]["ts"]
+        row = dict.fromkeys(cols, 0.0)
+        pieces = {"in": 0, "after": 0}
+        for r in runtime:
+            if r["ts"] < lo or r["ts"] >= nxt:
+                continue
+            ks = by_corr.get((r.get("args") or {}).get("correlation"), [])
+            if not ks:
+                continue
+            gpu = sum(k["dur"] for k in ks) / 1e3
+            inside = r["ts"] < hi
+            if r["name"] == "cudaGraphLaunch":
+                row["target_graph" if inside else "draft_graph"] += gpu
+                pieces["in" if inside else "after"] += 1
+            else:
+                row["eager_in" if inside else "eager_after"] += gpu
+        row["cpu_annot"] = ann[i]["dur"] / 1e3
+        row["cpu_after"] = (nxt - hi) / 1e3
+        row["pieces"] = (pieces["in"], pieces["after"])
+        rows.append(row)
+    print(f"steps {len(rows)} graph pieces per step (in, after): {rows[0]['pieces']}")
+    for c in cols + ("cpu_annot", "cpu_after"):
+        print(f"  {c:12s} {statistics.mean(r[c] for r in rows):7.2f} ms")
+
+
+if __name__ == "__main__":
+    main()
