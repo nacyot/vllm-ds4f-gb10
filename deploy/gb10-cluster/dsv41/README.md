@@ -60,6 +60,16 @@ clients such as pi send no temperature, so the server samples at 1.0. On the
 pi-like 4-agent benchmark (`casebench.py --mode agent`, thinking high) the
 same work took 232 s instead of 247 s; greedy requests are unchanged.
 
+Since 2026-09-15 (issue #36) the trailing prefix-cache block is kept
+(`SPEC_BLOCK_DROP=0`, `disable_eagle_block_drop`) and the engram page
+release is left to the kernel (`ENGRAM_RELEASE=0`). Measured together on a
+fresh boot against the 2026-09-13 defaults: 4-agent total 235.6 → 208.0 s,
+cold prefill 32K 1,459 → 1,918 and 128K 1,363 → 1,464 tok/s, 158K
+follow-up turn TTFT 3.13 → 0.77 s, code acceptance length unchanged (5.82),
+head `MemAvailable` floor 3.67 GiB during the 128K prefill. `MOE_BACKEND=b12x`
+(+12% code decode alone) stays off: with it the same floor was 2.66 GiB.
+Details in `.notes/2026-09-15-issue-36-knob-combo/results.md`.
+
 The scheduler caps `LPTT`, `LPTT_MIXED`, `PPCAP` and `DECODE_STEPS` stay
 unset by default. On that benchmark none of them shortened the total time.
 The DS4F mixed cap of 2,048 tokens cost 33% of prefill throughput here,
@@ -247,8 +257,8 @@ with a live server for the torch-process rule. Details:
   listed shared-memory files; workers must not run ad hoc `rm` commands.
   Inspect actual targets before accepting a safety prompt.
 - After experiments, restore port 8888 to the adopted `dsv41.env` defaults,
-  including `ENGRAM_PREFETCH=1`, `EMPTY_CACHE=1`, and
-  `EMPTY_CACHE_MIN_TOKENS=65536`. End with health 200, all four cap services
+  including `ENGRAM_PREFETCH=1`, `ENGRAM_RELEASE=0`, `SPEC_BLOCK_DROP=0`,
+  `EMPTY_CACHE=1`, and `EMPTY_CACHE_MIN_TOKENS=65536`. End with health 200, all four cap services
   active at 1989 MHz, and record head `MemAvailable`. After short probes the
   head sits at about 3.4–4.0 GiB under `EMPTY_CACHE_MIN_TOKENS=65536`; that is
   expected. Any long cold prefill must pass `dsv41_ctl.sh headroom` (≥5.2 GiB)
