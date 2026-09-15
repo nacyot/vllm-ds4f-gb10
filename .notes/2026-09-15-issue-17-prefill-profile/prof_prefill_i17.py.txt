@@ -1,0 +1,510 @@
+#!/usr/bin/env python3
+"""Issue #17: attribute prefill-chunk time of 4-rank V4.1 torch traces (stdlib only).
+
+Usage: prof_prefill_i17.py <tag dir> --prompt-tokens N [--chunk 4092]
+       [--min-context 0] [--skip-first 0] [--cats-dir deploy/gb10-cluster/dsv41]
+       [--json out.json]
+
+<tag dir> holds one trace per rank (*.pt.trace.json.gz, any depth; the rank comes
+from "rankN" in the file name). A chunk is an execute_context_1(<chunk>)_generation_0(0)
+step; its context start is counted back from the request's last prefill step
+(N prompt tokens). --skip-first drops the first prefill steps of the trace (the
+step the profiler started in). Per chunk, over the kernels that start inside the
+window (first kernel of the step .. first kernel of the next step):
+
+  busy / idle   union of kernel intervals; idle >= 0.5 ms after a pageable DtoH
+                memcpy (the runner's hash .cpu() before the Engram prefault) is
+                idle_dtoh, other idle >= 0.5 ms idle_other, shorter idle
+                small_gaps, the end of the window after the last kernel idle_tail
+  kinds         mHC post / hc_prenorm GEMM (by shape) / mHC pre and the Engram
+                lookup by kernel name, memcpy by direction, NCCL, the rest by
+                prof_summary.CATS; overlap = busy - kernel sum (<= 0, concurrent
+                streams), so every rank's rows add up to the window
+  per call      mHC calls split by launch: @in = inside the execute_model
+                annotation (target forward, the chunk-sized calls), @after =
+                sampling and draft; the bandwidth floor applies to @in
+  NCCL          calls are matched by order across ranks (names must agree):
+                transfer = per-call minimum, wait = rank - minimum, loss = per-call
+                maximum wait (the time the chunk loses to the rank that reaches
+                the call last); that laggard's segment since the previous call
+                is compared with the earliest rank's segment kind by kind, on the
+                stream the NCCL kernels run on
+Chunks whose NCCL names disagree fall back to per-chunk totals (#41 method).
+"""
+
+import argparse
+import bisect
+import collections
+import glob
+import gzip
+import json
+import os
+import re
+import statistics
+import sys
+
+GAP_US = 500.0
+BANDWIDTH = 273e9  # GB10 memory bandwidth, bytes/s
+HIDDEN, HC, MIX = 5120, 4, 24
+# Bytes one call moves per token: bf16 residual streams and activations, f32 mixes.
+FLOOR_BYTES = {
+    "mhc_post": 2 * HC * HIDDEN * 2 + HIDDEN * 2 + HC * 4 + HC * HC * 4,
+    "mhc_gemm<20480>": HC * HIDDEN * 2,
+    "mhc_pre": HC * HIDDEN * 2 + HIDDEN * 2 + HC * 4 + HC * HC * 4 + (MIX + 1) * 4,
+}
+STEP_RE = re.compile(r"execute_context_(\d+)\((\d+)\)_generation_(\d+)\((\d+)\)")
+GEMM_RE = re.compile(r"hc_prenorm_gemm_impl<\d+u, ?(\d+)u")
+ORDER = [
+    "window",
+    "k:moe_gemm",
+    "k:moe_glue",
+    "k:attention",
+    "k:attn_indexer",
+    "k:mhc_post",
+    "k:mhc_gemm<20480>",
+    "k:mhc_pre",
+    "k:norm_mhc",
+    "k:dense_gemm",
+    "k:engram_lookup",
+    "k:engram",
+    "k:elementwise",
+    "k:memcpy_HtoD",
+    "k:memcpy_DtoH",
+    "k:memcpy_DtoD",
+    "k:memcpy",
+    "k:other",
+    "nccl_transfer",
+    "nccl_wait",
+    "overlap",
+    "idle_dtoh",
+    "idle_other",
+    "small_gaps",
+    "idle_tail",
+]
+SKIP_SUM = {
+    "window",
+    "cpu_annot",
+    "busy",
+    "launch_in",
+    "launch_after",
+    "other_stream",
+    "k:nccl",
+}
+
+
+def kind_of(name, cat_of):
+    if "mhc_post_tilelang" in name:
+        return "mhc_post"
+    m = GEMM_RE.search(name)
+    if m:
+        return f"mhc_gemm<{m.group(1)}>"
+    if "mhc_pre_big_fuse" in name:
+        return "mhc_pre"
+    if "engram_lookup" in name:
+        return "engram_lookup"
+    if "nccl" in name.lower():
+        return "nccl"
+    if name.startswith("Memcpy "):
+        return "memcpy_" + name.split()[1]
+    return cat_of(name)
+
+
+def stream_of(k):
+    return (k.get("args") or {}).get("stream")
+
+
+def timeline(ks, start, end, parts, pairs=None):
+    """Add busy and idle (ms) of kernels `ks` (sorted by start, clipped to
+    [start, end)) into `parts`."""
+    cur_s = cur_e = None
+    last = None
+    for k in ks:
+        s, e = max(k["ts"], start), min(k["ts"] + k["dur"], end)
+        if cur_e is None:
+            if s > start:
+                parts["idle_lead"] += (s - start) / 1e3
+            cur_s, cur_e, last = s, e, k
+        elif s > cur_e:
+            parts["busy"] += (cur_e - cur_s) / 1e3
+            gap = s - cur_e
+            if gap < GAP_US:
+                parts["small_gaps"] += gap / 1e3
+            else:
+                dtoh = "DtoH" in last["name"] and "Pageable" in last["name"]
+                kind = "idle_dtoh" if dtoh else "idle_other"
+                parts[kind] += gap / 1e3
+                if pairs is not None:
+                    pairs[f"{kind}: {last['name'][:44]} -> {k['name'][:44]}"] += gap / 1e3
+            cur_s, cur_e, last = s, e, k
+        elif e > cur_e:
+            cur_e, last = e, k
+    if cur_e is None:
+        parts["idle_lead"] += (end - start) / 1e3
+        return
+    parts["busy"] += (cur_e - cur_s) / 1e3
+    if end > cur_e:
+        parts["idle_tail"] += (end - cur_e) / 1e3
+
+
+def rank_chunks(path, a, cat_of):
+    with gzip.open(path) as f:
+        ev = json.load(f)["traceEvents"]
+    kern = sorted(
+        (e for e in ev if e.get("cat") in ("kernel", "gpu_memcpy", "gpu_memset")),
+        key=lambda e: e["ts"],
+    )
+    runtime = {}
+    for e in ev:
+        if e.get("cat") in ("cuda_runtime", "cuda_driver"):
+            c = (e.get("args") or {}).get("correlation")
+            if c is not None:
+                runtime.setdefault(c, e)
+    ann = sorted(
+        (
+            e
+            for e in ev
+            if e.get("cat") == "user_annotation"
+            and e["name"].startswith("execute_context")
+        ),
+        key=lambda e: e["ts"],
+    )
+    del ev
+    starts = [x["ts"] for x in ann]
+    launched = collections.defaultdict(list)
+    for k in kern:
+        r = runtime.get((k.get("args") or {}).get("correlation"))
+        launch = r["ts"] if r else k["ts"]
+        i = bisect.bisect_right(starts, launch) - 1
+        if i >= 0:
+            launched[i].append((k, launch))
+    first = {i: min(k["ts"] for k, _ in v) for i, v in launched.items()}
+    kts = [k["ts"] for k in kern]
+    prefill = []
+    for i, x in enumerate(ann):
+        m = STEP_RE.match(x["name"])
+        if m and m.group(1) == "1" and m.group(3) == "0":
+            prefill.append((i, int(m.group(2))))
+    rows = []
+    for j, (i, tokens) in enumerate(prefill):
+        if tokens != a.chunk or j < a.skip_first or i not in first or i + 1 not in first:
+            continue
+        ctx = a.prompt_tokens - sum(t for _, t in prefill[j:])
+        if ctx < a.min_context:
+            continue
+        a_end = ann[i]["ts"] + ann[i]["dur"]
+        w0, w1 = first[i], first[i + 1]
+        ks = kern[bisect.bisect_left(kts, w0) : bisect.bisect_left(kts, w1)]
+        parts = collections.defaultdict(float)
+        pairs = collections.defaultdict(float)
+        timeline(ks, w0, w1, parts, pairs)
+        phase_of = {}
+        for k, launch in launched[i]:
+            phase_of[id(k)] = "in" if launch < a_end else "after"
+            parts["launch_" + phase_of[id(k)]] += k["dur"] / 1e3
+        percall = collections.defaultdict(lambda: [0, 0.0])
+        engram = []
+        streams = collections.Counter()
+        ksum = 0.0
+        for k in ks:
+            kind = kind_of(k["name"], cat_of)
+            parts["k:" + kind] += k["dur"] / 1e3
+            ksum += k["dur"] / 1e3
+            if kind.startswith("mhc_"):
+                key = f"{kind}@{phase_of.get(id(k), 'other')}"
+                percall[key][0] += 1
+                percall[key][1] += k["dur"] / 1e3
+            elif kind == "engram_lookup":
+                engram.append(k["dur"] / 1e3)
+            streams[f"{'nccl' if kind == 'nccl' else 'other'}@{stream_of(k)}"] += 1
+        parts["overlap"] = parts["busy"] - ksum
+        nccl = [k for k in ks if "nccl" in k["name"].lower()]
+        top = collections.Counter(stream_of(k) for k in nccl).most_common(1)
+        main_stream = top[0][0] if top else None
+        comp = [
+            k
+            for k in ks
+            if "nccl" not in k["name"].lower() and stream_of(k) == main_stream
+        ]
+        parts["other_stream"] = (
+            sum(k["dur"] for k in ks if stream_of(k) != main_stream) / 1e3
+        )
+        cts = [k["ts"] for k in comp]
+        segs = []
+        prev = w0
+        for k in nccl:
+            seg = collections.defaultdict(float)
+            dur = max(0.0, (k["ts"] - prev) / 1e3)
+            if k["ts"] > prev:
+                sub = comp[bisect.bisect_left(cts, prev) : bisect.bisect_left(cts, k["ts"])]
+                timeline(sub, prev, k["ts"], seg)
+                s_sum = 0.0
+                for c in sub:
+                    seg["k:" + kind_of(c["name"], cat_of)] += c["dur"] / 1e3
+                    s_sum += c["dur"] / 1e3
+                seg["overlap"] = seg["busy"] - s_sum
+                del seg["busy"]
+            segs.append((dur, dict(seg)))
+            prev = max(prev, k["ts"] + k["dur"])
+        rows.append(
+            {
+                "step": i,
+                "context": ctx,
+                "window": (w1 - w0) / 1e3,
+                "cpu_annot": ann[i]["dur"] / 1e3,
+                "parts": dict(parts),
+                "percall": {k: tuple(v) for k, v in percall.items()},
+                "engram": engram,
+                "nccl": [(k["name"][:60], k["dur"] / 1e3) for k in nccl],
+                "segs": segs,
+                "pairs": dict(pairs),
+                "streams": dict(streams),
+            }
+        )
+    return rows
+
+
+def mean(xs):
+    xs = list(xs)
+    return statistics.mean(xs) if xs else 0.0
+
+
+def main():
+    ap = argparse.ArgumentParser()
+    ap.add_argument("tag_dir")
+    ap.add_argument("--prompt-tokens", type=int, required=True)
+    ap.add_argument("--chunk", type=int, default=4092)
+    ap.add_argument("--min-context", type=int, default=0)
+    ap.add_argument("--skip-first", type=int, default=0)
+    ap.add_argument("--cats-dir", default="deploy/gb10-cluster/dsv41")
+    ap.add_argument("--json")
+    a = ap.parse_args()
+    sys.path.insert(0, a.cats_dir)
+    from prof_summary import cat_of
+
+    paths = {}
+    pattern = os.path.join(a.tag_dir, "**", "*.pt.trace.json*")
+    for p in glob.glob(pattern, recursive=True):
+        m = re.search(r"rank(\d+)", os.path.basename(p))
+        if m:
+            paths[int(m.group(1))] = p
+    per = {r: rank_chunks(p, a, cat_of) for r, p in sorted(paths.items())}
+    ranks = sorted(per)
+    n = min(len(v) for v in per.values())
+    rows = {r: per[r][:n] for r in ranks}
+    if not n:
+        print(f"no chunks selected: {[len(per[r]) for r in ranks]}")
+        return
+    ctx = [[rows[r][j]["context"] for r in ranks] for j in range(n)]
+    print(
+        f"== {a.tag_dir}: ranks {ranks}, chunks {[len(per[r]) for r in ranks]}, "
+        f"used {n}, contexts {[c[0] for c in ctx]}, "
+        f"contexts agree {all(len(set(c)) == 1 for c in ctx)}"
+    )
+
+    # NCCL matched call by call.
+    transfer, loss, aligned = [], [], []
+    wait = {r: [] for r in ranks}
+    lag_calls = collections.Counter()
+    lag_loss = collections.defaultdict(float)
+    excess = {r: collections.defaultdict(float) for r in ranks}
+    for j in range(n):
+        calls = [rows[r][j]["nccl"] for r in ranks]
+        ok = len({len(c) for c in calls}) == 1 and all(
+            len({calls[q][c][0] for q in range(len(ranks))}) == 1
+            for c in range(len(calls[0]))
+        )
+        t = lo = 0.0
+        w = [0.0] * len(ranks)
+        if ok:
+            for c in range(len(calls[0])):
+                d = [calls[q][c][1] for q in range(len(ranks))]
+                mn, mx = min(d), max(d)
+                lag, early = d.index(mn), d.index(mx)
+                t += mn
+                lo += mx - mn
+                for q in range(len(ranks)):
+                    w[q] += d[q] - mn
+                if mx == mn:
+                    continue
+                lag_calls[ranks[lag]] += 1
+                lag_loss[ranks[lag]] += mx - mn
+                sl = rows[ranks[lag]][j]["segs"][c]
+                se = rows[ranks[early]][j]["segs"][c]
+                ex = excess[ranks[lag]]
+                ex["segment"] += sl[0] - se[0]
+                for key in set(sl[1]) | set(se[1]):
+                    ex[key] += sl[1].get(key, 0.0) - se[1].get(key, 0.0)
+        else:
+            tot = [sum(x[1] for x in calls[q]) for q in range(len(ranks))]
+            t = min(tot)
+            lo = max(tot) - t
+            w = [x - t for x in tot]
+        transfer.append(t)
+        loss.append(lo)
+        aligned.append(ok)
+        for q, r in enumerate(ranks):
+            wait[r].append(w[q])
+
+    means = {}
+    for r in ranks:
+        keys = {k for row in rows[r] for k in row["parts"]}
+        m = {k: mean(row["parts"].get(k, 0.0) for row in rows[r]) for k in keys}
+        m["window"] = mean(row["window"] for row in rows[r])
+        m["cpu_annot"] = mean(row["cpu_annot"] for row in rows[r])
+        m["nccl_transfer"] = mean(transfer)
+        m["nccl_wait"] = mean(wait[r])
+        m["check"] = m["window"] - sum(
+            v for k, v in m.items() if k not in SKIP_SUM and k != "check"
+        )
+        means[r] = m
+    W = mean(means[r]["window"] for r in ranks)
+    T = 0.03 * W
+
+    print("\n== per chunk (ms) ==")
+    print(
+        f"  {'context':>8s} {'window':>8s} {'transfer':>9s} {'loss':>7s} aligned  wait "
+        + " ".join(f"r{r}" for r in ranks)
+    )
+    for j in range(n):
+        print(
+            f"  {ctx[j][0]:8d} {rows[ranks[0]][j]['window']:8.1f} {transfer[j]:9.1f} "
+            f"{loss[j]:7.1f} {str(aligned[j]):7s} "
+            + " ".join(f"{wait[r][j]:7.1f}" for r in ranks)
+        )
+
+    print(f"\n== attribution (ms/chunk, mean of {n}; share of W for rank {ranks[0]}) ==")
+    keys = [k for k in ORDER if any(k in means[r] for r in ranks)]
+    keys += sorted(
+        {k for r in ranks for k in means[r]} - set(keys) - {"check", "busy", "k:nccl"}
+    )
+    keys.append("check")
+    for k in keys:
+        vals = [means[r].get(k, 0.0) for r in ranks]
+        share = 100 * vals[0] / W if W else 0.0
+        print(f"  {k:24s}" + "".join(f"{v:10.1f}" for v in vals) + f"  {share:6.2f}%")
+
+    print(f"\n== mHC per call (W {W:.1f} ms, T = 3% = {T:.1f} ms) ==")
+    pkeys = sorted({k for r in ranks for row in rows[r] for k in row["percall"]})
+    u_floor = 0.0
+    fusion = 0.0
+    percall_out = {}
+    for k in pkeys:
+        calls, per_call = [], []
+        for r in ranks:
+            c = sum(row["percall"].get(k, (0, 0.0))[0] for row in rows[r])
+            s = sum(row["percall"].get(k, (0, 0.0))[1] for row in rows[r])
+            calls.append(c / n)
+            per_call.append(s / c if c else 0.0)
+        percall_out[k] = {"calls_per_chunk": calls, "ms_per_call": per_call}
+        line = (
+            f"  {k:22s} calls/chunk {mean(calls):5.1f}  ms/call "
+            + " ".join(f"{x:6.3f}" for x in per_call)
+        )
+        base, _, phase = k.partition("@")
+        if base in FLOOR_BYTES and phase == "in":
+            floor = a.chunk * FLOOR_BYTES[base] / BANDWIDTH * 1e3
+            ratio = mean(per_call) / floor
+            gap = mean(calls) * (mean(per_call) - floor)
+            line += f"  floor {floor:6.3f}  ratio {ratio:4.2f}  to-floor {gap:6.1f} ms/chunk"
+            percall_out[k].update(floor_ms=floor, ratio=ratio, to_floor_ms=gap)
+            if ratio >= 2:
+                u_floor += gap
+            if base == "mhc_gemm<20480>":
+                fusion = mean(calls) * mean(per_call)
+        print(line)
+    print(
+        f"  U(a): kernels >= 2x floor {u_floor:.1f} ms, fusion bound (GEMM calls) "
+        f"{fusion:.1f} ms, T {T:.1f} ms"
+    )
+
+    print("\n== Engram lookup (ms per call by order within the chunk; chunk total) ==")
+    for r in ranks:
+        order = collections.defaultdict(list)
+        for row in rows[r]:
+            for c, d in enumerate(row["engram"]):
+                order[c].append(d)
+        print(
+            f"  rank{r}: calls/chunk {mean(len(row['engram']) for row in rows[r]):.1f}  "
+            + "  ".join(f"#{c} {mean(v):6.2f}" for c, v in sorted(order.items()))
+            + f"  total {mean(sum(row['engram']) for row in rows[r]):6.1f}"
+        )
+
+    calls_per_chunk = mean(len(rows[ranks[0]][j]["nccl"]) for j in range(n))
+    print(
+        f"\n== NCCL: aligned {sum(aligned)}/{n} chunks, calls/chunk {calls_per_chunk:.1f}, "
+        f"transfer {mean(transfer):.1f}, loss {mean(loss):.1f} ms/chunk "
+        f"({100 * mean(loss) / W:.2f}% of W) =="
+    )
+    for r in ranks:
+        ex = excess[r]
+        print(
+            f"  rank{r}: wait {mean(wait[r]):7.1f}  laggard calls/chunk {lag_calls[r] / n:5.1f}  "
+            f"loss caused {lag_loss[r] / n:7.1f}  segment excess {ex['segment'] / n:7.1f}"
+        )
+        top = sorted(
+            ((k, v / n) for k, v in ex.items() if k != "segment"),
+            key=lambda kv: -abs(kv[1]),
+        )[:8]
+        if top:
+            print("      " + ", ".join(f"{k} {v:+.1f}" for k, v in top))
+    total = collections.defaultdict(float)
+    for r in ranks:
+        for k, v in excess[r].items():
+            if k != "segment":
+                total[k] += v / n
+    ranked = sorted(total.items(), key=lambda kv: -abs(kv[1]))[:10]
+    print(
+        "  loss sources over all laggards (ms/chunk): "
+        + ", ".join(f"{k} {v:+.1f}" for k, v in ranked)
+    )
+
+    print("\n== idle pairs (ms/chunk, top 5 per rank) ==")
+    for r in ranks:
+        agg = collections.defaultdict(float)
+        for row in rows[r]:
+            for k, v in row["pairs"].items():
+                agg[k] += v / n
+        for k, v in sorted(agg.items(), key=lambda kv: -kv[1])[:5]:
+            print(f"  rank{r} {v:8.2f}  {k}")
+
+    print("\n== launch phase and streams (rank: in / after ms; kernel counts by stream) ==")
+    for r in ranks:
+        st = collections.Counter()
+        for row in rows[r]:
+            st.update(row["streams"])
+        print(
+            f"  rank{r}: {means[r].get('launch_in', 0.0):8.1f} / "
+            f"{means[r].get('launch_after', 0.0):6.1f}  "
+            + ", ".join(f"{k} {v / n:.0f}" for k, v in st.most_common(4))
+        )
+
+    if a.json:
+        out = {
+            "tag_dir": a.tag_dir,
+            "chunks": n,
+            "contexts": [c[0] for c in ctx],
+            "window_ms": W,
+            "threshold_ms": T,
+            "ranks": {str(r): means[r] for r in ranks},
+            "nccl": {
+                "aligned": aligned,
+                "transfer": transfer,
+                "loss": loss,
+                "wait": {str(r): wait[r] for r in ranks},
+                "laggard_calls": {str(r): lag_calls[r] / n for r in ranks},
+                "loss_caused": {str(r): lag_loss[r] / n for r in ranks},
+                "excess": {
+                    str(r): {k: v / n for k, v in excess[r].items()} for r in ranks
+                },
+                "loss_sources": dict(total),
+            },
+            "percall": percall_out,
+            "engram": {str(r): [row["engram"] for row in rows[r]] for r in ranks},
+            "u_a": {"to_floor_ge2x": u_floor, "fusion_bound": fusion},
+        }
+        with open(a.json, "w") as f:
+            json.dump(out, f, indent=1)
+
+
+if __name__ == "__main__":
+    main()

@@ -1,0 +1,71 @@
+#!/usr/bin/env bash
+# profile_i17.sh <tag> <prefill_tokens> <delay_s>: torch-profile one casebench solo prefill on gx10-6040 (issue #17).
+# The server must run with PROFILER_DIR=/home/nacyot/dsv41-prep/prof-i17. Deletes nothing: it refuses to start while
+# the profiler dir holds top-level files on any node, and once the traces stop growing it moves the new top-level
+# files into <dir>/<tag>/ on every node. delay_s 0 starts the profiler 2 s before the request; otherwise the request
+# starts first, the profiler starts delay_s later and stops after the request completes. Head MemAvailable is checked
+# every second: below 2.8 GiB the client is killed (the server aborts the request) and the profiler is stopped only
+# once the head is back above 3.5 GiB (otherwise exit 3: restore production). Summaries run on the workstation.
+set -u
+T=${1:?tag}; TOKENS=${2:?prefill tokens}; DELAY=${3:?delay seconds}
+B=http://127.0.0.1:8888
+P=/home/nacyot/dsv41-prep/prof-i17
+PY=/home/nacyot/vllm-dsv41/.venv/bin/python
+CB=/home/nacyot/vllm-dsv41/deploy/gb10-cluster/dsv41/casebench.py
+OUT=/home/nacyot/sglang-cmp/results/casebench.jsonl
+NODES="local 10.100.0.32 10.100.0.48 10.100.0.64"
+on() { if [ "$1" = local ]; then bash -c "$2"; else ssh -n -o BatchMode=yes -o ConnectTimeout=10 "$1" "$2"; fi; }
+avail() { awk '/MemAvailable/ {printf "%.2f", $2/1048576}' /proc/meminfo; }
+below() { awk -v a="$(avail)" -v l="$1" 'BEGIN {exit !(a < l)}'; }
+log() { echo "$(date +%T) $* | head MemAvailable $(avail) GiB"; }
+
+for n in $NODES; do
+  c=$(on "$n" "find $P -maxdepth 1 -type f | wc -l")
+  [ "$c" = 0 ] || { echo "$n: $c top-level files already in $P; move them before profiling" >&2; exit 2; }
+  on "$n" "test ! -e $P/$T" || { echo "$n: $P/$T exists" >&2; exit 2; }
+done
+
+started=0; aborted=0; pid=""
+start_profile() { log "start_profile"; curl -s -m 60 -X POST "$B/start_profile" >/dev/null; started=1; log "profiling"; }
+guard() { # wait up to $1 s while the client runs; kill it once the head drops below 2.8 GiB
+  local end=$(( $(date +%s) + $1 )) i=0
+  while [ "$(date +%s)" -lt "$end" ] && kill -0 "$pid" 2>/dev/null; do
+    if below 2.8; then log "below 2.8 GiB: killing the client"; kill "$pid"; aborted=1; return; fi
+    i=$((i + 1)); if [ $((i % 10)) = 0 ]; then log "running"; fi
+    sleep 1
+  done
+}
+
+log "profile $T ($TOKENS tokens, delay $DELAY s)"
+if [ "$DELAY" = 0 ]; then start_profile; sleep 2; fi
+"$PY" "$CB" --mode solo --prefill-tokens "$TOKENS" --tag "i17-prof-$T" --config i17-prof --out "$OUT" &
+pid=$!
+if [ "$DELAY" != 0 ]; then
+  guard "$DELAY"
+  if [ "$aborted" = 0 ] && kill -0 "$pid" 2>/dev/null; then start_profile; fi
+fi
+[ "$aborted" = 1 ] || guard 3600
+wait "$pid"; rc=$?
+log "client exited ($rc)"
+if [ "$aborted" = 1 ]; then
+  for _ in $(seq 1 12); do below 3.5 || break; sleep 5; done
+  if below 3.5; then log "head still below 3.5 GiB; profiler left running, restore production"; exit 3; fi
+fi
+if [ "$started" = 0 ]; then log "the request ended before the profiler started"; exit 3; fi
+log "stop_profile"
+curl -s -m 600 -X POST "$B/stop_profile" >/dev/null
+log "stopped $T"
+prev=""; stable=0
+for _ in $(seq 1 40); do
+  sleep 10
+  cur=$(for n in $NODES; do on "$n" "du -sb $P | cut -f1"; done | tr '\n' ' ')
+  log "sizes $cur"
+  if [ "$cur" = "$prev" ]; then stable=$((stable + 1)); else stable=0; fi
+  prev=$cur
+  [ "$stable" -ge 2 ] && break
+done
+for n in $NODES; do
+  on "$n" "mkdir $P/$T && find $P -maxdepth 1 -type f -exec mv -n -t $P/$T/ {} + && echo \$(hostname): \$(ls $P/$T | tr '\n' ' ')"
+done
+[ "$aborted" = 0 ] || { log "ABORTED $T (traces kept)"; exit 3; }
+log "PROFILE DONE $T"

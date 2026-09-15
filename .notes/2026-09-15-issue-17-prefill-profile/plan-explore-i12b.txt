@@ -1,0 +1,100 @@
+ranks [0, 1, 2, 3], chunk steps [3, 3, 3, 3]
+  rank0: execute_context_1(4092)_generation_0(0) | execute_context_1(4092)_generation_0(0) | execute_context_1(4092)_generation_0(0)
+  rank1: execute_context_1(4092)_generation_0(0) | execute_context_1(4092)_generation_0(0) | execute_context_1(4092)_generation_0(0)
+  rank2: execute_context_1(4092)_generation_0(0) | execute_context_1(4092)_generation_0(0) | execute_context_1(4092)_generation_0(0)
+  rank3: execute_context_1(4092)_generation_0(0) | execute_context_1(4092)_generation_0(0) | execute_context_1(4092)_generation_0(0)
+
+metric (ms/chunk, mean)            rank0     rank1     rank2     rank3
+busy                              2077.4    1972.7    1879.0    1617.9
+cat:attention                      359.6     359.7     415.6     398.4
+cat:attn_indexer                    21.1      21.2      22.8      22.7
+cat:dense_gemm                     141.4     141.1     152.7     149.6
+cat:elementwise                    110.6     110.5     113.0     111.7
+cat:engram                          42.4      26.2      44.9      60.8
+cat:memcpy                          47.6       1.9       1.9       4.2
+cat:moe_gemm                       333.9     334.1     344.6     336.9
+cat:moe_glue                        38.5      38.1      38.7      38.3
+cat:nccl                           794.9     710.7     516.2     267.2
+cat:norm_mhc                       228.6     230.0     229.3     228.6
+cat:other                            1.5       1.5       1.5       1.7
+cpu_annot                         1968.1    1967.6    1966.4    1967.1
+idle_after_dtoh                    256.9     359.1     455.1     505.9
+idle_other                           1.1       3.0       6.1     207.1
+n_kernels                         2157.0    2156.3    2156.3    2156.3
+nccl                               794.9     710.7     516.2     267.2
+phase:after                         25.7      25.4      25.4      25.6
+phase:in                          2094.5    1949.5    1855.9    1594.3
+small_gaps                           9.0       8.6       4.1      13.1
+tail_idle                            1.4       2.0       1.9       2.2
+window                            2345.8    2345.3    2346.2    2346.3
+
+== mHC kernels at chunk steps: calls/chunk, mean us/call ==
+  mhc_post_tilelang_kernel @after                                        6 x       5      6 x       7      6 x       5      6 x       5
+  mhc_post_tilelang_kernel @in                                          83 x    1698     83 x    1711     83 x    1704     83 x    1699
+  mhc_pre_big_fuse_with_norm_tilelang_kernel @after                      6 x       7      6 x       6      6 x       6      6 x       6
+  mhc_pre_big_fuse_with_norm_tilelang_kernel @in                        80 x    1050     80 x    1056     80 x    1050     80 x    1048
+  void deep_gemm::sm120_tf32_hc_prenorm_gemm_impl<24u, 20480u, @after     6 x      19      6 x      15      6 x      18      6 x      17
+  void deep_gemm::sm120_tf32_hc_prenorm_gemm_impl<24u, 20480u, @in      79 x     837     79 x     835     79 x     849     79 x     836
+  void deep_gemm::sm120_tf32_hc_prenorm_gemm_impl<24u, 5120u,  @in       1 x     243      1 x     238      1 x     239      1 x     256
+
+== Engram lookup per call (us) per chunk ==
+  rank0: 22508i,7931i ; 24167i,23456i ; 21071i,14428i
+  rank1: 12738i,11321i ; 16251i,8764i ; 7496i,8081i
+  rank2: 27050i,22359i ; 20884i,20579i ; 16987i,13160i
+  rank3: 32286i,38858i ; 31601i,28650i ; 19781i,17351i
+
+== NCCL matched per call ==
+  chunk 0: calls 92, transfer 221.0 ms, imbalance loss 867.4 ms, wait r0 843.0 r1 716.2 r2 460.4 r3 92.3 | laggard calls r0 5 r1 7 r2 61 r3 19 | wait caused r0 3.0 r1 7.4 r2 318.9 r3 1782.6
+     laggard r0: segment excess 1.2 ms (kernels +1.2, idle/other-stream +0.0); moe_gemm +0.6, attention +0.2, moe_glue +0.2, elementwise +0.1, dense_gemm +0.0
+     laggard r1: segment excess 2.8 ms (kernels +4.1, idle/other-stream -1.3); norm_mhc +1.8, moe_gemm +1.1, dense_gemm +0.6, attention +0.4, elementwise +0.1
+     laggard r2: segment excess 128.6 ms (kernels +130.4, idle/other-stream -1.8); attention +76.3, moe_gemm +29.5, dense_gemm +15.4, elementwise +3.9, norm_mhc +3.6
+     laggard r3: segment excess 733.5 ms (kernels +71.4, idle/other-stream +662.1); engram +47.1, attention +12.5, norm_mhc +3.3, moe_gemm +3.3, dense_gemm +2.6
+     call   0 ncclDevKernel_AllReduce_bf16_RING(ncclDevKernelA caused   844.3 ms, laggard r3
+     call   6 ncclDevKernel_AllReduce_bf16_RING(ncclDevKernelA caused   159.4 ms, laggard r3
+     call   5 ncclDevKernel_AllReduce_bf16_RING(ncclDevKernelA caused   137.0 ms, laggard r3
+     call   2 ncclDevKernel_AllReduce_bf16_RING(ncclDevKernelA caused   135.0 ms, laggard r3
+     call   1 ncclDevKernel_AllReduce_bf16_RING(ncclDevKernelA caused   134.0 ms, laggard r3
+  chunk 1: calls 92, transfer 219.2 ms, imbalance loss 598.4 ms, wait r0 558.4 r1 519.3 r2 342.7 r3 24.3 | laggard calls r0 7 r1 11 r2 30 r3 44 | wait caused r0 9.3 r1 11.5 r2 93.9 r3 1330.1
+     laggard r0: segment excess 3.9 ms (kernels +2.1, idle/other-stream +1.8); moe_gemm +2.5, norm_mhc -1.6, attention +0.9, elementwise +0.2, dense_gemm +0.1
+     laggard r1: segment excess 5.2 ms (kernels +4.1, idle/other-stream +1.0); moe_gemm +2.9, elementwise +0.4, attention +0.4, norm_mhc +0.2, dense_gemm +0.1
+     laggard r2: segment excess 44.4 ms (kernels +37.3, idle/other-stream +7.1); attention +28.9, dense_gemm +6.6, norm_mhc -6.1, moe_gemm +5.4, elementwise +1.3
+     laggard r3: segment excess 544.2 ms (kernels +73.4, idle/other-stream +470.9); engram +35.3, attention +23.5, moe_gemm +10.4, memcpy -6.9, dense_gemm +6.0
+     call   0 ncclDevKernel_AllReduce_bf16_RING(ncclDevKernelA caused   376.9 ms, laggard r3
+     call   6 ncclDevKernel_AllReduce_bf16_RING(ncclDevKernelA caused   206.3 ms, laggard r3
+     call   8 ncclDevKernel_AllReduce_bf16_RING(ncclDevKernelA caused   131.8 ms, laggard r3
+     call   7 ncclDevKernel_AllReduce_bf16_RING(ncclDevKernelA caused   108.2 ms, laggard r3
+     call   5 ncclDevKernel_AllReduce_bf16_RING(ncclDevKernelA caused   106.2 ms, laggard r3
+  chunk 2: calls 92, transfer 219.2 ms, imbalance loss 359.6 ms, wait r0 324.0 r1 237.1 r2 86.2 r3 25.5 | laggard calls r0 12 r1 7 r2 38 r3 35 | wait caused r0 11.3 r1 11.1 r2 97.6 r3 552.9
+     laggard r0: segment excess 4.9 ms (kernels +4.9, idle/other-stream -0.0); moe_gemm +4.7, attention -0.4, moe_glue +0.4, elementwise +0.2, norm_mhc +0.0
+     laggard r1: segment excess 5.3 ms (kernels +5.4, idle/other-stream -0.1); moe_gemm +3.5, attention +0.8, elementwise +0.5, norm_mhc +0.3, dense_gemm +0.2
+     laggard r2: segment excess 46.2 ms (kernels +43.8, idle/other-stream +2.4); attention +32.2, moe_gemm +6.1, dense_gemm +4.7, norm_mhc -1.3, attn_indexer +0.9
+     laggard r3: segment excess 302.7 ms (kernels +65.7, idle/other-stream +237.0); attention +29.5, engram +21.6, moe_gemm +6.4, dense_gemm +5.9, attn_indexer +1.9
+     call   0 ncclDevKernel_AllReduce_bf16_RING(ncclDevKernelA caused   415.5 ms, laggard r3
+     call   1 ncclDevKernel_AllReduce_bf16_RING(ncclDevKernelA caused    36.8 ms, laggard r3
+     call  53 ncclDevKernel_AllReduce_bf16_RING(ncclDevKernelA caused     9.3 ms, laggard r3
+     call  31 ncclDevKernel_AllReduce_bf16_RING(ncclDevKernelA caused     9.1 ms, laggard r2
+     call  67 ncclDevKernel_AllReduce_bf16_RING(ncclDevKernelA caused     5.7 ms, laggard r2
+
+== top idle pairs (rank0, ms per chunk) ==
+     252.3  after [DtoH] before [void (anonymous namespace)::elementwise_]
+       2.4  after [DtoH] before [Memcpy DtoH (Device -> Pinned)]
+       2.2  after [DtoH] before [void vllm::vocab_embedding::vocab_parall]
+       0.4  after [void vllm::vocab_embedding::vocab_parall] before [ncclDevKernel_AllReduce_bf16_RING(ncclDe]
+
+== top idle pairs (rank1, ms per chunk) ==
+     352.3  after [DtoH] before [void (anonymous namespace)::elementwise_]
+       6.8  after [DtoH] before [void vllm::vocab_embedding::vocab_parall]
+       1.4  after [_apply_write_kernel] before [Memcpy HtoD (Pinned -> Device)]
+       1.2  after [void vllm::vocab_embedding::vocab_parall] before [ncclDevKernel_AllReduce_bf16_RING(ncclDe]
+
+== top idle pairs (rank2, ms per chunk) ==
+     443.6  after [DtoH] before [void (anonymous namespace)::elementwise_]
+      11.5  after [DtoH] before [void vllm::vocab_embedding::vocab_parall]
+       1.5  after [void vllm::vocab_embedding::vocab_parall] before [ncclDevKernel_AllReduce_bf16_RING(ncclDe]
+       1.0  after [_ZN7cutlass13device_kernelIN10flashinfer] before [ncclDevKernel_AllReduce_bf16_RING(ncclDe]
+
+== top idle pairs (rank3, ms per chunk) ==
+     494.3  after [DtoH] before [void (anonymous namespace)::elementwise_]
+      29.2  after [ncclDevKernel_AllReduce_bf16_RING(ncclDe] before [mhc_post_tilelang_kernel]
+      20.1  after [kernel_cutlass_kernel_flashinferquantiza] before [_ZN7cutlass13device_kernelIN10flashinfer]
+      12.4  after [void per_token_group_quant_8bit_kernel<c] before [void at::native::vectorized_elementwise_]

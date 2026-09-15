@@ -1,0 +1,75 @@
+#!/usr/bin/env python3
+"""Issue #17: per-rank Engram mmap timings of large steps from VLLM_ENGRAM_MMAP_STATS
+log lines (stdlib only).
+
+Usage: engram_stats_i17.py r0.log r1.log ... --from "09-15 22:10:05" --to "09-15 22:11:20"
+
+The rank comes from "r<N>" in each file name; lines outside [--from, --to]
+("MM-DD HH:MM:SS", inclusive) are ignored. Prints, per rank and table shard, the
+prefaults (rows, pages, pages not prefetched, drain and populate ms) and the
+prefetches (pages, queued and populate ms): count, mean and max.
+"""
+
+import argparse
+import collections
+import re
+import statistics
+
+STAMP = r"(\d\d-\d\d \d\d:\d\d:\d\d) \[engram\.py:\d+\] "
+PREFAULT = re.compile(
+    STAMP + r"engram prefault (\S+): (\d+) rows, (\d+) pages"
+    r"(?: \((\d+) not prefetched\))?, drain (\d+) ms, populate (\d+) ms"
+)
+PREFETCH = re.compile(
+    STAMP + r"engram prefetch (\S+): (\d+) pages, queued (\d+) ms, populate (\d+) ms"
+)
+
+
+def stats(values):
+    return f"{statistics.mean(values):8.1f} (max {max(values):6.0f})"
+
+
+def main():
+    ap = argparse.ArgumentParser()
+    ap.add_argument("logs", nargs="+")
+    ap.add_argument("--from", dest="t0", required=True)
+    ap.add_argument("--to", dest="t1", required=True)
+    a = ap.parse_args()
+    for path in sorted(a.logs):
+        rank = re.search(r"r(\d+)", path.rsplit("/", 1)[-1]).group(1)
+        pre = collections.defaultdict(lambda: collections.defaultdict(list))
+        fetch = collections.defaultdict(lambda: collections.defaultdict(list))
+        with open(path, errors="replace") as f:
+            for line in f:
+                m = PREFAULT.search(line)
+                if m and a.t0 <= m.group(1) <= a.t1:
+                    d = pre[m.group(2)]
+                    d["rows"].append(int(m.group(3)))
+                    d["pages"].append(int(m.group(4)))
+                    d["not_prefetched"].append(int(m.group(5) or 0))
+                    d["drain_ms"].append(int(m.group(6)))
+                    d["populate_ms"].append(int(m.group(7)))
+                    continue
+                m = PREFETCH.search(line)
+                if m and a.t0 <= m.group(1) <= a.t1:
+                    d = fetch[m.group(2)]
+                    d["pages"].append(int(m.group(3)))
+                    d["queued_ms"].append(int(m.group(4)))
+                    d["populate_ms"].append(int(m.group(5)))
+        for shard in sorted(set(pre) | set(fetch)):
+            if shard in pre:
+                d = pre[shard]
+                print(
+                    f"r{rank} {shard} prefault n={len(d['rows'])} "
+                    + " ".join(f"{k} {stats(v)}" for k, v in d.items())
+                )
+            if shard in fetch:
+                d = fetch[shard]
+                print(
+                    f"r{rank} {shard} prefetch n={len(d['pages'])} "
+                    + " ".join(f"{k} {stats(v)}" for k, v in d.items())
+                )
+
+
+if __name__ == "__main__":
+    main()

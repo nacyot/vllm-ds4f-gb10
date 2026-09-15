@@ -1,0 +1,317 @@
+#!/usr/bin/env python3
+"""Issue #17: Engram lookup time per emulated TP rank on the real mmap tables.
+
+Run on a GB10 node with the server stopped (torch on the GPU):
+  ~/vllm-dsv41/.venv/bin/python engram_lookup_bench_i17.py --out bench.jsonl
+
+A chunk is 4092 tokens x 6 local heads of hash rows over one emulated TP=4 rank's
+heads of the layer 1 and layer 14 tables. Each rank's rows repeat so the distinct
+pages per table match the 128K production prefill (--pages, calibrated per rank).
+The chunk's pages are populated first, then each table is gathered by:
+
+  base           the production kernel (token x head order, GRID programs striding)
+  base-g/N       the same with GRID = SM count / N
+  sorted         rows in row-id order, each program reading one contiguous run
+  sorted-stride  rows in row-id order with the production striding
+
+with --prefetch also while the next chunk's pages populate in the background on
+both tables (the production overlap). Outputs must equal the base kernel's.
+"""
+
+import argparse
+import json
+import os
+import sys
+import time
+
+import numpy as np
+import torch
+import triton
+import triton.language as tl
+
+sys.path.insert(0, os.path.expanduser("~/dsv41-prep"))
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+import vllm.models.deepseek_v4_1.common.engram as E  # noqa: E402
+from engram_layout import head_sizes_for  # noqa: E402
+
+TOKENS, TP, COLS, DIM, BLOCK, BLOCK_R = 4092, 4, 24, 256, 32, 16
+
+
+@triton.jit
+def sorted_lookup(
+    weight,
+    scales,
+    rows,
+    pos,
+    out,
+    vocab_start,
+    vocab_end,
+    num_rows,
+    rows_per_prog,
+    DIM: tl.constexpr,
+    QUANT_BLOCK: tl.constexpr,
+    BLOCK_R: tl.constexpr,
+):
+    weight = weight.to(tl.pointer_type(tl.float8e4nv))
+    scales = scales.to(tl.pointer_type(tl.uint8))
+    cols = tl.arange(0, DIM)
+    scale_cols = cols // QUANT_BLOCK
+    start = tl.program_id(0) * rows_per_prog
+    end = tl.minimum(start + rows_per_prog, num_rows)
+    for base in tl.range(start, end, BLOCK_R):
+        k = base + tl.arange(0, BLOCK_R)
+        valid = k < end
+        index = tl.load(rows + k, mask=valid, other=-1).to(tl.int64)
+        p = tl.load(pos + k, mask=valid, other=0).to(tl.int64)
+        owned = valid & (index >= vocab_start) & (index < vocab_end)
+        local = tl.where(owned, index - vocab_start, 0)
+        values = tl.load(
+            weight + local[:, None] * DIM + cols[None, :], mask=owned[:, None], other=0.0
+        )
+        scale = tl.load(
+            scales + local[:, None] * (DIM // QUANT_BLOCK) + scale_cols[None, :],
+            mask=owned[:, None],
+            other=0,
+        )
+        scale = (scale.to(tl.int32) << 23).to(tl.float32, bitcast=True)
+        tl.store(
+            out + p[:, None] * DIM + cols[None, :],
+            (values.to(tl.float32) * scale).to(tl.bfloat16),
+            mask=valid[:, None],
+        )
+
+
+@triton.jit
+def sorted_stride_lookup(
+    weight,
+    scales,
+    rows,
+    pos,
+    out,
+    vocab_start,
+    vocab_end,
+    num_rows,
+    DIM: tl.constexpr,
+    QUANT_BLOCK: tl.constexpr,
+    BLOCK_R: tl.constexpr,
+    GRID: tl.constexpr,
+):
+    weight = weight.to(tl.pointer_type(tl.float8e4nv))
+    scales = scales.to(tl.pointer_type(tl.uint8))
+    cols = tl.arange(0, DIM)
+    scale_cols = cols // QUANT_BLOCK
+    for base in tl.range(tl.program_id(0) * BLOCK_R, num_rows, GRID * BLOCK_R):
+        k = base + tl.arange(0, BLOCK_R)
+        valid = k < num_rows
+        index = tl.load(rows + k, mask=valid, other=-1).to(tl.int64)
+        p = tl.load(pos + k, mask=valid, other=0).to(tl.int64)
+        owned = valid & (index >= vocab_start) & (index < vocab_end)
+        local = tl.where(owned, index - vocab_start, 0)
+        values = tl.load(
+            weight + local[:, None] * DIM + cols[None, :], mask=owned[:, None], other=0.0
+        )
+        scale = tl.load(
+            scales + local[:, None] * (DIM // QUANT_BLOCK) + scale_cols[None, :],
+            mask=owned[:, None],
+            other=0,
+        )
+        scale = (scale.to(tl.int32) << 23).to(tl.float32, bitcast=True)
+        tl.store(
+            out + p[:, None] * DIM + cols[None, :],
+            (values.to(tl.float32) * scale).to(tl.bfloat16),
+            mask=valid[:, None],
+        )
+
+
+class Rank:
+    def __init__(self, rank, table, hs):
+        part = triton.cdiv(COLS, TP)
+        self.rank, self.table, self.hs = rank, table, hs
+        self.head_start = rank * part
+        self.heads = part
+        self.vocab_start = sum(hs[: self.head_start])
+        self.vocab_end = sum(hs[: self.head_start + part])
+        self.col_start = [sum(hs[:h]) for h in range(COLS)]
+
+    def draw(self, rng, fraction):
+        """[TOKENS, COLS] ids; each local column holds round(fraction * TOKENS)
+        distinct rows of its bucket range, every one used at least once."""
+        ids = np.full((TOKENS, COLS), -1, dtype=np.int64)
+        k = max(1, round(fraction * TOKENS))
+        for h in range(self.head_start, self.head_start + self.heads):
+            vals = self.col_start[h] + rng.integers(0, self.hs[h], size=k)
+            col = np.concatenate([vals, vals[rng.integers(0, k, TOKENS - k)]])
+            rng.shuffle(col)
+            ids[:, h] = col
+        return ids
+
+    def local_rows(self, ids):
+        return ids[:, self.head_start : self.head_start + self.heads].ravel()
+
+
+def calibrate(rank, target_pages, rng):
+    lo, hi = 0.02, 1.0
+    for _ in range(14):
+        mid = (lo + hi) / 2
+        pages = rank.table._pages_of(rank.local_rows(rank.draw(rng, mid))).size
+        if pages < target_pages:
+            lo = mid
+        else:
+            hi = mid
+    return (lo + hi) / 2
+
+
+def run_base(rank, ids_gpu, out, grid):
+    E._engram_lookup_kernel[(grid,)](
+        rank.table.weight_address(rank.vocab_start),
+        rank.table.scale_address(rank.vocab_start),
+        ids_gpu,
+        out,
+        rank.vocab_start,
+        rank.vocab_end,
+        TOKENS * rank.heads,
+        ids_gpu.stride(0),
+        ids_gpu.stride(1),
+        HEAD_START=rank.head_start,
+        LOCAL_HEADS=rank.heads,
+        TOTAL_HEADS=COLS,
+        DIM=DIM,
+        QUANT_BLOCK=BLOCK,
+        BLOCK_R=BLOCK_R,
+        GRID=grid,
+    )
+
+
+def run_sorted(rank, ids_gpu, out, programs, stride):
+    local = ids_gpu[:, rank.head_start : rank.head_start + rank.heads].reshape(-1)
+    rows, order = torch.sort(local)
+    num_rows = rows.numel()
+    flat = out.view(-1, DIM)
+    if stride:
+        sorted_stride_lookup[(programs,)](
+            rank.table.weight_address(rank.vocab_start),
+            rank.table.scale_address(rank.vocab_start),
+            rows,
+            order,
+            flat,
+            rank.vocab_start,
+            rank.vocab_end,
+            num_rows,
+            DIM=DIM,
+            QUANT_BLOCK=BLOCK,
+            BLOCK_R=BLOCK_R,
+            GRID=programs,
+        )
+    else:
+        per = triton.cdiv(triton.cdiv(num_rows, programs), BLOCK_R) * BLOCK_R
+        sorted_lookup[(triton.cdiv(num_rows, per),)](
+            rank.table.weight_address(rank.vocab_start),
+            rank.table.scale_address(rank.vocab_start),
+            rows,
+            order,
+            flat,
+            rank.vocab_start,
+            rank.vocab_end,
+            num_rows,
+            per,
+            DIM=DIM,
+            QUANT_BLOCK=BLOCK,
+            BLOCK_R=BLOCK_R,
+        )
+
+
+def main():
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--model", default=os.path.expanduser("~/models/DeepSeek-V4.1-Flash"))
+    ap.add_argument("--pages", default="26400,36000,41900,44000")
+    ap.add_argument("--reps", type=int, default=3)
+    ap.add_argument("--threads", type=int, default=32)
+    ap.add_argument("--ranks", default="0,1,2,3")
+    ap.add_argument("--variants", default="base,sorted,sorted-stride,base-g/4")
+    ap.add_argument("--out", required=True)
+    a = ap.parse_args()
+    cfg = json.load(open(f"{a.model}/config.json"))["text_config"]
+    layers = cfg["engram_layer_ids"]
+    tables = {
+        layer: E.MmapEngramTable(
+            a.model, layer, DIM, BLOCK, a.threads, background=True, min_chunk_runs=8
+        )
+        for layer in layers
+    }
+    sizes = {layer: head_sizes_for(cfg, layer) for layer in layers}
+    sms = torch.cuda.get_device_properties(0).multi_processor_count
+    programs_full = min(triton.cdiv(TOKENS * 6, BLOCK_R), sms)
+    rng = np.random.default_rng(17)
+    targets = [int(x) for x in a.pages.split(",")]
+    print(f"SM count {sms}, programs {programs_full}, threads {a.threads}", flush=True)
+    log = open(a.out, "a")
+    out = {layer: torch.empty(TOKENS, 6, DIM, dtype=torch.bfloat16, device="cuda") for layer in layers}
+    check = {layer: torch.empty_like(out[layer]) for layer in layers}
+    for r in [int(x) for x in a.ranks.split(",")]:
+        ranks = {layer: Rank(r, tables[layer], sizes[layer]) for layer in layers}
+        fraction = calibrate(ranks[layers[0]], targets[r], rng)
+        print(f"rank {r}: distinct fraction {fraction:.3f} for {targets[r]} pages", flush=True)
+        # Warm the kernels (JIT) on a populated chunk.
+        ids = {layer: ranks[layer].draw(rng, fraction) for layer in layers}
+        for layer in layers:
+            rk = ranks[layer]
+            rk.table.prefault(rk.local_rows(ids[layer]))
+            g = torch.from_numpy(ids[layer]).to(torch.int32).cuda()
+            run_base(rk, g, out[layer], programs_full)
+            run_base(rk, g, out[layer], max(1, programs_full // 4))
+            run_sorted(rk, g, out[layer], programs_full, False)
+            run_sorted(rk, g, out[layer], programs_full, True)
+        torch.cuda.synchronize()
+        for rep in range(a.reps):
+            for prefetch in (False, True):
+                for variant in a.variants.split(","):
+                    ids = {layer: ranks[layer].draw(rng, fraction) for layer in layers}
+                    gpu = {}
+                    for layer in layers:
+                        rk = ranks[layer]
+                        rk.table.prefault(rk.local_rows(ids[layer]))
+                        rk.table._prefetched = None
+                        gpu[layer] = torch.from_numpy(ids[layer]).to(torch.int32).cuda()
+                    if prefetch:
+                        for layer in layers:
+                            rk = ranks[layer]
+                            rk.table.prefetch(rk.local_rows(rk.draw(rng, fraction)))
+                    torch.cuda.synchronize()
+                    for layer in layers:
+                        rk = ranks[layer]
+                        t0 = time.perf_counter()
+                        if variant == "base":
+                            run_base(rk, gpu[layer], out[layer], programs_full)
+                        elif variant.startswith("base-g/"):
+                            div = int(variant.split("/")[1])
+                            run_base(rk, gpu[layer], out[layer], max(1, programs_full // div))
+                        elif variant == "sorted":
+                            run_sorted(rk, gpu[layer], out[layer], programs_full, False)
+                        elif variant == "sorted-stride":
+                            run_sorted(rk, gpu[layer], out[layer], programs_full, True)
+                        torch.cuda.synchronize()
+                        ms = (time.perf_counter() - t0) * 1e3
+                        pages = rk.table._pages_of(rk.local_rows(ids[layer])).size
+                        rec = {
+                            "rank": r,
+                            "layer": layer,
+                            "variant": variant,
+                            "prefetch": prefetch,
+                            "rep": rep,
+                            "pages": int(pages),
+                            "ms": round(ms, 2),
+                        }
+                        if rep == 0 and variant != "base":
+                            run_base(rk, gpu[layer], check[layer], programs_full)
+                            torch.cuda.synchronize()
+                            rec["equal_base"] = bool(torch.equal(out[layer], check[layer]))
+                        log.write(json.dumps(rec) + "\n")
+                        log.flush()
+                        print(json.dumps(rec), flush=True)
+                    for layer in layers:
+                        ranks[layer].table.drain()
+                        ranks[layer].table._prefetched = None
+
+
+if __name__ == "__main__":
+    main()

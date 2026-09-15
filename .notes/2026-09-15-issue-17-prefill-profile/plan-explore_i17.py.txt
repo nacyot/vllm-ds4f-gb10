@@ -1,0 +1,274 @@
+#!/usr/bin/env python3
+"""Plan-stage exploration for issue #17 (throwaway, stdlib only).
+
+Attribute prefill-chunk wall time of 4-rank V4.1 torch traces:
+window / busy / gaps, kernel categories, launch phase (inside execute_model
+annotation vs after = sampling + draft), mHC kernels per call, Engram lookup
+per call, NCCL matched call by call across ranks (transfer = per-call min,
+wait = rank - min) with the laggard rank's segment excess by category.
+
+Usage: explore_prefill_i17.py <dir with rank traces> [--min-tokens 2048]
+"""
+
+import argparse
+import bisect
+import collections
+import glob
+import gzip
+import json
+import os
+import re
+import statistics
+import sys
+
+sys.path.insert(0, "deploy/gb10-cluster/dsv41")
+from prof_summary import cat_of  # noqa: E402
+
+GAP_US = 500.0
+STEP_RE = re.compile(r"execute_context_(\d+)\((\d+)\)_generation_(\d+)\((\d+)\)")
+MHC_RE = re.compile(r"mhc_post|mhc_pre|hc_prenorm|mhc_fused")
+
+
+def is_nccl(name):
+    return "nccl" in name.lower()
+
+
+def load_rank(path, min_tokens):
+    ev = json.load(gzip.open(path))["traceEvents"]
+    kern = sorted(
+        (e for e in ev if e.get("cat") in ("kernel", "gpu_memcpy", "gpu_memset")),
+        key=lambda e: e["ts"],
+    )
+    runtime = {}
+    for e in ev:
+        if e.get("cat") in ("cuda_runtime", "cuda_driver"):
+            c = (e.get("args") or {}).get("correlation")
+            if c is not None:
+                runtime.setdefault(c, e)
+    ann = sorted(
+        (
+            e
+            for e in ev
+            if e.get("cat") == "user_annotation"
+            and e["name"].startswith("execute_context")
+        ),
+        key=lambda e: e["ts"],
+    )
+    del ev
+    starts = [a["ts"] for a in ann]
+    launched = collections.defaultdict(list)
+    for k in kern:
+        r = runtime.get((k.get("args") or {}).get("correlation"))
+        launch = r["ts"] if r else k["ts"]
+        i = bisect.bisect_right(starts, launch) - 1
+        if i >= 0:
+            launched[i].append((k, launch, r["name"] if r else ""))
+    first = {i: min(x[0]["ts"] for x in v) for i, v in launched.items()}
+    kts = [k["ts"] for k in kern]
+    steps = []
+    for i, a in enumerate(ann):
+        m = STEP_RE.match(a["name"])
+        if not m or int(m.group(2)) < min_tokens:
+            continue
+        if i not in first or i + 1 not in first:
+            continue
+        a_end = a["ts"] + a["dur"]
+        w0, w1 = first[i], first[i + 1]
+        row = collections.defaultdict(float)
+        row["name"] = a["name"]
+        row["window"] = (w1 - w0) / 1e3
+        row["cpu_annot"] = a["dur"] / 1e3
+        idle_pairs = collections.defaultdict(float)
+        cur_s = cur_e = None
+        last = None
+        in_win = kern[bisect.bisect_left(kts, w0) : bisect.bisect_left(kts, w1)]
+        for k in in_win:
+            s, e = k["ts"], k["ts"] + k["dur"]
+            if cur_e is None:
+                cur_s, cur_e, last = s, e, k
+                continue
+            if s > cur_e:
+                row["busy"] += (cur_e - cur_s) / 1e3
+                g = s - cur_e
+                if g < GAP_US:
+                    row["small_gaps"] += g / 1e3
+                elif "DtoH" in last["name"] and "Pageable" in last["name"]:
+                    row["idle_after_dtoh"] += g / 1e3
+                    idle_pairs[("DtoH", k["name"][:40])] += g / 1e3
+                else:
+                    row["idle_other"] += g / 1e3
+                    idle_pairs[(last["name"][:40], k["name"][:40])] += g / 1e3
+                cur_s, cur_e, last = s, e, k
+            elif e >= cur_e:
+                cur_e, last = e, k
+        row["busy"] += (cur_e - cur_s) / 1e3
+        if w1 > cur_e:
+            row["tail_idle"] += (w1 - cur_e) / 1e3
+        mhc = collections.defaultdict(lambda: [0, 0.0])
+        eng = []
+        nccl = []
+        streams = collections.Counter()
+        for k, launch, rname in launched[i]:
+            d = k["dur"] / 1e3
+            phase = "in" if launch < a_end else "after"
+            row["phase:" + phase] += d
+            row["cat:" + cat_of(k["name"])] += d
+            row["n_kernels"] += 1
+            if MHC_RE.search(k["name"]):
+                key = k["name"][:60] + " @" + phase
+                mhc[key][0] += 1
+                mhc[key][1] += k["dur"]
+            if "engram_lookup" in k["name"]:
+                eng.append((k["dur"], phase))
+            if is_nccl(k["name"]):
+                nccl.append(k)
+                streams[(k.get("args") or {}).get("stream")] += 1
+        row["mhc"] = dict(mhc)
+        row["engram_calls"] = eng
+        nccl.sort(key=lambda k: k["ts"])
+        row["nccl_list"] = [(k["name"][:48], k["dur"]) for k in nccl]
+        row["nccl"] = sum(k["dur"] for k in nccl) / 1e3
+        # Segments between consecutive NCCL kernels on the NCCL stream.
+        nstream = streams.most_common(1)[0][0] if streams else None
+        segs = []
+        prev_end = w0
+        comp = [
+            k
+            for k, _, _ in launched[i]
+            if not is_nccl(k["name"])
+        ]
+        comp.sort(key=lambda k: k["ts"])
+        cts = [k["ts"] for k in comp]
+        for k in nccl:
+            lo = bisect.bisect_left(cts, prev_end)
+            hi = bisect.bisect_left(cts, k["ts"])
+            cats = collections.defaultdict(float)
+            for c in comp[lo:hi]:
+                if (c.get("args") or {}).get("stream") == nstream:
+                    cats[cat_of(c["name"])] += c["dur"]
+            segs.append((k["ts"] - prev_end, dict(cats)))
+            prev_end = k["ts"] + k["dur"]
+        row["segs"] = segs
+        row["idle_pairs"] = dict(idle_pairs)
+        steps.append(row)
+    return steps
+
+
+def main():
+    ap = argparse.ArgumentParser()
+    ap.add_argument("tag_dir")
+    ap.add_argument("--min-tokens", type=int, default=2048)
+    a = ap.parse_args()
+    paths = {}
+    for p in glob.glob(os.path.join(a.tag_dir, "**", "*.pt.trace.json*"), recursive=True):
+        m = re.search(r"rank(\d+)", os.path.basename(p))
+        if m:
+            paths[int(m.group(1))] = p
+    per = {r: load_rank(p, a.min_tokens) for r, p in sorted(paths.items())}
+    ranks = sorted(per)
+    n = min(len(v) for v in per.values())
+    print(f"ranks {ranks}, chunk steps {[len(per[r]) for r in ranks]}")
+    for r in ranks:
+        print(f"  rank{r}: " + " | ".join(s["name"] for s in per[r][:n]))
+
+    scalar = sorted(
+        {
+            k
+            for r in ranks
+            for s in per[r][:n]
+            for k, v in s.items()
+            if isinstance(v, float)
+        }
+    )
+    print(f"\n{'metric (ms/chunk, mean)':30s}" + "".join(f"{'rank' + str(r):>10s}" for r in ranks))
+    for k in scalar:
+        vals = [statistics.mean(s.get(k, 0.0) for s in per[r][:n]) for r in ranks]
+        print(f"{k:30s}" + "".join(f"{v:10.1f}" for v in vals))
+
+    print("\n== mHC kernels at chunk steps: calls/chunk, mean us/call ==")
+    keys = sorted({k for r in ranks for s in per[r][:n] for k in s["mhc"]})
+    for key in keys:
+        cells = []
+        for r in ranks:
+            c = sum(s["mhc"].get(key, [0, 0.0])[0] for s in per[r][:n])
+            t = sum(s["mhc"].get(key, [0, 0.0])[1] for s in per[r][:n])
+            cells.append(f"{c / n:5.0f} x {t / c if c else 0:7.0f}")
+        print(f"  {key:66s} " + "  ".join(cells))
+
+    print("\n== Engram lookup per call (us) per chunk ==")
+    for r in ranks:
+        print(f"  rank{r}: " + " ; ".join(
+            ",".join(f"{d:.0f}{ph[0]}" for d, ph in s["engram_calls"]) for s in per[r][:n]
+        ))
+
+    print("\n== NCCL matched per call ==")
+    for j in range(n):
+        lists = [per[r][j]["nccl_list"] for r in ranks]
+        lens = [len(x) for x in lists]
+        same = len(set(lens)) == 1 and all(
+            len({lists[q][c][0] for q in range(len(ranks))}) == 1 for c in range(lens[0])
+        )
+        if not same:
+            print(f"  chunk {j}: calls {lens}, names aligned False; skip")
+            continue
+        transfer = 0.0
+        loss = 0.0
+        wait = collections.defaultdict(float)
+        lag_calls = collections.Counter()
+        lag_wait = collections.defaultdict(float)
+        excess = collections.defaultdict(lambda: collections.defaultdict(float))
+        big = []
+        for c in range(lens[0]):
+            durs = [lists[q][c][1] for q in range(len(ranks))]
+            mn = min(durs)
+            transfer += mn
+            loss += max(durs) - mn
+            lag = ranks[durs.index(mn)]
+            caused = sum(d - mn for d in durs)
+            for q, r in enumerate(ranks):
+                wait[r] += durs[q] - mn
+            lag_calls[lag] += 1
+            lag_wait[lag] += caused
+            segs = [per[r][j]["segs"][c] for r in ranks]
+            fast = min(range(len(ranks)), key=lambda q: segs[q][0])
+            lq = durs.index(mn)
+            ex = excess[lag]
+            ex["segment"] += segs[lq][0] - segs[fast][0]
+            for cat in set(segs[lq][1]) | set(segs[fast][1]):
+                ex[cat] += segs[lq][1].get(cat, 0.0) - segs[fast][1].get(cat, 0.0)
+            big.append((caused, c, lag, lists[0][c][0]))
+        print(
+            f"  chunk {j}: calls {lens[0]}, transfer {transfer / 1e3:.1f} ms, "
+            f"imbalance loss {loss / 1e3:.1f} ms, wait "
+            + " ".join(f"r{r} {wait[r] / 1e3:.1f}" for r in ranks)
+            + " | laggard calls "
+            + " ".join(f"r{r} {lag_calls[r]}" for r in ranks)
+            + " | wait caused "
+            + " ".join(f"r{r} {lag_wait[r] / 1e3:.1f}" for r in ranks)
+        )
+        for r in ranks:
+            ex = excess[r]
+            if not ex:
+                continue
+            top = sorted(((k, v) for k, v in ex.items() if k != "segment"), key=lambda kv: -abs(kv[1]))[:5]
+            kernels = sum(v for k, v in ex.items() if k != "segment")
+            print(
+                f"     laggard r{r}: segment excess {ex['segment'] / 1e3:.1f} ms "
+                f"(kernels {kernels / 1e3:+.1f}, idle/other-stream {(ex['segment'] - kernels) / 1e3:+.1f}); "
+                + ", ".join(f"{k} {v / 1e3:+.1f}" for k, v in top)
+            )
+        for caused, c, lag, name in sorted(big, reverse=True)[:5]:
+            print(f"     call {c:3d} {name:48s} caused {caused / 1e3:7.1f} ms, laggard r{lag}")
+
+    for r in ranks:
+        print(f"\n== top idle pairs (rank{r}, ms per chunk) ==")
+        agg = collections.defaultdict(float)
+        for s in per[r][:n]:
+            for k, v in s["idle_pairs"].items():
+                agg[k] += v / n
+        for k, v in sorted(agg.items(), key=lambda kv: -kv[1])[:4]:
+            print(f"  {v:8.1f}  after [{k[0]}] before [{k[1]}]")
+
+
+if __name__ == "__main__":
+    main()

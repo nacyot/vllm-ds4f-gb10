@@ -1,0 +1,96 @@
+{"rank": 3, "layer": 1, "variant": "base", "prefetch": false, "rep": 0, "pages": 44022, "ms": 69.18}
+{"rank": 3, "layer": 14, "variant": "base", "prefetch": false, "rep": 0, "pages": 43967, "ms": 79.3}
+{"rank": 3, "layer": 1, "variant": "sorted", "prefetch": false, "rep": 0, "pages": 43972, "ms": 91.56, "equal_base": true}
+{"rank": 3, "layer": 14, "variant": "sorted", "prefetch": false, "rep": 0, "pages": 43978, "ms": 79.5, "equal_base": true}
+{"rank": 3, "layer": 1, "variant": "sorted-stride", "prefetch": false, "rep": 0, "pages": 43995, "ms": 117.78, "equal_base": true}
+{"rank": 3, "layer": 14, "variant": "sorted-stride", "prefetch": false, "rep": 0, "pages": 44072, "ms": 100.85, "equal_base": true}
+{"rank": 3, "layer": 1, "variant": "base-g/4", "prefetch": false, "rep": 0, "pages": 43957, "ms": 271.97, "equal_base": true}
+{"rank": 3, "layer": 14, "variant": "base-g/4", "prefetch": false, "rep": 0, "pages": 43977, "ms": 185.51, "equal_base": true}
+{"rank": 3, "layer": 1, "variant": "base", "prefetch": true, "rep": 0, "pages": 43998, "ms": 626.67}
+{"rank": 3, "layer": 14, "variant": "base", "prefetch": true, "rep": 0, "pages": 43952, "ms": 136.1}
+{"rank": 3, "layer": 1, "variant": "sorted", "prefetch": true, "rep": 0, "pages": 43945, "ms": 535.49, "equal_base": true}
+{"rank": 3, "layer": 14, "variant": "sorted", "prefetch": true, "rep": 0, "pages": 43933, "ms": 187.5, "equal_base": true}
+{"rank": 3, "layer": 1, "variant": "sorted-stride", "prefetch": true, "rep": 0, "pages": 43993, "ms": 515.16, "equal_base": true}
+{"rank": 3, "layer": 14, "variant": "sorted-stride", "prefetch": true, "rep": 0, "pages": 43956, "ms": 502.54, "equal_base": true}
+{"rank": 3, "layer": 1, "variant": "base-g/4", "prefetch": true, "rep": 0, "pages": 44044, "ms": 1433.45, "equal_base": true}
+{"rank": 3, "layer": 14, "variant": "base-g/4", "prefetch": true, "rep": 0, "pages": 43944, "ms": 667.98, "equal_base": true}
+{"rank": 3, "layer": 1, "variant": "base", "prefetch": false, "rep": 1, "pages": 43945, "ms": 240.3}
+{"rank": 3, "layer": 14, "variant": "base", "prefetch": false, "rep": 1, "pages": 43969, "ms": 277.01}
+{"rank": 3, "layer": 1, "variant": "sorted", "prefetch": false, "rep": 1, "pages": 43975, "ms": 345.19}
+{"rank": 3, "layer": 14, "variant": "sorted", "prefetch": false, "rep": 1, "pages": 44028, "ms": 416.86}
+{"rank": 3, "layer": 1, "variant": "sorted-stride", "prefetch": false, "rep": 1, "pages": 43973, "ms": 277.24}
+{"rank": 3, "layer": 14, "variant": "sorted-stride", "prefetch": false, "rep": 1, "pages": 43928, "ms": 266.84}
+{"rank": 3, "layer": 1, "variant": "base-g/4", "prefetch": false, "rep": 1, "pages": 43950, "ms": 295.05}
+{"rank": 3, "layer": 14, "variant": "base-g/4", "prefetch": false, "rep": 1, "pages": 44011, "ms": 260.01}
+{"rank": 3, "layer": 1, "variant": "base", "prefetch": true, "rep": 1, "pages": 43963, "ms": 251.9}
+{"rank": 3, "layer": 14, "variant": "base", "prefetch": true, "rep": 1, "pages": 43882, "ms": 559.05}
+{"rank": 3, "layer": 1, "variant": "sorted", "prefetch": true, "rep": 1, "pages": 43964, "ms": 536.7}
+{"rank": 3, "layer": 14, "variant": "sorted", "prefetch": true, "rep": 1, "pages": 43921, "ms": 297.93}
+{"rank": 3, "layer": 1, "variant": "sorted-stride", "prefetch": true, "rep": 1, "pages": 44030, "ms": 542.39}
+{"rank": 3, "layer": 14, "variant": "sorted-stride", "prefetch": true, "rep": 1, "pages": 44048, "ms": 275.46}
+{"rank": 3, "layer": 1, "variant": "base-g/4", "prefetch": true, "rep": 1, "pages": 43972, "ms": 420.24}
+{"rank": 3, "layer": 14, "variant": "base-g/4", "prefetch": true, "rep": 1, "pages": 43999, "ms": 248.62}
+{"rank": 3, "layer": 1, "variant": "base", "prefetch": false, "rep": 2, "pages": 43979, "ms": 362.96}
+{"rank": 3, "layer": 14, "variant": "base", "prefetch": false, "rep": 2, "pages": 44016, "ms": 223.06}
+{"rank": 3, "layer": 1, "variant": "sorted", "prefetch": false, "rep": 2, "pages": 43996, "ms": 205.94}
+{"rank": 3, "layer": 14, "variant": "sorted", "prefetch": false, "rep": 2, "pages": 44019, "ms": 280.92}
+{"rank": 3, "layer": 1, "variant": "sorted-stride", "prefetch": false, "rep": 2, "pages": 43931, "ms": 327.57}
+{"rank": 3, "layer": 14, "variant": "sorted-stride", "prefetch": false, "rep": 2, "pages": 43993, "ms": 278.64}
+{"rank": 3, "layer": 1, "variant": "base-g/4", "prefetch": false, "rep": 2, "pages": 44025, "ms": 230.65}
+{"rank": 3, "layer": 14, "variant": "base-g/4", "prefetch": false, "rep": 2, "pages": 43919, "ms": 230.82}
+{"rank": 3, "layer": 1, "variant": "base", "prefetch": true, "rep": 2, "pages": 44028, "ms": 475.04}
+{"rank": 3, "layer": 14, "variant": "base", "prefetch": true, "rep": 2, "pages": 43946, "ms": 208.18}
+{"rank": 3, "layer": 1, "variant": "sorted", "prefetch": true, "rep": 2, "pages": 43999, "ms": 560.25}
+{"rank": 3, "layer": 14, "variant": "sorted", "prefetch": true, "rep": 2, "pages": 44019, "ms": 313.95}
+{"rank": 3, "layer": 1, "variant": "sorted-stride", "prefetch": true, "rep": 2, "pages": 43967, "ms": 538.69}
+{"rank": 3, "layer": 14, "variant": "sorted-stride", "prefetch": true, "rep": 2, "pages": 43982, "ms": 308.9}
+{"rank": 3, "layer": 1, "variant": "base-g/4", "prefetch": true, "rep": 2, "pages": 43911, "ms": 352.42}
+{"rank": 3, "layer": 14, "variant": "base-g/4", "prefetch": true, "rep": 2, "pages": 43942, "ms": 296.01}
+{"rank": 0, "layer": 1, "variant": "base", "prefetch": false, "rep": 0, "pages": 26452, "ms": 133.55}
+{"rank": 0, "layer": 14, "variant": "base", "prefetch": false, "rep": 0, "pages": 26459, "ms": 71.98}
+{"rank": 0, "layer": 1, "variant": "sorted", "prefetch": false, "rep": 0, "pages": 26402, "ms": 221.16, "equal_base": true}
+{"rank": 0, "layer": 14, "variant": "sorted", "prefetch": false, "rep": 0, "pages": 26414, "ms": 133.31, "equal_base": true}
+{"rank": 0, "layer": 1, "variant": "sorted-stride", "prefetch": false, "rep": 0, "pages": 26436, "ms": 68.45, "equal_base": true}
+{"rank": 0, "layer": 14, "variant": "sorted-stride", "prefetch": false, "rep": 0, "pages": 26472, "ms": 69.07, "equal_base": true}
+{"rank": 0, "layer": 1, "variant": "base-g/4", "prefetch": false, "rep": 0, "pages": 26424, "ms": 188.49, "equal_base": true}
+{"rank": 0, "layer": 14, "variant": "base-g/4", "prefetch": false, "rep": 0, "pages": 26443, "ms": 81.98, "equal_base": true}
+{"rank": 0, "layer": 1, "variant": "base", "prefetch": true, "rep": 0, "pages": 26439, "ms": 132.97}
+{"rank": 0, "layer": 14, "variant": "base", "prefetch": true, "rep": 0, "pages": 26427, "ms": 231.82}
+{"rank": 0, "layer": 1, "variant": "sorted", "prefetch": true, "rep": 0, "pages": 26433, "ms": 140.07, "equal_base": true}
+{"rank": 0, "layer": 14, "variant": "sorted", "prefetch": true, "rep": 0, "pages": 26457, "ms": 214.11, "equal_base": true}
+{"rank": 0, "layer": 1, "variant": "sorted-stride", "prefetch": true, "rep": 0, "pages": 26451, "ms": 696.36, "equal_base": true}
+{"rank": 0, "layer": 14, "variant": "sorted-stride", "prefetch": true, "rep": 0, "pages": 26427, "ms": 658.83, "equal_base": true}
+{"rank": 0, "layer": 1, "variant": "base-g/4", "prefetch": true, "rep": 0, "pages": 26416, "ms": 884.88, "equal_base": true}
+{"rank": 0, "layer": 14, "variant": "base-g/4", "prefetch": true, "rep": 0, "pages": 26414, "ms": 750.94, "equal_base": true}
+{"rank": 0, "layer": 1, "variant": "base", "prefetch": false, "rep": 1, "pages": 26441, "ms": 684.74}
+{"rank": 0, "layer": 14, "variant": "base", "prefetch": false, "rep": 1, "pages": 26439, "ms": 251.12}
+{"rank": 0, "layer": 1, "variant": "sorted", "prefetch": false, "rep": 1, "pages": 26450, "ms": 275.97}
+{"rank": 0, "layer": 14, "variant": "sorted", "prefetch": false, "rep": 1, "pages": 26490, "ms": 324.28}
+{"rank": 0, "layer": 1, "variant": "sorted-stride", "prefetch": false, "rep": 1, "pages": 26437, "ms": 408.21}
+{"rank": 0, "layer": 14, "variant": "sorted-stride", "prefetch": false, "rep": 1, "pages": 26408, "ms": 176.75}
+{"rank": 0, "layer": 1, "variant": "base-g/4", "prefetch": false, "rep": 1, "pages": 26464, "ms": 434.94}
+{"rank": 0, "layer": 14, "variant": "base-g/4", "prefetch": false, "rep": 1, "pages": 26445, "ms": 170.92}
+{"rank": 0, "layer": 1, "variant": "base", "prefetch": true, "rep": 1, "pages": 26417, "ms": 473.14}
+{"rank": 0, "layer": 14, "variant": "base", "prefetch": true, "rep": 1, "pages": 26431, "ms": 650.69}
+{"rank": 0, "layer": 1, "variant": "sorted", "prefetch": true, "rep": 1, "pages": 26421, "ms": 536.43}
+{"rank": 0, "layer": 14, "variant": "sorted", "prefetch": true, "rep": 1, "pages": 26424, "ms": 512.77}
+{"rank": 0, "layer": 1, "variant": "sorted-stride", "prefetch": true, "rep": 1, "pages": 26457, "ms": 167.94}
+{"rank": 0, "layer": 14, "variant": "sorted-stride", "prefetch": true, "rep": 1, "pages": 26467, "ms": 360.7}
+{"rank": 0, "layer": 1, "variant": "base-g/4", "prefetch": true, "rep": 1, "pages": 26427, "ms": 974.55}
+{"rank": 0, "layer": 14, "variant": "base-g/4", "prefetch": true, "rep": 1, "pages": 26456, "ms": 654.21}
+{"rank": 0, "layer": 1, "variant": "base", "prefetch": false, "rep": 2, "pages": 26450, "ms": 616.94}
+{"rank": 0, "layer": 14, "variant": "base", "prefetch": false, "rep": 2, "pages": 26412, "ms": 331.05}
+{"rank": 0, "layer": 1, "variant": "sorted", "prefetch": false, "rep": 2, "pages": 26400, "ms": 95.92}
+{"rank": 0, "layer": 14, "variant": "sorted", "prefetch": false, "rep": 2, "pages": 26413, "ms": 71.28}
+{"rank": 0, "layer": 1, "variant": "sorted-stride", "prefetch": false, "rep": 2, "pages": 26447, "ms": 286.84}
+{"rank": 0, "layer": 14, "variant": "sorted-stride", "prefetch": false, "rep": 2, "pages": 26404, "ms": 232.85}
+{"rank": 0, "layer": 1, "variant": "base-g/4", "prefetch": false, "rep": 2, "pages": 26464, "ms": 117.22}
+{"rank": 0, "layer": 14, "variant": "base-g/4", "prefetch": false, "rep": 2, "pages": 26462, "ms": 138.51}
+{"rank": 0, "layer": 1, "variant": "base", "prefetch": true, "rep": 2, "pages": 26469, "ms": 637.65}
+{"rank": 0, "layer": 14, "variant": "base", "prefetch": true, "rep": 2, "pages": 26461, "ms": 264.45}
+{"rank": 0, "layer": 1, "variant": "sorted", "prefetch": true, "rep": 2, "pages": 26415, "ms": 511.28}
+{"rank": 0, "layer": 14, "variant": "sorted", "prefetch": true, "rep": 2, "pages": 26430, "ms": 282.64}
+{"rank": 0, "layer": 1, "variant": "sorted-stride", "prefetch": true, "rep": 2, "pages": 26467, "ms": 558.03}
+{"rank": 0, "layer": 14, "variant": "sorted-stride", "prefetch": true, "rep": 2, "pages": 26394, "ms": 322.59}
+{"rank": 0, "layer": 1, "variant": "base-g/4", "prefetch": true, "rep": 2, "pages": 26427, "ms": 542.41}
+{"rank": 0, "layer": 14, "variant": "base-g/4", "prefetch": true, "rep": 2, "pages": 26442, "ms": 425.04}
