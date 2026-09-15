@@ -101,6 +101,24 @@ a short request's wait behind a 128K prefill from about 87 s to 7 s by
 slowing that prefill to 878 tok/s. An 8,192 budget was the upper bound: at
 12,288 the boot-time FlashInfer autotune ran every worker into earlyoom.
 
+`SHORT_RESERVE` is the exception: it is on, at 4,096. Those caps all take a
+fixed amount away from every prefill chunk, which is why they cost total
+time. This one takes only what is actually queued behind the prefill --
+the decodes already in the running batch and the waiting requests whose new
+tokens fit under the value -- capped at half the step budget, and it takes
+it from the token budget and the input budget both, since every scheduled
+request also costs the drafter's extra slots. With nothing waiting it
+reserves nothing, so a solo prefill keeps its whole chunk and the step still
+schedules `MNBT` tokens, leaving the per-expert chunk size alone. Adopted
+2026-09-15 (issue #34): a 16-token request behind a 128K cold prefill waits
+7.0 and 8.7 s instead of 64.5 and 68.0, the 4-agent run with that prefill
+injected is unchanged at 265 s, the 4-agent run alone went 205.6 to 199.3 s,
+and a solo 128K prefill 1,666 to 1,792 tok/s. A waiting request cannot
+report its prefix hit before admission, so the cutoff sees the whole prompt:
+a resumed long session's new turn is not treated as short even when it only
+recomputes a few thousand tokens. Details in
+`.notes/2026-09-15-issue-34-hol-reserve/results.md`.
+
 `dsv41_ctl.sh caps` prints `HOST SERVICE PERSISTENCE MAX_SM_MHZ`. Each node
 must have an active `gpu-clock-cap.service`, persistence `Enabled`, and a
 maximum SM clock of at most 2000 MHz across five samples, 200 ms apart.
