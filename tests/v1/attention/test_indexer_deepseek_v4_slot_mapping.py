@@ -22,68 +22,6 @@ from vllm.v1.kv_cache_interface import MLAAttentionSpec
 from vllm.v1.worker.block_table import get_block_table_width
 
 
-@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
-@pytest.mark.parametrize("use_kernel", [False, True])
-@pytest.mark.parametrize(
-    "query_lens", [[1], [0, 257, 1, 0, 3], [6] * 64, [2, 6, 4, 0], [0, 0, 0], []]
-)
-@pytest.mark.parametrize("padding", [-1, 0, 7])
-def test_device_token_request_mapping(monkeypatch, use_kernel, query_lens, padding):
-    """Preserve buffer/cache semantics and follow device boundaries on replay."""
-    monkeypatch.setattr("vllm.v1.attention.backend._DSV41_TOKEN_REQ_KERNEL", use_kernel)
-    lengths = torch.tensor(query_lens, device="cuda", dtype=torch.int32)
-    qsl = torch.cat(
-        [torch.zeros(1, device="cuda", dtype=torch.int32), lengths.cumsum(0).int()]
-    )
-    n = sum(query_lens)
-    num_tokens = max(0, n + padding)
-    written = max(n, num_tokens)
-    output = torch.full((written + 11,), -99, device="cuda", dtype=torch.int32)
-    common = CommonAttentionMetadata(
-        query_start_loc=qsl,
-        query_start_loc_cpu=qsl.cpu(),
-        seq_lens=lengths,
-        num_reqs=len(query_lens),
-        num_actual_tokens=num_tokens,
-        max_query_len=max(query_lens, default=0),
-        max_seq_len=max(query_lens, default=0),
-        block_table_tensor=torch.empty(
-            (len(query_lens), 1), device="cuda", dtype=torch.int32
-        ),
-        slot_mapping=torch.full((num_tokens,), -1, device="cuda", dtype=torch.int64),
-    )
-    expected = torch.repeat_interleave(
-        torch.arange(len(query_lens), device="cuda", dtype=torch.int32), lengths
-    )
-    result = common.token_to_req_indices(output)
-    assert result.shape == (num_tokens,)
-    assert result.untyped_storage().data_ptr() == output.untyped_storage().data_ptr()
-    torch.testing.assert_close(output[:n], expected, rtol=0, atol=0)
-    assert torch.count_nonzero(output[n:written]) == 0
-    assert torch.all(output[written:] == -99)
-    unused = torch.full_like(output, -77)
-    cached = common.token_to_req_indices(unused)
-    assert cached.untyped_storage().data_ptr() == result.untyped_storage().data_ptr()
-    assert torch.all(unused == -77)
-    if written == 0:
-        return
-
-    graph = torch.cuda.CUDAGraph()
-    common._token_to_req_indices_cache = None
-    with torch.cuda.graph(graph):
-        common.token_to_req_indices(output)
-    reversed_lens = lengths.flip(0)
-    qsl[1:].copy_(reversed_lens.cumsum(0))
-    output.fill_(-99)
-    graph.replay()
-    expected = torch.repeat_interleave(
-        torch.arange(len(query_lens), device="cuda", dtype=torch.int32), reversed_lens
-    )
-    torch.testing.assert_close(output[:n], expected, rtol=0, atol=0)
-    assert torch.count_nonzero(output[n:written]) == 0
-    assert torch.all(output[written:] == -99)
-
-
 def test_indexer_warmup_normalizes_zero_compress_ratios():
     config = SimpleNamespace(
         scheduler_config=SimpleNamespace(max_num_batched_tokens=8),

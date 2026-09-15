@@ -1,7 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
-import os
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, replace
 from enum import Enum
@@ -32,8 +31,6 @@ if TYPE_CHECKING:
     )
 
 from vllm.v1.kv_cache_interface import KVCacheLayout, get_kv_quant_mode
-
-_DSV41_TOKEN_REQ_KERNEL = os.environ.get("DSV41_TOKEN_REQ_KERNEL", "0") == "1"
 
 
 class AttentionType(str, Enum):
@@ -512,35 +509,19 @@ class CommonAttentionMetadata:
         # Built from the device query_start_loc: adaptive verification decides the
         # per-request draft split on device, so the CPU copy carries the right total
         # but not the right per-request boundaries. Padding requests have a query
-        # length of zero and contribute no mapped tokens.
+        # length of zero and drop out of the repeat.
         num_mapped_tokens = int(self.query_start_loc_cpu[-1])
-        num_output_tokens = max(num_mapped_tokens, num_tokens)
-        assert buffer.shape[0] >= num_output_tokens
-        if _DSV41_TOKEN_REQ_KERNEL:
-            if num_output_tokens > 0:
-                from vllm.v1.attention.ops.metadata import _token_request_mapping_kernel
-
-                _token_request_mapping_kernel[((num_output_tokens + 255) // 256,)](
-                    self.query_start_loc,
-                    buffer,
-                    self.query_start_loc.shape[0] - 1,
-                    num_mapped_tokens,
-                    num_output_tokens,
-                    num_warps=4,
-                )
-        else:
-            query_lens = self.query_start_loc[1:] - self.query_start_loc[:-1]
-            token_to_req_indices = torch.repeat_interleave(
-                torch.arange(
-                    query_lens.shape[0], dtype=torch.int32, device=buffer.device
-                ),
-                query_lens,
-                output_size=num_mapped_tokens,
-            )
-            buffer[:num_mapped_tokens].copy_(token_to_req_indices)
-            if num_mapped_tokens < num_tokens:
-                buffer[num_mapped_tokens:num_tokens].zero_()
-        self._token_to_req_indices_cache = buffer[:num_output_tokens]
+        query_lens = self.query_start_loc[1:] - self.query_start_loc[:-1]
+        assert buffer.shape[0] >= max(num_mapped_tokens, num_tokens)
+        token_to_req_indices = torch.repeat_interleave(
+            torch.arange(query_lens.shape[0], dtype=torch.int32, device=buffer.device),
+            query_lens,
+            output_size=num_mapped_tokens,
+        )
+        buffer[:num_mapped_tokens].copy_(token_to_req_indices)
+        if num_mapped_tokens < num_tokens:
+            buffer[num_mapped_tokens:num_tokens].zero_()
+        self._token_to_req_indices_cache = buffer[: max(num_mapped_tokens, num_tokens)]
         return self._token_to_req_indices_cache[:num_tokens]
 
     # TODO(lucas): remove once we have FULL-CG spec-decode support
