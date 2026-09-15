@@ -1,0 +1,18 @@
+Implementation checks (2026-09-16 KST)
+PASS: 13 unique casebench tags, 8 unique decode combinations, 1 longctx.
+PASS: recursively checked reported error/errors/short_error fields are empty.
+PASS: positive prefill throughput; decode streams_ok == c; all 3 agents have 24 turns.
+PASS: longctx cold/followup answers match expected values.
+PASS: pre-commit run (all applicable staged-file hooks).
+Initial markdownlint MD060 table spacing failure fixed; subsequent run exit 0.
+PASS: git diff --cached --check.
+PASS: all 5 copied evidence files match remote SHA-256.
+No pytest/torch/build: no code or model changes.
+Full workflow validation remains the next stage.
+
+Remote original and local copy SHA-256:
+49e06962bfb66295b483813a50bb3f0a938c11cbbd1ae0688cdea850c4e340b6  casebench.jsonl
+58ae977bace95911ea04eba790de376721fd6e1d66d8acbc1f85813c00e206a0  decode.jsonl
+968c88c41bf681bbf59efc18c704cd2856203ab562338f495d9083f34eb0862d  longctx.jsonl
+bdc6f6a47003454eb08e676718b8bd7f1de275abb57c327eb1c465f0979c95c0  prod-final.log
+6d616bead54719b694ff7b2a728f4e54787d696dbefc43e7625268e40db1be48  prod-final.prestate

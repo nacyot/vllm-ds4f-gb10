@@ -1,0 +1,52 @@
+# Executed on gx10-6040, each cell in a separate foreground SSH command.
+cd ~/sglang-cmp
+B=http://127.0.0.1:8888
+T=prod-final
+cb() { python3 casebench.py --base "$B" --config "$T" --out results/casebench.jsonl "$@"; }
+
+# warm
+cb --mode solo --tag prod-final-warm --prefill-tokens 16000
+
+# warm2
+cb --mode mixed --tag prod-final-warm2 --prefill-tokens 6000 --decodes 2
+
+# decode
+python3 decodebench.py --base "$B" --tag prod-final --types prose,code --levels 1,2,4,8 --gen 256 --out results/decode.jsonl
+
+# S8
+cb --mode solo --tag prod-final-S8 --prefill-tokens 8000
+
+# S32
+cb --mode solo --tag prod-final-S32 --prefill-tokens 32000
+
+# S128
+cb --mode solo --tag prod-final-S128 --prefill-tokens 128000
+
+# M3
+cb --mode mixed --tag prod-final-M3 --prefill-tokens 32000 --decodes 3
+
+# AG4r1
+cb --mode agent --tag prod-final-AG4r1 --lanes 4 --turns 6 --stagger 8 --start-tokens 12000 --turn-tokens-min 2000 --turn-tokens-max 8000 --gen-min 150 --gen-max 900 --work-seed w1 --thinking high --temperature default
+
+# AG4r2
+cb --mode agent --tag prod-final-AG4r2 --lanes 4 --turns 6 --stagger 8 --start-tokens 12000 --turn-tokens-min 2000 --turn-tokens-max 8000 --gen-min 150 --gen-max 900 --work-seed w1 --thinking high --temperature default
+
+# HOL
+cb --mode hol --tag prod-final-HOL --prefill-tokens 128000
+
+# longctx
+python3 longctx.py --base "$B" --tag prod-final --records 10700 --out results/longctx.jsonl
+
+# S128r2
+cb --mode solo --tag prod-final-S128r2 --prefill-tokens 128000
+
+# S128r3
+cb --mode solo --tag prod-final-S128r3 --prefill-tokens 128000
+
+# MIXLONG
+bash ~/dsv41-prep/i34/mixlong_i34.sh prod-final prod-final 8888
+
+# Each cell: stamp + stdout/stderr to results/prod-final.log, sleep 5,
+# validate newly appended rows, health 200, ATTENTION absent.
+# 128K-class cells: MemAvailable >= 3.0 GiB before launch.
+# Watchdog stop 03:02:46 KST; start and active 03:26:09 KST.

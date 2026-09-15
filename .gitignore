@@ -213,6 +213,7 @@ cython_debug/
 .DS_Store
 
 !.notes/2026-09-16-issue-10-kvfs-verify/
+!.notes/2026-09-16-issue-46-final-baseline/
 
 # Results
 *.csv

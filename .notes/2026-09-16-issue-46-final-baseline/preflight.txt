@@ -1,0 +1,54 @@
+NODE 6040
+2026-09-16T03:01:29+09:00
+gx10-6040
+88744c769e5e32796df01cd927d5b9a037e8dca4
+d9c18da5554fcfad75cd6b19cea8fa0645d44512
+d3035099cb4e07a27ca2339a497f910f0ee43825
+active
+Environment=
+0 /home/nacyot/dsv41-prep/dsv41-override.env
+active
+1989 MHz
+MemAvailable 9.169117 GiB
+
+NODE f323
+bash: warning: setlocale: LC_ALL: cannot change locale (en_US.UTF-8)
+2026-09-16T03:01:28+09:00
+gx10-f323
+d77882fc77a1f97886d0d199f06ba406606784ba
+d9c18da5554fcfad75cd6b19cea8fa0645d44512
+17ab1124de573e1d33740ab19f77f9f4253f70d1
+active
+Environment=
+0 /home/nacyot/dsv41-prep/dsv41-override.env
+active
+1989 MHz
+MemAvailable 7.714684 GiB
+
+NODE 37cc
+bash: warning: setlocale: LC_ALL: cannot change locale (en_US.UTF-8)
+2026-09-16T03:01:28+09:00
+gx10-37cc
+3d81648af247e874740c41d8c41b679fe522b2cd
+d9c18da5554fcfad75cd6b19cea8fa0645d44512
+17ab1124de573e1d33740ab19f77f9f4253f70d1
+active
+Environment=
+0 /home/nacyot/dsv41-prep/dsv41-override.env
+active
+1989 MHz
+MemAvailable 7.492363 GiB
+
+NODE 27c4
+bash: warning: setlocale: LC_ALL: cannot change locale (en_US.UTF-8)
+2026-09-16T03:01:28+09:00
+gx10-27c4
+fe5e0aff15f05d15ff7573b664d77571d7022558
+d9c18da5554fcfad75cd6b19cea8fa0645d44512
+17ab1124de573e1d33740ab19f77f9f4253f70d1
+active
+Environment=
+0 /home/nacyot/dsv41-prep/dsv41-override.env
+active
+1989 MHz
+MemAvailable 7.817436 GiB
