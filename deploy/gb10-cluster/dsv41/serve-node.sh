@@ -104,6 +104,7 @@ else
 fi
 if [ "$SPEC" = "dspark" ]; then
   SC="{\"method\":\"dspark\",\"num_speculative_tokens\":$SPEC_K,\"draft_sample_method\":\"${SPEC_DRAFT:-probabilistic}\",\"rejection_sample_method\":\"${SPEC_REJECT:-standard}\""
+  [ "${SPEC_BLOCK_DROP:-1}" = "0" ] && SC="$SC,\"disable_eagle_block_drop\":true"
   [ -n "$SPEC_EXTRA" ] && SC="$SC,$SPEC_EXTRA"
   ARGS+=(--speculative-config "$SC}")
 fi
