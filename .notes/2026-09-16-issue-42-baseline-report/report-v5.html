@@ -1330,7 +1330,7 @@
 <table>
 <thead>
 <tr>
-<th>#</th>
+<th style="white-space: nowrap;">#</th>
 <th>후보</th>
 <th>결말</th>
 <th>실측 몫</th>
@@ -1339,70 +1339,70 @@
 </thead>
 <tbody>
 <tr>
-<td>1</td>
+<td style="white-space: nowrap;">1</td>
 <td><code>disable_eagle_block_drop</code></td>
 <td>채택, 기본값</td>
 <td>후속 턴 TTFT 3.13 → 1.17초, 에이전트 235 → 215초. <code>prod-final</code>의 후속 턴은 0.80초</td>
 <td>없음</td>
 </tr>
 <tr>
-<td>2</td>
+<td style="white-space: nowrap;">2</td>
 <td><code>ENGRAM_RELEASE=0</code></td>
 <td>채택, 기본값</td>
 <td>콜드 프리필 +8~13%, 에이전트 221초</td>
 <td>헤드 여유를 0.3 GiB 깎는다</td>
 </tr>
 <tr>
-<td>3</td>
+<td style="white-space: nowrap;">3</td>
 <td>Engram 호스트 동기화 제거</td>
 <td>채택, 기본값(디코드 prefault 비동기)</td>
 <td>코드 c1 스텝 −3.5 ms와 −1.1 ms. 산문 c1은 오히려 +1.0%와 +6.2%로 손해라 산문 쪽 모드는 옵트인으로 남겼다</td>
 <td>prefault가 콜드 NVMe 읽기라 디스크 상태를 탄다</td>
 </tr>
 <tr>
-<td>4</td>
+<td style="white-space: nowrap;">4</td>
 <td>인덱서 TP 분할</td>
 <td>채택, 기본값</td>
 <td>S128 +22.4%와 +23.1%. S32에서는 이득이 없다</td>
 <td>재계산이 분할 없이 비트 단위로 같지는 않다. GPU 커널 동일성으로 판정했다</td>
 </tr>
 <tr>
-<td>5</td>
+<td style="white-space: nowrap;">5</td>
 <td>짧은 요청 예약 <code>SHORT_RESERVE=4096</code></td>
 <td>채택, 기본값</td>
 <td>긴 프리필 중 대기 65초에서 7~9초. 긴 프리필과 섞인 워크로드 총시간은 동률</td>
 <td>입력 예산에서 드래프트 슬롯을 뺀 값에도 예약해야 한다</td>
 </tr>
 <tr>
-<td>6</td>
+<td style="white-space: nowrap;">6</td>
 <td>MoE를 b12x로</td>
 <td>미채택</td>
 <td>코드 스텝 C1 −6%, C4 −14%, 에이전트 217초</td>
 <td>헤드 여유가 2.96 GiB까지 내려간다. 여유를 더 확보하는 레버는 오너 결정으로 현상 유지라 후보에서 뺐다</td>
 </tr>
 <tr>
-<td>7</td>
+<td style="white-space: nowrap;">7</td>
 <td>업스트림 #56562 cherry-pick</td>
 <td>미채택</td>
 <td>같은 빌드 게이트 A/B에서 코드 c1 +0.3%로 판정선 2.7% 안쪽. 코드는 되돌렸다</td>
 <td>PR이 보고한 배치 1 TPOT −15.1%는 우리 형상에서 재현되지 않았다</td>
 </tr>
 <tr>
-<td>8</td>
+<td style="white-space: nowrap;">8</td>
 <td><code>EP=1</code></td>
 <td>미채택</td>
 <td>랭크 −7.24 GiB, 헤드 여유 +6 GiB, 단일 스트림 −10~12%</td>
 <td>속도를 메모리와 바꾸는 거래라 지금 형상에서는 손해</td>
 </tr>
 <tr>
-<td>9</td>
+<td style="white-space: nowrap;">9</td>
 <td>RoCE one-shot all-reduce</td>
 <td>보류, 우선순위 내림</td>
 <td>디코드 프로파일에서 NCCL이 스텝의 19%인 것은 그대로다. 다만 128K 프리필 청크에서 NCCL 대기(2,224 ms)의 73%는 통신이 아니라 Engram 조회의 랭크 차였다(r0 46 ms에서 r3 468 ms)</td>
 <td>호출당 mHC가 대역폭 하한의 1.24~1.37배라 통신 자체에 여지가 거의 없다. 새 b12x 빌드와 libibverbs 설치(오너 승인)도 그대로 남는다</td>
 </tr>
 <tr>
-<td>10</td>
+<td style="white-space: nowrap;">10</td>
 <td>SWA bounded replay</td>
 <td>미착수</td>
 <td>프리필 1.4~1.8배(추정, 아직 몫을 가르지 못했다)</td>

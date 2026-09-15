@@ -5,7 +5,7 @@ dsv41-sglang-vs-vllm-2026-09-14
   project         (global)
   type            리포트
   format          html
-  version         v5
+  version         v6
   uploader        ops
   created         2026-09-14T14:03:02Z
   url             https://hangar.tail39057.ts.net/p/dsv41-sglang-vs-vllm-2026-09-14/

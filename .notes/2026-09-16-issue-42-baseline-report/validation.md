@@ -11,15 +11,22 @@
 
 ```text
 $ hangar upload -replace -slug dsv41-sglang-vs-vllm-2026-09-14 -type 리포트 report-v5.html
-replaced /p/dsv41-sglang-vs-vllm-2026-09-14/ (id=dsv41-sglang-vs-vllm-2026-09-14, status=active, version=5)
-verified /p/dsv41-sglang-vs-vllm-2026-09-14/ — serves the same bytes as report-v5.html (sha256 413119b92856, 72.7 KiB)
+replaced /p/dsv41-sglang-vs-vllm-2026-09-14/ (id=..., status=active, version=5)
+verified ... serves the same bytes as report-v5.html (sha256 413119b92856, 72.7 KiB)
+
+# 검증 중 표 20 의 첫 열이 "10" 을 두 줄로 흘려 nowrap 을 넣고 한 번 더 올렸다
+$ hangar upload -replace -slug dsv41-sglang-vs-vllm-2026-09-14 -type 리포트 report-v5.html
+replaced /p/dsv41-sglang-vs-vllm-2026-09-14/ (id=..., status=active, version=6)
+verified ... serves the same bytes as report-v5.html (sha256 d3706a3e749d, 73.0 KiB)
 
 $ hangar info dsv41-sglang-vs-vllm-2026-09-14      # 전문은 hangar-info-v5.txt
-  version         v5
+  version         v6
   status          active
   type            리포트
   url             https://hangar.tail39057.ts.net/p/dsv41-sglang-vs-vllm-2026-09-14/
 ```
+
+**완료 기준과 다른 점.** 기준은 "version v5" 인데 실제 hangar 버전은 **v6** 이다. hangar 의 version 은 문서의 판이 아니라 업로드 횟수라서, 같은 `report-v5.html` 을 두 번 올리는 순간 v6 이 된다(두 번째 업로드는 위의 표 20 nowrap 수정뿐이다). 문서 자체는 "v5 정정 (2026-09-16)" 절을 가진 v5 판이고, 게시된 바이트는 `report-v5.html` 과 일치한다(sha256 d3706a3e749d). 되돌릴 방법은 없다.
 
 ### 정정 항목별 확인
 
@@ -36,6 +43,8 @@ $ hangar info dsv41-sglang-vs-vllm-2026-09-14      # 전문은 hangar-info-v5.tx
 | 9 | Grafana 단서 | v4 에 Grafana 인용 문장이 0 곳이라 본문에 새로 만들지 않고, 정정 절 끝에 "09-16 01:35 이전 값은 복원 포함(옛 식)" 한 줄로 남겼다 |
 | 10 | 헤드 여유 레버(#31) | 오너 결정 (d) 현상 유지로 적고, 그래서 b12x 계열이 채택 후보에서 빠졌다고 표와 본문 양쪽에 썼다 |
 | 11 | S128 범위, 비교 상대 | 정정 절에 프로덕션 구성 범위 1,599~1,894 tok/s(회차 편차 ±8%), 동시 4/8 비교 상대는 `combo-nob12x`, 구성 A~C 는 상대 몫에만 쓴다고 명시 |
+
+렌더링 확인: 게시된 페이지와 `report-v5.html` 을 브라우저로 열어 머리말, v5 정정 절, 표 1, 표 20 을 눈으로 봤다. 표 1 의 `prod-final` 열과 표 20 의 결말·실측 몫 열이 의도대로 나오고 레이아웃이 깨진 곳은 없다.
 
 추가로 머리말의 "측정에 쓴 노브는 하나도 반영하지 않았다" 와 "03:41 프로덕션 복구 완료" 는 v5 시점 사실(채택 노브가 `dsv41.env` 기본값, 프로덕션이 override 0 B 로 그 기본값 사용)로 고쳤다. 새로 쓴 문장에 줄표와 가운뎃점은 쓰지 않았고(문서 전체 0 개), HTML 태그 균형과 표 수를 스크립트로 확인했다.
 
