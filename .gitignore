@@ -217,6 +217,7 @@ cython_debug/
 !.notes/2026-09-16-issue-39-gate-ab/
 !.notes/2026-09-16-issue-42-baseline-report/
 !.notes/2026-09-16-issue-35-epic-wrapup/
+!.notes/2026-09-16-issue-43-meta-close/
 
 # Results
 *.csv
