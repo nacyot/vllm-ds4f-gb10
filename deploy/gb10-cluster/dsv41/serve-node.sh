@@ -132,7 +132,9 @@ fi
 if [ "${KVOFF_GIB:-0}" != "0" ]; then
   ARGS+=(--kv-offloading-size "$KVOFF_GIB")
   if [ -n "$KVFS_DIR" ]; then
-    mkdir -p "$KVFS_DIR"
+    # Only rank 0's scheduler writes the fs tier (workers are relay receivers):
+    # a worker must not need /mnt/kvdisk, whose NFS mount does not survive a reboot.
+    [ "$NODE_RANK" != 0 ] || mkdir -p "$KVFS_DIR"
     source "$HERE/kv_transfer_json.sh"
     ARGS+=(--kv-transfer-config "$KV_TRANSFER_JSON")
   fi
