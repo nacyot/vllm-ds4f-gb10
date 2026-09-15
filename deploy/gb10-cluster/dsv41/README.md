@@ -12,12 +12,16 @@ gx10-f323, gx10-37cc, and gx10-27c4. It requires Bash 4 or newer; on macOS:
 
 | File | Role |
 | --- | --- |
-| `dsv41_ctl.sh` | Workstation start, stop, shm inspection, status, caps, and log commands. |
-| `serve-node.sh` | Launch one TP rank as the `dsv41-serve` user service. |
+| `dsv41_ctl.sh` | Workstation start, stop, install, shm inspection, status, caps, and log commands. |
+| `dsv41_lib.sh` | Node table, cap check and shm cleanup shared by `dsv41_ctl.sh` and the node scripts. |
+| `dsv41_unit.sh`, `systemd/dsv41-serve.service` | The persistent `dsv41-serve` user unit on every node and its pre-start, start and post-start steps. |
+| `dsv41_watchdog.sh`, `systemd/dsv41-watchdog.{service,timer}` | Head watchdog, one check per minute. |
+| `dsv41_warmup.py`, `systemd/dsv41-warmup.service` | Post-start warm-up of the head API (three requests). |
+| `serve-node.sh` | Launch one TP rank (the `dsv41-serve` unit's main process). |
 | `serve-frontend.sh`, `kv_transfer_json.sh` | API server without an engine on `FRONTEND_HOST` (issue #24 spike, off by default); the shared `--kv-transfer-config` builder. |
 | `dsv41.env` | Adopted server defaults, overridable through the environment. |
 | `clock_ctl.sh` | Clock observations and sampling; `cap` is owner-only recovery. |
-| `selftest_caps.sh` | Local cap fixtures and simulated SSH tests without node access. |
+| `selftest_caps.sh` | Local cap, headroom, shm, unit pre-start and watchdog tests with fixtures and stubs, without node access. |
 | `bench.py` | Before/after latency, throughput, and greedy-output checks. |
 | `bench2.py`, `bench_prompts_v1.json` | Category and concurrency benchmarks and prompts. |
 | `prefill_probe.py` | Prefill throughput measurements with unique prompts. |
@@ -31,10 +35,13 @@ gx10-f323, gx10-37cc, and gx10-27c4. It requires Bash 4 or newer; on macOS:
 
 ## Startup and cap checks
 
-`dsv41_ctl.sh start` checks all four caps before any rank starts. After the
-check passes, it launches workers rank 3 (27c4), 2 (37cc), 1 (f323), waits
-five seconds, then launches head rank 0 (6040). Each rank uses
-`serve-node.sh` and the defaults in `dsv41.env`. The API is on head port 8888,
+`dsv41_ctl.sh start` checks all four caps before any rank restarts. After the
+check passes, it writes the knobs set in its environment to the head's
+`~/dsv41-prep/dsv41-override.env` and restarts the head's `dsv41-serve` unit.
+That unit's pre-start restarts workers rank 3 (27c4), 2 (37cc), 1 (f323) and
+then head rank 0 (6040) boots (see
+[Persistent unit, watchdog and warm-up](#persistent-unit-watchdog-and-warm-up-issue-32)).
+Each rank uses `serve-node.sh` and the defaults in `dsv41.env`. The API is on head port 8888,
 the production endpoint since 2026-09-13 (it replaced the DS4F TP=4 service
 that used the same port; bring-up ran on 8889). The server answers to the
 model names `deepseek-v4.1-flash` and, for the old DS4F clients,
@@ -128,29 +135,106 @@ these nodes, not a direct query of the driver's clock-lock setting.
 lost, so service status alone is insufficient (issue #14).
 
 Any failed or incomplete check returns exit code 3 and lists the affected
-hosts with owner recovery instructions. `start` stops before launching a
-rank; it never restores clocks automatically. `status` appends
-`cap <service-state> <max-sm>MHz` to each existing node row and still prints
-API health. Use `caps` for the pass/fail exit status.
+hosts with owner recovery instructions. `start` stops before restarting a
+rank; it never restores clocks automatically. The head unit's pre-start
+repeats the same check before every start of the server, including automatic
+restarts, watchdog restarts and boots (12 tries, 10 s apart, the head probed
+locally); when it still fails the unit fails, logs to `user.err` and changes
+no cap. `status` appends `cap <service-state> <max-sm>MHz` to each existing
+node row and still prints API health. Use `caps` for the pass/fail exit status.
 
 `CAP_MHZ` overrides the local threshold (default 2000). The owner's
-`SKIP_CAP_CHECK=1` bypasses only the automatic start gate, not `caps`.
-Neither variable is forwarded to node services. Automation workers must
-not use the override to bypass an observed failure.
+`SKIP_CAP_CHECK=1` bypasses only the workstation start gate, not `caps` and
+not the unit pre-start. Neither variable is written to the override file.
+Automation workers must not use the override to bypass an observed failure.
 
-`start`/`stop` first list shared-memory candidates with their sizes, then delete
-only explicitly listed, unused files owned by the remote user directly under
-`/dev/shm`: `sem.mp-*`, `psm_*`, and `vllm_offload_*.mmap`. Symlinks and changed
-files are rejected. Active or transitioning `dsv41-serve` services protect all
-candidates; files still used by a process are skipped. Inspection failures
-prevent deletion and are reported. Nodes need GNU Bash 4.4+ and `fuser`.
+`stop` and every unit pre-start first list shared-memory candidates with their
+sizes, then delete only explicitly listed, unused files owned by the remote user
+directly under `/dev/shm`: `sem.mp-*`, `psm_*`, and `vllm_offload_*.mmap`.
+Symlinks and changed files are rejected. Active or transitioning `dsv41-serve`
+services protect all candidates, except that a unit's own pre-start cleans
+while that unit is activating (the same `InvocationID`); files still used by a
+process are skipped. Inspection failures prevent deletion and are reported
+(`stop` exits 1, a pre-start fails the unit). Nodes need GNU Bash 4.4+ and `fuser`.
 
 Use `dsv41_ctl.sh shm [host]` to inspect all four nodes or one named cluster
 node, including while serving. It lists candidates and whether they are in use
-without stopping services or deleting files. `DSV41_SHM_DRYRUN=1` makes start/stop
-cleanup read-only too: **dry-run stop still stops the services**, but leaves
-cleanup candidates in place. Stop retains its six-second wait before the final
-process termination and cleanup. The KV filesystem store is never a candidate.
+without stopping services or deleting files. `DSV41_SHM_DRYRUN=1` makes stop and
+start cleanup read-only too: **dry-run stop still stops the services**, but leaves
+cleanup candidates in place. For `start` it is written to the override file, so
+automatic restarts stay read-only until the next `start` without it. Stop retains
+its six-second wait before the final process termination and cleanup. The KV
+filesystem store is never a candidate.
+
+## Persistent unit, watchdog and warm-up (issue #32)
+
+Since 2026-09-15 `dsv41-serve` is a persistent user unit
+(`systemd/dsv41-serve.service`, the same file on the four nodes; the rank
+comes from the host name) instead of a transient `systemd-run` unit, so the
+server comes back after a reboot or a dead process. Linger is enabled on all
+four nodes. After `git am` on the nodes, put the units in place with
+`dsv41_ctl.sh install` (copies them to `~/.config/systemd/user/`, reloads and
+enables `dsv41-serve` everywhere, and the watchdog timer on the head; it
+starts no server and refuses while a transient `dsv41-serve` is still loaded,
+so `stop` first when switching). Run `install` again after changing a unit file.
+
+- The unit restarts always (`RestartSec=20`, at most 5 starts in 30 minutes),
+  since the API server can exit 0 after `EngineDeadError`; `systemctl stop`
+  does not restart it. `TimeoutStopSec=60` with `KillMode=mixed`: a graceful
+  stop next to a dead NCCL peer only ends at the timeout. Logs stay in
+  `~/dsv41-prep/logs/dsv41-r<rank>.log`, pre-start lines included.
+- Pre-start on every rank (`dsv41_unit.sh pre`): wait for MemAvailable ≥
+  100 GiB (up to 2 minutes), clean shm candidates, drop caches. The head
+  first waits for `/mnt/kvdisk` (up to 3 minutes) when `KVFS_DIR` is on it,
+  checks the caps, copies its override file to the three workers and
+  restarts their units (27c4, 37cc, f323; worker ssh waited up to 8 minutes
+  in total). Restarting the head unit therefore restarts the whole server,
+  and a head boot or restart never runs next to stale workers. A worker unit
+  that restarts alone (its own crash, a worker reboot) leaves the TP group
+  broken until the watchdog restarts the head.
+- Knobs: `start` rewrites `~/dsv41-prep/dsv41-override.env` on the head
+  (`KEY="value"` lines; empty means the `dsv41.env` defaults) and the head
+  pre-start copies it to the workers, so all ranks boot with the same knobs.
+  Quotes and spaces in values now survive. The file persists across restarts
+  and reboots: end every experiment with a `start` without knobs.
+- Watchdog (`dsv41-watchdog.timer` on the head, every minute, log
+  `~/dsv41-prep/logs/dsv41-watchdog.log`). It skips the first 600 s after the
+  head unit became active. It restarts the head unit when a worker unit is not
+  active or started more than 30 s after the head (no cooldown, 12 restarts in
+  2 h), or when a worker is unreachable 3 checks in a row, `/health` fails 3
+  checks in a row, or a 1-token probe fails twice in a row (15-minute
+  cooldown, 4 restarts in 2 h). The probe runs every fifth check, and every
+  check while it fails, because `/health` stays 200 while the engine waits
+  on a dead rank in NCCL. It never starts an inactive unit (an operator
+  stop). A failed unit, a start still activating after 30 minutes and a
+  used-up budget go to `logger -p user.err` and
+  `~/dsv41-prep/logs/dsv41-ATTENTION` (the latest reason; checked and removed
+  by a person). Probes count in `/metrics`: pause the watchdog for such
+  benchmarks with `systemctl --user stop dsv41-watchdog.timer` on the head
+  and `start` it afterwards.
+- Warm-up (`dsv41-warmup.service`, queued by the head's post-start on every
+  start): once `/health` is 200 it sends an ~8K greedy request, a short
+  sampled request with thinking and one image, each with a fresh salt, and
+  logs one JSON line per request to `~/dsv41-prep/logs/dsv41-warmup.log`.
+  The first request after a boot took 21 s TTFT before (JIT kernels and the
+  FlashInfer autotune).
+
+Units of the replaced DS4F production. They are disabled, not deleted, and
+their files, `~/migration-027` and `~/ds4f-logs` are kept:
+
+| Node | Unit | State | Why |
+| --- | --- | --- | --- |
+| 37cc, 27c4 | `tp4-worker.service` (user) | disabled and stopped (#32) | DS4F TP=4 worker; at boot it took the memory the V4.1F rank needs |
+| 37cc | `kv-prune.timer` (user) | disabled and stopped (#32) | Pruned a DS4F directory on `/mnt/kvdisk` |
+| 6040 | `ds4f-log-capture.service` (system) | disabled and stopped (#32) | Captured docker logs of a container that no longer exists (2.2 MB/day of errors) |
+| 6040 | `tp4-head.service`, `ds4f-head.service`, `ds4f-watchdog.timer`, `serve-warmup.service` (static), `kv-prune.timer`, `kv-snapshot-ttl.timer` (user) | already disabled | DS4F head, watchdog, warm-up and KV retention |
+| 27c4 | `ds4f-worker.service` (user) | already disabled | DS4F pair worker |
+
+The owner's `uvm-stall-sentinel.timer` stays enabled on all four nodes. Every
+minute, when memory PSI full avg10 is at least 50 and the Normal zone has no
+free order≥9 block, it runs `drop_caches` and `compact_memory`. It ran 32
+times on the head and 19 times on 37cc in the 7 days to 2026-09-15. Its
+behaviour is unchanged; the decision belongs to issue #31.
 
 ## KV offload host tier (issue #2)
 
@@ -297,8 +381,12 @@ with a live server for the torch-process rule. Details:
 - After experiments, restore port 8888 to the adopted `dsv41.env` defaults,
   including `ENGRAM_PREFETCH=1`, `ENGRAM_RELEASE=0`, `ENGRAM_DECODE_ASYNC=1`,
   `ENGRAM_CHUNK_RUNS=8`, `SPEC_BLOCK_DROP=0`, `DSV41_INDEXER_TP_SPLIT=1`,
-  `EMPTY_CACHE=1`, and `EMPTY_CACHE_MIN_TOKENS=65536`. End with health 200, all four cap services
-  active at 1989 MHz, and record head `MemAvailable`. After short probes the
+  `EMPTY_CACHE=1`, and `EMPTY_CACHE_MIN_TOKENS=65536`: run `dsv41_ctl.sh start`
+  with no knobs, so `~/dsv41-prep/dsv41-override.env` is empty on all four
+  nodes and `systemctl --user show dsv41-serve -p Environment` is empty. End
+  with health 200, all four cap services active at 1989 MHz, the head's
+  `dsv41-watchdog.timer` active with no `dsv41-ATTENTION` file, and record head
+  `MemAvailable`. After short probes the
   head sits at about 3.4–4.0 GiB under `EMPTY_CACHE_MIN_TOKENS=65536`; that is
   expected. Any long cold prefill must pass `dsv41_ctl.sh headroom` (≥5.2 GiB)
   first, which in practice means a fresh boot. `status` reports
@@ -427,7 +515,13 @@ in the printed directory; no cleanup deletion is performed.
 
 `DSV41_MEM_FIXTURE=<file>` replaces headroom SSH queries with `host gib`
 rows. The same selftest covers memory thresholds, overrides, malformed or
-missing head readings and transport failure. Python tests use fake responses
+missing head readings and transport failure. It also runs `dsv41_unit.sh`
+and `dsv41_watchdog.sh` with recording stubs for `systemctl`, `curl`,
+`logger`, `sudo` and `mountpoint`: the start flow and override quoting,
+`install`, the head pre-start's worker order and its failure paths (kvdisk,
+caps, unreachable worker, memory), the shm `pre` mode, and every watchdog
+rule (inactive, failed, grace, worker down or late, health, probe,
+unreachable, cooldown, budget). Python tests use fake responses
 and a local HTTP server to check refusal without inference, CLI exit 3,
 remote bypass, and shared cancellation while waiting for the first token.
 Run them only on the workstation, without importing vLLM or torch.
