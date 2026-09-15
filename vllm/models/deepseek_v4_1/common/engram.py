@@ -39,6 +39,7 @@ import json
 import mmap
 import os
 import struct
+import threading
 import time
 import weakref
 from collections import deque
@@ -656,6 +657,56 @@ def _engram_lookup_kernel(
 _MADV_POPULATE_READ = 22  # Linux 5.14+
 
 
+class EngramLookupGate:
+    """Holds the background prefetch populates back until the step's Engram
+    lookups ran on the GPU.
+
+    The runner prefetches the next chunk right before the forward, whose first
+    kernels gather every table: populating pages while the lookup kernel reads
+    the mapping slows the lookups down, most on the ranks whose heads touch the
+    most pages, and the other ranks wait for them in the next all-reduce. Each
+    gated table counts as one lookup per step; a prefetch waits for that many
+    lookups after its submission, or `timeout` seconds.
+    """
+
+    def __init__(self, timeout: float = 2.0) -> None:
+        self.tables = 0
+        self.timeout = timeout
+        self._cond = threading.Condition()
+        self._launched = 0
+        self._event: torch.cuda.Event | None = None
+
+    def mark(self) -> int:
+        with self._cond:
+            return self._launched
+
+    def launched(self, event: torch.cuda.Event) -> None:
+        with self._cond:
+            self._launched += 1
+            self._event = event
+            self._cond.notify_all()
+
+    def wait(self, mark: int) -> None:
+        """Return once `tables` lookups were launched after `mark` and the GPU
+        ran the last of them, or after `timeout` seconds."""
+        deadline = time.monotonic() + self.timeout
+        with self._cond:
+            while self._launched < mark + self.tables:
+                left = deadline - time.monotonic()
+                if left <= 0:
+                    return
+                self._cond.wait(left)
+            event = self._event
+        while event is not None and not event.query():
+            if time.monotonic() > deadline:
+                return
+            time.sleep(0.002)
+
+
+# Shared by every gated table of this worker process.
+_LOOKUP_GATE = EngramLookupGate()
+
+
 class MmapEngramTable:
     """An Engram table read in place from its safetensors shard.
 
@@ -681,6 +732,7 @@ class MmapEngramTable:
         background: bool = False,
         decode_async: bool = False,
         min_chunk_runs: int = 1,
+        lookup_gate: EngramLookupGate | None = None,
     ) -> None:
         index_path = os.path.join(model_dir, "model.safetensors.index.json")
         with open(index_path) as f:
@@ -756,6 +808,10 @@ class MmapEngramTable:
         )
         self._pending: Future | None = None
         self._pending_prefetch: Future | None = None
+        # `lookup_gate`: a prefetch populates once the step's lookups ran.
+        self.lookup_gate = lookup_gate
+        if lookup_gate is not None:
+            lookup_gate.tables += 1
         # `decode_async`: `prefault(wait=False)` populates on this worker and
         # returns at once; the lookup faults in place whatever is still cold.
         # A release ring would race such a populate, so it needs no ring.
@@ -887,17 +943,22 @@ class MmapEngramTable:
         """Populate the pages of `rows` (a later step's row ids, hashed
         ahead of time) in the background, outside the release ring: the
         `prefault` of that step then finds them resident. No-op unless the
-        table was created with `background=True`."""
+        table was created with `background=True`. With a `lookup_gate` the
+        populate starts once this step's lookups ran on the GPU."""
         if rows.size == 0 or self._prefetch_worker is None:
             return
         pages = self._pages_of(rows)
         self._prefetched = pages
         release = self._pending
+        gate = self.lookup_gate
+        mark = gate.mark() if gate is not None else 0
         submitted = time.perf_counter()
 
         def job() -> None:
             if release is not None:
                 release.result()
+            if gate is not None:
+                gate.wait(mark)
             t0 = time.perf_counter()
             self._populate(pages)
             if self.stats_enabled:
@@ -1214,6 +1275,11 @@ class ParallelEngramEmbedding(nn.Module):
             BLOCK_R=16,
             GRID=grid,
         )
+        gate = self.mmap_table.lookup_gate if self.mmap_table is not None else None
+        if gate is not None and not torch.cuda.is_current_stream_capturing():
+            event = torch.cuda.Event()
+            event.record()
+            gate.launched(event)
 
     def forward(self, indices: torch.Tensor) -> torch.Tensor:
         """indices: [num_tokens, n_hash_cols] -> [num_tokens, n_hash_cols, dim]
@@ -1388,7 +1454,18 @@ class Engram(nn.Module):
                 background=engram_config.mmap_prefetch_next_chunk,
                 decode_async=engram_config.mmap_decode_async > 0,
                 min_chunk_runs=engram_config.mmap_min_chunk_runs,
+                lookup_gate=(
+                    _LOOKUP_GATE
+                    if engram_config.mmap_prefetch_next_chunk
+                    and os.environ.get("DSV41_ENGRAM_PREFETCH_AFTER_LOOKUP") == "1"
+                    else None
+                ),
             )
+            if mmap_table.lookup_gate is not None:
+                logger.info_once(
+                    "DSV41_ENGRAM_PREFETCH_AFTER_LOOKUP on: the next chunk's Engram "
+                    "pages populate once this step's lookups ran."
+                )
         self.embed_tokens = ParallelEngramEmbedding(
             layout.num_embeddings[layer_hash_index],
             layout.head_dim,
