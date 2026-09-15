@@ -2,7 +2,6 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 import bisect
 import os
-import time
 from types import SimpleNamespace
 
 import numpy as np
@@ -855,15 +854,8 @@ def test_engram_mmap_matches_resident(tp_size, tmp_path, monkeypatch):
         engram_ops, "get_tensor_model_parallel_world_size", lambda: tp_size
     )
     monkeypatch.setattr(ep_weight_filter, "_SKIP_SUFFIXES", set())
-    gate = engram_ops.EngramLookupGate()
     table = MmapEngramTable(
-        str(tmp_path),
-        1,
-        dim,
-        32,
-        num_threads=4,
-        release_after_steps=1,
-        lookup_gate=gate,
+        str(tmp_path), 1, dim, 32, num_threads=4, release_after_steps=1
     )
     for rank in range(tp_size):
         monkeypatch.setattr(
@@ -896,8 +888,6 @@ def test_engram_mmap_matches_resident(tp_size, tmp_path, monkeypatch):
         mapped.prefault(ids)
         mapped.lookup(ids, actual)
         torch.testing.assert_close(actual, expected, rtol=0, atol=0)
-    # Every mmap lookup (two per rank) reports to the table's gate.
-    assert gate.mark() == 2 * tp_size
     names = [name for name, _ in safetensors_weights_iterator([str(shard)], False)]
     assert names == ["layers.1.engram.q_weight"]
 
@@ -1155,43 +1145,3 @@ def test_mmap_table_decode_async_prefault(tmp_path):
     ringed.prefault(np.arange(1500, 1564), wait=False)
     assert ringed._pending_async is None
     assert all(resident(ringed._pages_of(np.arange(1500, 1564))))
-
-
-@pytest.mark.skipif(not current_platform.is_cuda(), reason="CUDA required")
-@pytest.mark.skipif(
-    not os.path.exists("/lib/aarch64-linux-gnu/libc.so.6")
-    and not os.path.exists("/lib/x86_64-linux-gnu/libc.so.6"),
-    reason="madvise(MADV_POPULATE_READ) needs Linux 5.14+",
-)
-def test_mmap_table_prefetch_waits_for_lookups(tmp_path):
-    """With a lookup gate a prefetch populates only once every gated table
-    launched a lookup after it and the GPU ran it, or after the timeout."""
-    dim = _evicted_shard(tmp_path)
-    gate = engram_ops.EngramLookupGate(timeout=0.5)
-    tables = [
-        MmapEngramTable(
-            str(tmp_path), 1, dim, 32, num_threads=2, background=True, lookup_gate=gate
-        )
-        for _ in range(2)
-    ]
-    table = tables[0]
-    assert gate.tables == 2
-    resident = _mincore(table)
-    chunk, later = np.arange(2048, 2112), np.arange(3000, 3064)
-    if any(resident(table._pages_of(chunk))):
-        pytest.skip("the shard's page cache cannot be evicted here (tmpfs?)")
-    event = torch.cuda.Event()
-    event.record()
-    table.prefetch(chunk)
-    gate.launched(event)
-    time.sleep(0.2)
-    assert not any(resident(table._pages_of(chunk)))
-    gate.launched(event)
-    table.drain()
-    assert all(resident(table._pages_of(chunk)))
-    # Without the step's lookups the populate still runs after the timeout.
-    start = time.monotonic()
-    table.prefetch(later)
-    table.drain()
-    assert time.monotonic() - start >= 0.5
-    assert all(resident(table._pages_of(later)))
