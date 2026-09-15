@@ -1,0 +1,124 @@
+# 삭제 전 `ls -ld` 목록 (2026-09-16 05:1x~05:2x KST, 워크스테이션에서 ssh 전경 실행)
+# 명령: ssh <node> 'for p in <절대경로 목록>; do ls -ld "$p"; done'
+# setlocale 경고 줄은 지웠고, 그 밖의 출력은 받은 그대로다.
+
+================ gx10-6040 (head) ================
+### worktree list
+/home/nacyot/vllm-dspark-fork      ab7723d3ff [gb10-longctx-offload]
+/home/nacyot/t2w-trees/t2w-best    e47aa780bc (detached HEAD)
+/home/nacyot/t2w-trees/t2w-boot10  e47aa780bc (detached HEAD)
+/home/nacyot/vllm-dsv41            88744c769e [ds41f-gx10-port-20260910]
+### targets
+  drwxrwxr-x 4 nacyot nacyot 4096 Sep 15 00:35 /home/nacyot/t2w-trees
+  drwxrwxr-x 19 nacyot nacyot 4096 Sep 15 00:35 /home/nacyot/t2w-trees/t2w-best
+  drwxrwxr-x 19 nacyot nacyot 4096 Sep 15 00:35 /home/nacyot/t2w-trees/t2w-boot10
+  drwxrwxr-x 5 nacyot nacyot 4096 Sep 15 01:07 /home/nacyot/t2w-cache
+  drwxrwxr-x 5 nacyot nacyot 4096 Sep 15 22:51 /home/nacyot/dsv41-prep/prof-i17
+  drwxrwxr-x 7 nacyot nacyot 4096 Sep 15 19:21 /home/nacyot/dsv41-prep/prof-i41-base
+  drwxrwxr-x 2 nacyot nacyot 4096 Sep 15 20:13 /home/nacyot/dsv41-prep/i34
+  drwx------ 24 nacyot nacyot 4096 Sep 16 02:26 /home/nacyot/dsv41-prep/i10-pytest.0d3aKA
+  drwx------ 26 nacyot nacyot 4096 Sep 16 02:37 /home/nacyot/dsv41-prep/i10-pytest.PDst6K
+  drwxrwxr-x 3 nacyot nacyot 4096 Sep 15 17:56 /home/nacyot/vllm-dsv41/.pytest_cache
+  drwxrwxr-x 2 nacyot nacyot 4096 Sep 16 02:37 /home/nacyot/vllm-dsv41/deploy/gb10-cluster/dsv41/__pycache__
+  drwxrwxr-x 2 nacyot nacyot 4096 Sep 15 18:06 /home/nacyot/dsv41-prep/i40-8fd917c8ae
+  drwxrwxr-x 3 nacyot nacyot 4096 Sep 15 17:12 /home/nacyot/dsv41-prep/i38
+  drwxrwxr-x 2 nacyot nacyot 4096 Sep 15 16:39 /home/nacyot/dsv41-prep/i38-a
+  drwxrwxr-x 2 nacyot nacyot 4096 Sep 15 17:14 /home/nacyot/dsv41-prep/i38-b
+  -rw-rw-r-- 1 nacyot nacyot 780 Sep 15 17:34 /home/nacyot/dsv41-prep/trace_ops_i40.py
+  -rw-rw-r-- 1 nacyot nacyot 2087 Sep 15 17:36 /home/nacyot/dsv41-prep/trace_ri_children_i40.py
+  -rw-rw-r-- 1 nacyot nacyot 2264 Sep 15 17:35 /home/nacyot/dsv41-prep/trace_steps_i40.py
+  drwxrwxr-x 2 nacyot nacyot 4096 Sep 15 22:30 /home/nacyot/dsv41-prep/patches/i17-223024
+  drwxrwxr-x 2 nacyot nacyot 4096 Sep 15 22:52 /home/nacyot/dsv41-prep/patches/i17-revert-225245
+  -rw-rw-r-- 1 nacyot nacyot 22307 Sep 15 19:29 /home/nacyot/dsv41-prep/decode_i41.jsonl
+  -rw-r--r-- 1 nacyot nacyot 9971 Sep 15 19:07 /home/nacyot/dsv41-prep/decodebench_i41.py
+  -rwxr-xr-x 1 nacyot nacyot 2047 Sep 15 19:07 /home/nacyot/dsv41-prep/profile_i41.sh
+  -rw-rw-r-- 1 nacyot nacyot 332 Sep 16 01:02 /home/nacyot/dsv41-prep/bench/decode-i32.jsonl
+  -rw-rw-r-- 1 nacyot nacyot 27653 Sep 16 04:40 /home/nacyot/sglang-cmp/results/i39.log
+### keep-list (must survive)
+  drwxrwxr-x 4 nacyot nacyot 4096 Sep 12 18:20 /home/nacyot/dsv41-prep/kvfs
+  -rw-rw-r-- 1 nacyot nacyot 940 Aug 24 22:57 /home/nacyot/vmagent/scrape.yml
+  drwxrwxr-x 8 nacyot nacyot 4096 Sep  7 13:16 /home/nacyot/migration-027
+  drwxr-xr-x 2 nacyot nacyot 4096 Sep 15 09:00 /home/nacyot/ds4f-logs
+  drwxrwxr-x 22 nacyot nacyot 4096 Sep  7 14:55 /home/nacyot/vllm-dspark-fork
+  -rw-rw-r-- 1 nacyot nacyot 227913 Sep 16 04:40 /home/nacyot/sglang-cmp/results/casebench.jsonl
+  -rw-rw-r-- 1 nacyot nacyot 66154 Sep 16 04:39 /home/nacyot/sglang-cmp/results/decode.jsonl
+  -rw-rw-r-- 1 nacyot nacyot 4139 Sep 16 03:18 /home/nacyot/sglang-cmp/results/longctx.jsonl
+### i34 내용 (사본 대상)
+  -rw-rw-r--  1 nacyot nacyot  947 Sep 15 20:14 logs-base.json
+  -rwxrwxr-x  1 nacyot nacyot  879 Sep 15 20:01 mixlong_i34.sh
+### df
+/dev/nvme0n1p2  916G  798G   72G  92% /
+
+================ gx10-f323 ================
+### worktree list
+/home/nacyot/vllm-dsv41            d77882fc7 [ds41f-gx10-port-20260910]
+/home/nacyot/t2w-trees/t2w-best    e47aa780b (detached HEAD)
+/home/nacyot/t2w-trees/t2w-boot10  e47aa780b (detached HEAD)
+### targets
+  drwxrwxr-x 4 nacyot nacyot 4096 Sep 15 00:35 /home/nacyot/t2w-trees
+  drwxrwxr-x 19 nacyot nacyot 4096 Sep 15 00:35 /home/nacyot/t2w-trees/t2w-best
+  drwxrwxr-x 19 nacyot nacyot 4096 Sep 15 00:35 /home/nacyot/t2w-trees/t2w-boot10
+  drwxrwxr-x 5 nacyot nacyot 4096 Sep 15 01:07 /home/nacyot/t2w-cache
+  drwxrwxr-x 5 nacyot nacyot 4096 Sep 15 22:51 /home/nacyot/dsv41-prep/prof-i17
+  drwxrwxr-x 7 nacyot nacyot 4096 Sep 15 19:21 /home/nacyot/dsv41-prep/prof-i41-base
+  drwxrwxr-x 2 nacyot nacyot 4096 Sep 15 16:39 /home/nacyot/dsv41-prep/i38-a
+  drwxrwxr-x 2 nacyot nacyot 4096 Sep 15 17:14 /home/nacyot/dsv41-prep/i38-b
+  drwxrwxr-x 2 nacyot nacyot 4096 Sep 15 22:30 /home/nacyot/dsv41-prep/patches/i17-223024
+  drwxrwxr-x 2 nacyot nacyot 4096 Sep 15 22:52 /home/nacyot/dsv41-prep/patches/i17-revert-225245
+  drwxrwxr-x 2 nacyot nacyot 4096 Sep 12 20:40 /home/nacyot/vllm-dsv41/deploy/gb10-cluster/dsv41/__pycache__
+### sglang image
+IMAGE                       ID             DISK USAGE   CONTENT SIZE   EXTRA
+lmsysorg/sglang:dev-dsv41   381b27ffa19b       33.2GB             0B
+### containers using it
+CONTAINER ID   IMAGE     COMMAND   CREATED   STATUS    PORTS     NAMES
+### all containers
+CONTAINER ID   IMAGE     COMMAND   CREATED   STATUS    PORTS     NAMES
+### keep
+  drwxrwxr-x 2 nacyot nacyot 4096 Sep 11 11:02 /home/nacyot/dsv41-prep/kvfs
+  drwxrwxr-x 23 nacyot nacyot 4096 Sep 12 20:18 /home/nacyot/vllm-dsv41
+### df
+/dev/nvme0n1p2  916G  781G   89G  90% /
+
+================ gx10-37cc ================
+### worktree list
+/home/nacyot/vllm-dsv41            3d81648af [ds41f-gx10-port-20260910]
+/home/nacyot/t2w-trees/t2w-best    e47aa780b (detached HEAD)
+/home/nacyot/t2w-trees/t2w-boot10  e47aa780b (detached HEAD)
+### targets
+  drwxrwxr-x 4 nacyot nacyot 4096 Sep 15 00:35 /home/nacyot/t2w-trees
+  drwxrwxr-x 19 nacyot nacyot 4096 Sep 15 00:35 /home/nacyot/t2w-trees/t2w-best
+  drwxrwxr-x 19 nacyot nacyot 4096 Sep 15 00:35 /home/nacyot/t2w-trees/t2w-boot10
+  drwxrwxr-x 5 nacyot nacyot 4096 Sep 15 01:07 /home/nacyot/t2w-cache
+  drwxrwxr-x 5 nacyot nacyot 4096 Sep 15 22:51 /home/nacyot/dsv41-prep/prof-i17
+  drwxrwxr-x 7 nacyot nacyot 4096 Sep 15 19:21 /home/nacyot/dsv41-prep/prof-i41-base
+  drwxrwxr-x 2 nacyot nacyot 4096 Sep 15 16:39 /home/nacyot/dsv41-prep/i38-a
+  drwxrwxr-x 2 nacyot nacyot 4096 Sep 15 17:14 /home/nacyot/dsv41-prep/i38-b
+  drwxrwxr-x 2 nacyot nacyot 4096 Sep 15 22:30 /home/nacyot/dsv41-prep/patches/i17-223024
+  drwxrwxr-x 2 nacyot nacyot 4096 Sep 15 22:52 /home/nacyot/dsv41-prep/patches/i17-revert-225245
+### keep
+  drwxrwxr-x 2 nacyot nacyot 4096 Sep 11 11:02 /home/nacyot/dsv41-prep/kvfs
+  drwxrwxr-x 23 nacyot nacyot 4096 Sep 12 20:18 /home/nacyot/vllm-dsv41
+### df
+/dev/nvme0n1p2  916G  732G  138G  85% /
+
+================ gx10-27c4 ================
+### worktree list
+/home/nacyot/vllm-dsv41            fe5e0aff1 [ds41f-gx10-port-20260910]
+/home/nacyot/t2w-trees/t2w-best    e47aa780b (detached HEAD)
+/home/nacyot/t2w-trees/t2w-boot10  e47aa780b (detached HEAD)
+### targets
+  drwxrwxr-x 4 nacyot nacyot 4096 Sep 15 00:35 /home/nacyot/t2w-trees
+  drwxrwxr-x 19 nacyot nacyot 4096 Sep 15 00:35 /home/nacyot/t2w-trees/t2w-best
+  drwxrwxr-x 19 nacyot nacyot 4096 Sep 15 00:35 /home/nacyot/t2w-trees/t2w-boot10
+  drwxrwxr-x 5 nacyot nacyot 4096 Sep 15 01:07 /home/nacyot/t2w-cache
+  drwxrwxr-x 5 nacyot nacyot 4096 Sep 15 22:51 /home/nacyot/dsv41-prep/prof-i17
+  drwxrwxr-x 7 nacyot nacyot 4096 Sep 15 19:21 /home/nacyot/dsv41-prep/prof-i41-base
+  drwxrwxr-x 2 nacyot nacyot 4096 Sep 15 16:39 /home/nacyot/dsv41-prep/i38-a
+  drwxrwxr-x 2 nacyot nacyot 4096 Sep 15 17:14 /home/nacyot/dsv41-prep/i38-b
+  drwxrwxr-x 2 nacyot nacyot 4096 Sep 15 22:30 /home/nacyot/dsv41-prep/patches/i17-223024
+  drwxrwxr-x 2 nacyot nacyot 4096 Sep 15 22:52 /home/nacyot/dsv41-prep/patches/i17-revert-225245
+### keep
+  drwxrwxr-x 2 nacyot nacyot 4096 Sep 11 11:02 /home/nacyot/dsv41-prep/kvfs
+  drwxrwxr-x 23 nacyot nacyot 4096 Sep 12 20:18 /home/nacyot/vllm-dsv41
+### df
+/dev/nvme0n1p2  916G  748G  122G  87% /

@@ -52,6 +52,8 @@ $ hangar info dsv41-sglang-vs-vllm-2026-09-14      # 전문은 hangar-info-v5.tx
 
 매니저 목록만, 노드 한 대씩 전경에서, 절대 경로를 그대로 적어 지웠다. 변수·글롭 조합과 `find -delete` 는 쓰지 않았다. 각 대상은 삭제 전 `ls -ld` 로 확인했고 전부 존재했으며, 삭제 뒤 `[ -e ]` 로 부재를 확인했다.
 
+받은 출력 그대로는 `node-preflight.txt`(삭제 전 `ls -ld`, worktree 목록, df)와 `node-postflight.txt`(삭제 뒤 부재 확인, 보존 확인, 골든룰, df)에 있다. 아래는 그 요약이다.
+
 데이터 파일은 지우기 전에 저장소 사본을 확인했다.
 
 | 파일 | 판정 |

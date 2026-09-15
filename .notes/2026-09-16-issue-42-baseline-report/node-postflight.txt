@@ -1,0 +1,136 @@
+# 삭제 뒤 부재 확인과 보존 확인 (2026-09-16, ssh 전경 실행)
+# 명령: for p in <절대경로 목록>; do if [ -e "$p" ]; then echo "  STILL PRESENT: $p"; else echo "  gone: $p"; fi; done
+# setlocale 경고 줄은 지웠고, 그 밖의 출력은 받은 그대로다.
+
+================ gx10-6040 (head) ================
+--- worktree list after remove/prune ---
+/home/nacyot/vllm-dspark-fork  ab7723d3ff [gb10-longctx-offload]
+/home/nacyot/vllm-dsv41        88744c769e [ds41f-gx10-port-20260910]
+=== absence check ===
+  gone: /home/nacyot/t2w-trees
+  gone: /home/nacyot/t2w-cache
+  gone: /home/nacyot/dsv41-prep/prof-i17
+  gone: /home/nacyot/dsv41-prep/prof-i41-base
+  gone: /home/nacyot/dsv41-prep/i34
+  gone: /home/nacyot/dsv41-prep/i10-pytest.0d3aKA
+  gone: /home/nacyot/dsv41-prep/i10-pytest.PDst6K
+  gone: /home/nacyot/vllm-dsv41/.pytest_cache
+  gone: /home/nacyot/vllm-dsv41/deploy/gb10-cluster/dsv41/__pycache__
+  gone: /home/nacyot/dsv41-prep/i40-8fd917c8ae
+  gone: /home/nacyot/dsv41-prep/i38
+  gone: /home/nacyot/dsv41-prep/i38-a
+  gone: /home/nacyot/dsv41-prep/i38-b
+  gone: /home/nacyot/dsv41-prep/trace_ops_i40.py
+  gone: /home/nacyot/dsv41-prep/trace_ri_children_i40.py
+  gone: /home/nacyot/dsv41-prep/trace_steps_i40.py
+  gone: /home/nacyot/dsv41-prep/patches/i17-223024
+  gone: /home/nacyot/dsv41-prep/patches/i17-revert-225245
+  gone: /home/nacyot/dsv41-prep/decode_i41.jsonl
+  gone: /home/nacyot/dsv41-prep/decodebench_i41.py
+  gone: /home/nacyot/dsv41-prep/profile_i41.sh
+  gone: /home/nacyot/dsv41-prep/bench/decode-i32.jsonl
+  gone: /home/nacyot/sglang-cmp/results/i39.log
+=== keep-list still present ===
+  ok: /home/nacyot/dsv41-prep/kvfs
+  ok: /home/nacyot/vmagent/scrape.yml
+  ok: /home/nacyot/migration-027
+  ok: /home/nacyot/ds4f-logs
+  ok: /home/nacyot/vllm-dspark-fork
+  ok: /home/nacyot/sglang-cmp/results/casebench.jsonl
+  ok: /home/nacyot/sglang-cmp/results/decode.jsonl
+  ok: /home/nacyot/sglang-cmp/results/longctx.jsonl
+  ok: /home/nacyot/dsv41-prep/bench
+=== df ===
+/dev/nvme0n1p2  916G  797G   73G  92% /
+
+================ gx10-f323 ================
+Untagged: lmsysorg/sglang:dev-dsv41
+Deleted: sha256:381b27ffa19bfbade2bf69bb103395e59a7e82ab0adf176b15b492e9df5aaf7b
+=== absence check ===
+  gone: /home/nacyot/t2w-trees
+  gone: /home/nacyot/t2w-cache
+  gone: /home/nacyot/dsv41-prep/prof-i17
+  gone: /home/nacyot/dsv41-prep/prof-i41-base
+  gone: /home/nacyot/dsv41-prep/i38-a
+  gone: /home/nacyot/dsv41-prep/i38-b
+  gone: /home/nacyot/dsv41-prep/patches/i17-223024
+  gone: /home/nacyot/dsv41-prep/patches/i17-revert-225245
+  gone: /home/nacyot/vllm-dsv41/deploy/gb10-cluster/dsv41/__pycache__
+  docker images:
+    IMAGE                  ID             DISK USAGE   CONTENT SIZE   EXTRA
+    alpine:latest          1991bd789d71       8.66MB             0B
+    dsv41-4x-spark:local   3b5e958cf1ad       33.2GB             0B
+=== keep ===
+  ok: /home/nacyot/dsv41-prep/kvfs
+  ok: /home/nacyot/vllm-dsv41
+=== worktree list ===
+/home/nacyot/vllm-dsv41  d77882fc7 [ds41f-gx10-port-20260910]
+=== df ===
+/dev/nvme0n1p2  916G  779G   90G  90% /
+--- 레이어 공유 확인 ---
+$ docker system df
+TYPE            TOTAL     ACTIVE    SIZE      RECLAIMABLE
+Images          3         0         33.2GB    33.2GB (99%)
+Containers      0         0         0B        0B
+Local Volumes   0         0         0B        0B
+Build Cache     85        0         444kB     147.3kB
+$ docker images -f dangling=true
+IMAGE        ID             DISK USAGE   CONTENT SIZE   EXTRA
+<untagged>   171c04994a8d       33.2GB             0B
+
+================ gx10-37cc ================
+=== absence check ===
+  gone: /home/nacyot/t2w-trees
+  gone: /home/nacyot/t2w-cache
+  gone: /home/nacyot/dsv41-prep/prof-i17
+  gone: /home/nacyot/dsv41-prep/prof-i41-base
+  gone: /home/nacyot/dsv41-prep/i38-a
+  gone: /home/nacyot/dsv41-prep/i38-b
+  gone: /home/nacyot/dsv41-prep/patches/i17-223024
+  gone: /home/nacyot/dsv41-prep/patches/i17-revert-225245
+=== keep ===
+  ok: /home/nacyot/dsv41-prep/kvfs
+  ok: /home/nacyot/vllm-dsv41
+=== worktree list ===
+/home/nacyot/vllm-dsv41  3d81648af [ds41f-gx10-port-20260910]
+=== df ===
+/dev/nvme0n1p2  916G  731G  139G  85% /
+
+================ gx10-27c4 ================
+=== absence check ===
+  gone: /home/nacyot/t2w-trees
+  gone: /home/nacyot/t2w-cache
+  gone: /home/nacyot/dsv41-prep/prof-i17
+  gone: /home/nacyot/dsv41-prep/prof-i41-base
+  gone: /home/nacyot/dsv41-prep/i38-a
+  gone: /home/nacyot/dsv41-prep/i38-b
+  gone: /home/nacyot/dsv41-prep/patches/i17-223024
+  gone: /home/nacyot/dsv41-prep/patches/i17-revert-225245
+=== keep ===
+  ok: /home/nacyot/dsv41-prep/kvfs
+  ok: /home/nacyot/vllm-dsv41
+=== worktree list ===
+/home/nacyot/vllm-dsv41  fe5e0aff1 [ds41f-gx10-port-20260910]
+=== df ===
+/dev/nvme0n1p2  916G  746G  124G  86% /
+
+================ 골든룰 (4 노드, 삭제 뒤) ================
+gx10-6040   dsv41-serve active | Environment= | override.env 0 bytes | gpu-clock-cap active | git dirty 0 lines
+gx10-f323   dsv41-serve active | Environment= | override.env 0 bytes | gpu-clock-cap active | git dirty 0 lines
+gx10-37cc   dsv41-serve active | Environment= | override.env 0 bytes | gpu-clock-cap active | git dirty 0 lines
+gx10-27c4   dsv41-serve active | Environment= | override.env 0 bytes | gpu-clock-cap active | git dirty 0 lines
+
+$ systemctl cat gpu-clock-cap.service   # head, 네 대 동일
+ExecStart=/usr/bin/nvidia-smi -lgc 300,2000
+ExecStop=/usr/bin/nvidia-smi -rgc
+
+$ nvidia-smi --query-gpu=clocks.sm --format=csv,noheader
+gx10-6040  1989 MHz
+gx10-f323  1989 MHz
+gx10-37cc  1989 MHz
+gx10-27c4  1989 MHz
+
+head 추가:
+  dsv41-watchdog.timer: active
+  curl -o /dev/null -w "%{http_code}" http://127.0.0.1:8888/health -> 200
+  MemAvailable: 9.57 GiB
