@@ -1,0 +1,36 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+
+"""Raw random 4K pread on the engram shard (page cache bypassed with O_DIRECT): device latency and IOPS vs thread count."""
+
+import mmap
+import os
+import time
+from concurrent.futures import ThreadPoolExecutor
+
+import numpy as np
+
+MODEL = os.path.expanduser("~/models/DeepSeek-V4.1-Flash")
+shard = f"{MODEL}/model-00047-of-00048.safetensors"
+fd = os.open(shard, os.O_RDONLY | os.O_DIRECT)
+size = os.fstat(fd).st_size
+rng = np.random.default_rng(2)
+
+
+def read_one(off):
+    buf = mmap.mmap(-1, 4096)
+    os.preadv(fd, [buf], off)
+    buf.close()
+
+
+for threads in (1, 8, 32, 72):
+    pool = ThreadPoolExecutor(threads)
+    offs = (rng.integers(0, size // 4096, 288) * 4096).tolist()
+    t = time.perf_counter()
+    list(pool.map(read_one, offs))
+    dt = time.perf_counter() - t
+    print(
+        f"threads {threads:3d}: 288 random 4K reads in {1e3 * dt:7.2f} ms -> {288 / dt:8.0f} IOPS, {1e6 * dt / 288 * min(threads, 288):6.0f} us/read effective latency; 72 reads ~ {1e3 * dt * 72 / 288:5.2f} ms"
+    )
+    pool.shutdown()
+os.close(fd)

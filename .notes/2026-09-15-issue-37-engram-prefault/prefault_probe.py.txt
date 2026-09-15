@@ -1,0 +1,115 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+
+"""Read-mostly probe on the head: (1) page-cache residency of the two engram shards (mincore),
+(2) cost of a decode-sized prefault (36 rows/table -> ~72 pages) inline vs the thread pool,
+on cold random pages and on the same pages once resident. Reads ~1 MB per cold iteration."""
+
+import ctypes
+import json
+import mmap
+import os
+import struct
+import time
+from concurrent.futures import ThreadPoolExecutor
+
+import numpy as np
+
+MADV_POPULATE_READ = 22
+MODEL = os.path.expanduser("~/models/DeepSeek-V4.1-Flash")
+libc = ctypes.CDLL("libc.so.6", use_errno=True)
+libc.madvise.argtypes = [ctypes.c_void_p, ctypes.c_size_t, ctypes.c_int]
+libc.madvise.restype = ctypes.c_int
+libc.mincore.argtypes = [ctypes.c_void_p, ctypes.c_size_t, ctypes.c_void_p]
+libc.mincore.restype = ctypes.c_int
+PAGE = mmap.PAGESIZE
+pool = ThreadPoolExecutor(32)
+idx = json.load(open(f"{MODEL}/model.safetensors.index.json"))["weight_map"]
+
+
+def runs_of(pages):
+    breaks = np.flatnonzero(np.diff(pages) != 1) + 1
+    starts = np.concatenate([[0], breaks])
+    ends = np.concatenate([breaks, [pages.size]])
+    return np.stack([pages[starts], pages[ends - 1] - pages[starts] + 1], axis=1)
+
+
+for layer in (1, 14):
+    shard = f"{MODEL}/{idx[f'layers.{layer}.engram.embed.weight']}"
+    fd = os.open(shard, os.O_RDONLY)
+    size = os.fstat(fd).st_size
+    m = mmap.mmap(fd, size, prot=mmap.PROT_READ, flags=mmap.MAP_SHARED)
+    base = int(np.frombuffer(m, dtype=np.uint8, count=1).ctypes.data)
+    with open(shard, "rb") as f:
+        hl = struct.unpack("<Q", f.read(8))[0]
+        hdr = json.loads(f.read(hl))
+    ds = 8 + hl
+    wm, sm = (
+        hdr[f"layers.{layer}.engram.embed.weight"],
+        hdr[f"layers.{layer}.engram.embed.scale"],
+    )
+    nrows, dim = wm["shape"]
+    scols = sm["shape"][1]
+    woff = ds + wm["data_offsets"][0]
+    soff = ds + sm["data_offsets"][0]
+    # residency of the whole shard
+    npages = (size + PAGE - 1) // PAGE
+    vec = (ctypes.c_ubyte * npages)()
+    t = time.perf_counter()
+    rc = libc.mincore(base, npages * PAGE, vec)
+    dt = time.perf_counter() - t
+    v = np.frombuffer(vec, dtype=np.uint8) & 1
+    wpages = slice(woff // PAGE, (woff + nrows * dim) // PAGE)
+    spages = slice(soff // PAGE, (soff + nrows * scols) // PAGE)
+    print(
+        f"layer {layer} {os.path.basename(shard)} size {size / 2**30:.1f} GiB rc={rc} mincore {dt * 1e3:.0f} ms: resident {v.sum() / 2**18:.2f} GiB / {npages / 2**18:.2f} "
+        f"({100 * v.mean():.1f}%), weight region {100 * v[wpages].mean():.1f}%, scale region {100 * v[spages].mean():.1f}%"
+    )
+    # TP=4 rank-0 slice of rows: this rank owns heads 0..5 -> vocab range = first quarter-ish; use rows over the full table (random hashes)
+    rng = np.random.default_rng(1)
+
+    def pages_of(rows):
+        return np.unique(
+            np.concatenate([(woff + rows * dim) // PAGE, (soff + rows * scols) // PAGE])
+        )
+
+    def populate(chunk):
+        for s, l in chunk.tolist():
+            libc.madvise(base + s * PAGE, l * PAGE, MADV_POPULATE_READ)
+
+    def run(pages, mode):
+        runs = runs_of(pages)
+        if mode == "inline":
+            populate(runs)
+        elif mode == "pool":
+            splits = np.array_split(runs, min(32 * 4, runs.shape[0]))
+            list(pool.map(populate, splits))
+        elif mode == "pool8":
+            splits = np.array_split(runs, min(8, runs.shape[0]))
+            list(pool.map(populate, splits))
+
+    for n_rows in (36, 72):
+        for mode in ("inline", "pool", "pool8"):
+            cold, warm, res = [], [], []
+            for it in range(8):
+                rows = rng.integers(0, nrows, n_rows)
+                pages = pages_of(rows)
+                sub = (ctypes.c_ubyte * pages.size)()
+                # residency of exactly these pages before touching (per page mincore)
+                r = 0
+                for p in pages.tolist():
+                    libc.mincore(base + p * PAGE, PAGE, sub)
+                    r += sub[0] & 1
+                res.append(r / pages.size)
+                t = time.perf_counter()
+                run(pages, mode)
+                cold.append(time.perf_counter() - t)
+                t = time.perf_counter()
+                run(pages, mode)
+                warm.append(time.perf_counter() - t)
+            print(
+                f"  rows {n_rows:3d} pages {pages.size:3d} runs {runs_of(pages).shape[0]:3d} {mode:6s}: pre-resident {100 * np.mean(res):4.1f}%  "
+                f"first {1e3 * np.median(cold):6.2f} ms (min {1e3 * min(cold):.2f})  again(resident) {1e3 * np.median(warm):6.2f} ms (min {1e3 * min(warm):.2f})"
+            )
+    m.close()
+    os.close(fd)
