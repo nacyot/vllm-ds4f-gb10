@@ -80,6 +80,16 @@ unchanged. `ENGRAM_DECODE_ASYNC=2` (both tables in the background) reaches
 64.6 ms on code but prose pays the GPU's in-place page faults instead.
 Details in `.notes/2026-09-15-issue-37-engram-prefault/results.md`.
 
+Since 2026-09-15 (issue #38) the indexer of a prefill chunk scores only a
+quarter of the chunk's rows on each TP rank and one all-gather per indexer
+layer rebuilds the top-k (`DSV41_INDEXER_TP_SPLIT=1`, from the Tech2Wild
+speedrun). The logits, the candidate blocks and every row's top-k set are
+identical to the unsplit loop on the GPU. Cold prefill 128K 1,666 → 1,836
+and 32K 1,866 → 1,978 tok/s, 158K needle cold prefill 2,034 tok/s,
+acceptance length unchanged. The four ranks compare the setting at model
+build and refuse to start when it differs.
+Details in `.notes/2026-09-15-issue-38-indexer-tp-split/results.md`.
+
 The scheduler caps `LPTT`, `LPTT_MIXED`, `PPCAP` and `DECODE_STEPS` stay
 unset by default. On that benchmark none of them shortened the total time.
 The DS4F mixed cap of 2,048 tokens cost 33% of prefill throughput here,
@@ -268,7 +278,7 @@ with a live server for the torch-process rule. Details:
   Inspect actual targets before accepting a safety prompt.
 - After experiments, restore port 8888 to the adopted `dsv41.env` defaults,
   including `ENGRAM_PREFETCH=1`, `ENGRAM_RELEASE=0`, `ENGRAM_DECODE_ASYNC=1`,
-  `ENGRAM_CHUNK_RUNS=8`, `SPEC_BLOCK_DROP=0`,
+  `ENGRAM_CHUNK_RUNS=8`, `SPEC_BLOCK_DROP=0`, `DSV41_INDEXER_TP_SPLIT=1`,
   `EMPTY_CACHE=1`, and `EMPTY_CACHE_MIN_TOKENS=65536`. End with health 200, all four cap services
   active at 1989 MHz, and record head `MemAvailable`. After short probes the
   head sits at about 3.4–4.0 GiB under `EMPTY_CACHE_MIN_TOKENS=65536`; that is
