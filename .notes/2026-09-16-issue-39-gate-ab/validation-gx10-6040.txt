@@ -1,0 +1,14 @@
+2026-09-16T04:48:48+09:00
+gx10-6040
+88744c769e5e32796df01cd927d5b9a037e8dca4
+d9c18da5554fcfad75cd6b19cea8fa0645d44512
+dirty=0
+0 /home/nacyot/dsv41-prep/dsv41-override.env
+NRestarts=0
+Environment=
+ActiveState=active
+active
+1989 MHz, Enabled
+health=200
+active
+ATTENTION_absent

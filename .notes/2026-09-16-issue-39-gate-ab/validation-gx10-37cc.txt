@@ -1,0 +1,12 @@
+bash: warning: setlocale: LC_ALL: cannot change locale (en_US.UTF-8)
+2026-09-16T04:48:47+09:00
+gx10-37cc
+3d81648af247e874740c41d8c41b679fe522b2cd
+d9c18da5554fcfad75cd6b19cea8fa0645d44512
+dirty=0
+0 /home/nacyot/dsv41-prep/dsv41-override.env
+NRestarts=0
+Environment=
+ActiveState=active
+active
+1989 MHz, Enabled
