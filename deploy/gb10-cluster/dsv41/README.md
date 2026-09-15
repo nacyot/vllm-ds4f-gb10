@@ -70,6 +70,16 @@ head `MemAvailable` floor 3.67 GiB during the 128K prefill. `MOE_BACKEND=b12x`
 (+12% code decode alone) stays off: with it the same floor was 2.66 GiB.
 Details in `.notes/2026-09-15-issue-36-knob-combo/results.md`.
 
+Since 2026-09-15 (issue #37) a decode-only step waits for the pages of the
+first engram table only and populates the second one in the background
+(`ENGRAM_DECODE_ASYNC=1`, with `ENGRAM_CHUNK_RUNS=8`): the pages of a decode
+step are cold NVMe reads (the two 23.6 GiB tables per rank never fit the page
+cache), and waiting on both tables serially idled the GPU 5.6 ms per step.
+Code c1 step 70.6 → 68.2 ms, prose 70.5 → 67.8 ms, acceptance length
+unchanged. `ENGRAM_DECODE_ASYNC=2` (both tables in the background) reaches
+64.6 ms on code but prose pays the GPU's in-place page faults instead.
+Details in `.notes/2026-09-15-issue-37-engram-prefault/results.md`.
+
 The scheduler caps `LPTT`, `LPTT_MIXED`, `PPCAP` and `DECODE_STEPS` stay
 unset by default. On that benchmark none of them shortened the total time.
 The DS4F mixed cap of 2,048 tokens cost 33% of prefill throughput here,
@@ -257,7 +267,8 @@ with a live server for the torch-process rule. Details:
   listed shared-memory files; workers must not run ad hoc `rm` commands.
   Inspect actual targets before accepting a safety prompt.
 - After experiments, restore port 8888 to the adopted `dsv41.env` defaults,
-  including `ENGRAM_PREFETCH=1`, `ENGRAM_RELEASE=0`, `SPEC_BLOCK_DROP=0`,
+  including `ENGRAM_PREFETCH=1`, `ENGRAM_RELEASE=0`, `ENGRAM_DECODE_ASYNC=1`,
+  `ENGRAM_CHUNK_RUNS=8`, `SPEC_BLOCK_DROP=0`,
   `EMPTY_CACHE=1`, and `EMPTY_CACHE_MIN_TOKENS=65536`. End with health 200, all four cap services
   active at 1989 MHz, and record head `MemAvailable`. After short probes the
   head sits at about 3.4–4.0 GiB under `EMPTY_CACHE_MIN_TOKENS=65536`; that is
