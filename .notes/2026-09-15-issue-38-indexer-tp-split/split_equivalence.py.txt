@@ -1,0 +1,148 @@
+# Issue #38 one-off GPU check (run on a node with the server stopped):
+#   cd ~/vllm-dsv41 && ~/vllm-dsv41-venv/bin/python <this file>
+# Does DSV41_INDEXER_TP_SPLIT compute the same indexer outputs as the unsplit loop?
+# Production FP8 indexer cache layout (use_fp4_cache=False, q_scale None). Synthetic
+# inputs, a realistic chunk geometry (4096 rows at ~124K context, compressed K), the
+# real kernels: fp8_fp4_mqa_logits (DeepGEMM), top_k_per_row_prefill, and the
+# candidate select/mask Triton kernels. The TP all-gather is emulated in rank order.
+import torch
+
+import vllm.model_executor.layers.sparse_attn_indexer as si
+from vllm import _custom_ops as ops
+from vllm.utils.deep_gemm import fp8_fp4_mqa_logits
+
+H, D, TOPK, CAND_W, CAND_BS = 32, 128, 512, 2048, 8
+dev = torch.device("cuda")
+
+
+def make_inputs(n, ctx_before, ratio, seed):
+    g = torch.Generator(device=dev).manual_seed(seed)
+    k_len = (ctx_before + n) // ratio
+    q = (torch.randn(n, H, D, device=dev, generator=g) * 2).clamp(-6, 6)
+    k = (torch.randn(k_len, D, device=dev, generator=g) * 2).clamp(-6, 6)
+    q_fp8 = q.to(torch.float8_e4m3fn)
+    k_fp8 = k.to(torch.float8_e4m3fn)
+    k_scale = (torch.rand(k_len, 1, device=dev, generator=g) * 0.5 + 0.75).float()
+    k_scale_bytes = k_scale.view(torch.uint8).reshape(k_len, 4)
+    weights = torch.randn(n, H, device=dev, generator=g).float()
+    pos = torch.arange(ctx_before, ctx_before + n, device=dev)
+    ks = torch.zeros(n, dtype=torch.int32, device=dev)
+    ke = ((pos + 1) // ratio).clamp(min=1).to(torch.int32)
+    return q_fp8, k_fp8, k_scale_bytes, weights, ks, ke
+
+
+def unsplit(q, k, k_scale, w, ks, ke, cand_in, cand_write):
+    n = q.shape[0]
+    topk = torch.full((n, TOPK), -1, dtype=torch.int32, device=dev)
+    logits = fp8_fp4_mqa_logits(
+        (q, None), (k, k_scale.view(torch.float32).squeeze(-1)), w, ks, ke,
+        clean_logits=False,
+    )
+    raw = logits.clone()
+    cand = None
+    if cand_in is not None:
+        if cand_write:
+            cand = torch.full((n, CAND_W), -1, dtype=torch.int32, device=dev)
+            si._select_candidate_blocks(logits, ks, ke, CAND_W, CAND_BS, cand)
+        else:
+            si._apply_candidate_mask(logits, ks, ke, cand_in, CAND_BS)
+    ops.top_k_per_row_prefill(
+        logits, ks, ke, topk, n, logits.stride(0), logits.stride(1), TOPK
+    )
+    unsplit.scored = logits
+    return raw, topk, cand
+
+
+def split(q, k, k_scale, w, ks, ke, cand_in, cand_write, world):
+    n = q.shape[0]
+    locals_, raw_rows = [], []
+    for rank in range(world):
+        lo, hi, per = si._dsv41_tp_split_bounds(n, world, rank)
+        if hi > lo:
+            raw_rows.append(
+                fp8_fp4_mqa_logits(
+                    (q[lo:hi], None), (k, k_scale.view(torch.float32).squeeze(-1)),
+                    w[lo:hi], ks[lo:hi], ke[lo:hi], clean_logits=False,
+                )
+            )
+        locals_.append(
+            si._dsv41_prefill_rows_local(
+                q[lo:hi], None, k, k_scale, w[lo:hi], ks[lo:hi], ke[lo:hi], TOPK,
+                per, cand_in[lo:hi] if cand_in is not None else None, CAND_BS,
+                cand_write, False,
+            )
+        )
+    gathered = torch.cat(locals_, dim=0)
+    topk = torch.full((n, TOPK), -2, dtype=torch.int32, device=dev)
+    cand = None
+    if cand_in is not None and cand_write:
+        cand = torch.full((n, CAND_W), -2, dtype=torch.int32, device=dev)
+    si._dsv41_scatter_gathered(gathered, n, 0, topk, TOPK, cand, cand_write)
+    return torch.cat(raw_rows, dim=0), topk, cand
+
+
+def rows_differ(scored, a, b):
+    """(rows whose index sets differ, rows whose selected score multisets differ).
+
+    top_k_per_row_prefill does not order its output and FP8 scores tie, so the
+    same kernel twice may pick different but equally scored indices."""
+    set_diff = (a.sort(dim=1).values != b.sort(dim=1).values).any(dim=1)
+
+    def scores(idx):
+        s = scored.gather(1, idx.clamp(min=0).long())
+        return s.masked_fill(idx < 0, float("-inf")).sort(dim=1).values
+
+    score_diff = (scores(a) != scores(b)).any(dim=1)
+    return int(set_diff.sum()), int(score_diff.sum())
+
+
+def check(name, n, ctx_before, ratio, seed):
+    q, k, k_scale, w, ks, ke = make_inputs(n, ctx_before, ratio, seed)
+    # The candidate buffer is [tokens, candidate_topk_blocks] in production.
+    cand_buf = torch.full((n, CAND_W), -1, dtype=torch.int32, device=dev)
+    # Candidate-source layer first, then a masked layer that consumes its blocks.
+    raw_a, topk_a, cand_a = unsplit(q, k, k_scale, w, ks, ke, cand_buf, True)
+    src_scored = unsplit.scored
+    raw_a2, topk_a2, cand_a2 = unsplit(q, k, k_scale, w, ks, ke, cand_buf, True)
+    raw_b, topk_b, cand_b = split(q, k, k_scale, w, ks, ke, cand_buf, True, 4)
+    _, mtopk_a, _ = unsplit(q, k, k_scale, w, ks, ke, cand_a, False)
+    m_scored = unsplit.scored
+    _, mtopk_a2, _ = unsplit(q, k, k_scale, w, ks, ke, cand_a, False)
+    _, mtopk_b, _ = split(q, k, k_scale, w, ks, ke, cand_a, False, 4)
+    _, ptopk_a, _ = unsplit(q, k, k_scale, w, ks, ke, None, False)
+    p_scored = unsplit.scored
+    _, ptopk_b, _ = split(q, k, k_scale, w, ks, ke, None, False, 4)
+    print(
+        f"{name}: (rows with differing index sets, rows with differing selected "
+        f"scores) of {n} | source self {rows_differ(src_scored, topk_a, topk_a2)} "
+        f"split {rows_differ(src_scored, topk_a, topk_b)} | masked self "
+        f"{rows_differ(m_scored, mtopk_a, mtopk_a2)} split "
+        f"{rows_differ(m_scored, mtopk_a, mtopk_b)} | plain split "
+        f"{rows_differ(p_scored, ptopk_a, ptopk_b)}"
+    )
+    # clean_logits=False leaves columns outside [ks, ke) unwritten: compare only
+    # the valid window of each row.
+    col = torch.arange(k.shape[0], device=dev)
+    valid = (col[None, :] >= ks[:, None]) & (col[None, :] < ke[:, None])
+    va, va2, vb = raw_a[valid], raw_a2[valid], raw_b[valid]
+    print(
+        f"{name}: rows={n} K={k.shape[0]} valid={va.numel()} | unsplit self-repeat "
+        f"logits {torch.equal(va, va2)} topk {torch.equal(topk_a, topk_a2)} "
+        f"cand {torch.equal(cand_a, cand_a2)} | split vs unsplit: logits "
+        f"{torch.equal(va, vb)} (max abs {(va - vb).abs().max().item():.3g}) "
+        f"source-layer topk {torch.equal(topk_a, topk_b)} "
+        f"candidates {torch.equal(cand_a, cand_b)} "
+        f"masked-layer topk {torch.equal(mtopk_a, mtopk_b)} "
+        f"plain topk {torch.equal(ptopk_a, ptopk_b)}"
+    )
+
+
+torch.backends.cuda.matmul.allow_tf32 = False
+for name, n, ctx, ratio, seed in [
+    ("128K-tail-chunk", 4096, 124_000, 4, 1),
+    ("32K-chunk", 4096, 28_000, 4, 2),
+    ("first-chunk", 4096, 0, 4, 3),
+    ("uneven-1000", 1000, 60_000, 4, 4),
+    ("ratio2-chunk", 4096, 60_000, 2, 5),
+]:
+    check(name, n, ctx, ratio, seed)

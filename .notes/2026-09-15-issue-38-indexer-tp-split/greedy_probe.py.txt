@@ -1,0 +1,132 @@
+#!/usr/bin/env python3
+"""Greedy output identity probe for issue #38 (standard library only; run on the head).
+
+run:     greedy_probe.py run --base URL --tag TAG --out FILE [--sizes 8000,32000] [--repeats 2]
+         One fixed prompt per size (same text on every boot), temperature 0, max_tokens 64,
+         top-5 logprobs, a fresh cache_salt per request so every run is a cold prefill.
+compare: greedy_probe.py compare --out FILE
+         Pairwise per size over every recorded run: identical text, first differing
+         token, largest top-1 logprob gap over the common prefix.
+"""
+
+import argparse
+import itertools
+import json
+import random
+import time
+import urllib.request
+
+CHARS_PER_TOKEN = 4.3
+
+
+def post(base, path, payload):
+    req = urllib.request.Request(
+        base + path,
+        data=json.dumps(payload).encode(),
+        headers={"Content-Type": "application/json"},
+    )
+    return json.loads(urllib.request.urlopen(req, timeout=3600).read())
+
+
+def build_prompt(size):
+    rng = random.Random(38_000 + size)
+    words = ["alpha", "bravo", "delta", "echo", "kilo", "lima", "oscar", "sierra", "tango"]
+    lines, chars, i = [], 0, 0
+    while chars < (size - 120) * CHARS_PER_TOKEN:
+        i += 1
+        line = (
+            f"Record {i}: station {rng.choice(words)}-{rng.randrange(1000)} "
+            f"logged {rng.randrange(100000)} units at hour {rng.randrange(24)}."
+        )
+        lines.append(line)
+        chars += len(line) + 1
+    return (
+        "\n".join(lines)
+        + "\n\nList the station names and unit counts of records 1 through 12 above,"
+        " one record per line, in order."
+    )
+
+
+def run(a):
+    model = json.loads(urllib.request.urlopen(a.base + "/v1/models").read())["data"][0]["id"]
+    salt_rng = random.Random()
+    with open(a.out, "a") as f:
+        for size in [int(s) for s in a.sizes.split(",")]:
+            prompt = build_prompt(size)
+            for rep in range(a.repeats):
+                salt = "".join(salt_rng.choices("abcdefghijklmnop", k=16))
+                t0 = time.time()
+                body = post(
+                    a.base,
+                    "/v1/chat/completions",
+                    {
+                        "model": model,
+                        "cache_salt": salt,
+                        "messages": [{"role": "user", "content": prompt}],
+                        "max_tokens": 64,
+                        "temperature": 0.0,
+                        "logprobs": True,
+                        "top_logprobs": 5,
+                        "chat_template_kwargs": {"thinking": False},
+                    },
+                )
+                choice = body["choices"][0]
+                content = (choice.get("logprobs") or {}).get("content") or []
+                rec = {
+                    "tag": a.tag,
+                    "size": size,
+                    "rep": rep,
+                    "salt": salt,
+                    "prompt_tokens": body["usage"]["prompt_tokens"],
+                    "latency_s": round(time.time() - t0, 2),
+                    "text": choice["message"]["content"],
+                    "tokens": [c["token"] for c in content],
+                    "top1_logprob": [round(c["logprob"], 4) for c in content],
+                    "top5": [[(t["token"], round(t["logprob"], 3)) for t in c["top_logprobs"]] for c in content],
+                }
+                f.write(json.dumps(rec) + "\n")
+                f.flush()
+                print(json.dumps({k: rec[k] for k in ("tag", "size", "rep", "prompt_tokens", "latency_s", "text")}))
+
+
+def compare(a):
+    recs = [json.loads(line) for line in open(a.out)]
+    for size in sorted({r["size"] for r in recs}):
+        runs = [r for r in recs if r["size"] == size]
+        for x, y in itertools.combinations(runs, 2):
+            n = min(len(x["tokens"]), len(y["tokens"]))
+            first = next((i for i in range(n) if x["tokens"][i] != y["tokens"][i]), None)
+            upto = n if first is None else first
+            gap = max(
+                (abs(x["top1_logprob"][i] - y["top1_logprob"][i]) for i in range(upto)),
+                default=0.0,
+            )
+            print(
+                json.dumps(
+                    {
+                        "size": size,
+                        "a": f"{x['tag']}#{x['rep']}",
+                        "b": f"{y['tag']}#{y['rep']}",
+                        "text_identical": x["text"] == y["text"],
+                        "first_diff_token": first,
+                        "tokens": [len(x["tokens"]), len(y["tokens"])],
+                        "max_top1_logprob_gap_common_prefix": round(gap, 4),
+                    }
+                )
+            )
+
+
+def main():
+    ap = argparse.ArgumentParser()
+    ap.add_argument("cmd", choices=["run", "compare"])
+    ap.add_argument("--base", default="http://127.0.0.1:8888")
+    ap.add_argument("--tag", default="")
+    ap.add_argument("--out", required=True)
+    ap.add_argument("--sizes", default="8000,32000")
+    ap.add_argument("--repeats", type=int, default=2)
+    a = ap.parse_args()
+    run(a) if a.cmd == "run" else compare(a)
+
+
+if __name__ == "__main__":
+    main()
