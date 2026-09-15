@@ -394,6 +394,19 @@ with a live server for the torch-process rule. Details:
   first, which in practice means a fresh boot. `status` reports
   memory from `/proc/meminfo` to two decimal places.
 
+### Metrics in Grafana (issue #33)
+
+VictoriaMetrics on CT116 scrapes port 8888 directly (`job="vllm"`,
+`service="ds4f"`, 15 s) for the homelab `ds4f-vllm` dashboard; the head's
+`~/vmagent/scrape.yml` is unused. Read computed prefill from
+`vllm:prompt_tokens_by_source_total{source="local_compute"}` and disk/CPU
+restores from `source="external_kv_transfer"`. vLLM books prompt tokens when
+the first token appears, so a long prefill shows as a sawtooth or one spike;
+use the per-request panel (`request_prefill_kv_computed_tokens_sum` over
+`request_prefill_time_seconds_sum`, 5 minutes) for speed.
+`iteration_tokens_total_count` counts only steps that emit output, so the
+stall signature also requires no `kv_cache_usage_perc` change for 2 minutes.
+
 ### Long cold prefill headroom
 
 Long cold prefill (operationally, ≥256K tokens) starts only with head
