@@ -14,30 +14,42 @@
   p{margin:0 0 .95rem} strong{font-weight:700}
   ul,ol{margin:.4rem 0 1.1rem;padding-left:1.1rem} li{margin:.5rem 0}
   code{font-family:ui-monospace,Menlo,Consolas,monospace;font-size:.8em;color:#46443f;background:#efeee7;padding:0 .25em;border-radius:2px}
-  pre{background:var(--box);border:1px solid var(--rule);border-radius:4px;padding:.9rem 1rem;overflow-x:auto;margin:0 0 1.2rem}
-  pre code{background:none;padding:0;font-size:.78rem;line-height:1.55;color:var(--ink)}
   table{width:100%;border-collapse:collapse;font-size:.88rem;line-height:1.55;margin:0 0 1.2rem}
   th,td{text-align:left;vertical-align:top;padding:.52rem .8rem .52rem 0}
-  th.r,td.r{text-align:right;padding-right:0;padding-left:.8rem}
   thead th{border-bottom:1px solid var(--ink);font-weight:700;font-size:.82rem}
   tbody tr+tr td{border-top:1px solid var(--rule)} td:first-child,th:first-child{font-weight:600}
-  @media(max-width:640px){body{font-size:17px}.doc{padding:2.6rem 1.2rem 5rem}
-    table{font-size:.82rem}th,td{padding:.45rem .5rem .45rem 0}}
+  details{margin:1rem 0;border-top:1px solid var(--rule);padding-top:.7rem}
+  summary{cursor:pointer;font-weight:700;list-style:none} summary::before{content:"▸ ";color:var(--faint)}
+  details[open] summary::before{content:"▾ "}
+  @media(max-width:640px){body{font-size:17px}.doc{padding:2.6rem 1.2rem 5rem}}
 </style></head><body><div class="doc">
 <h1>메타 이슈 #43 마감: 다섯 주제가 어떻게 끝났나</h1>
-<p>2026-09-15 오전에 &quot;DS4.1F 포크에서 지금 풀어야 할 다섯 주제&quot; 를 적었다. 하루 뒤인 2026-09-16, 그 다섯 주제가 모두 끝났다. 이 글은 각 주제가 무엇을 물었고 무엇으로 답했는지를 정리한 마감 기록이다.</p>
+<p>2026-09-15 오전에 "DS4.1F 포크에서 지금 풀어야 할 다섯 주제" 를 적었다. 하루 뒤인 2026-09-16, 그 다섯 주제가 모두 끝났다. 이 글은 각 주제가 무엇을 물었고 무엇으로 답했는지를 정리한 마감 기록이다. 같은 날 09:03 에 오너 지시로 디스크 정리와 최종 트리 재기동까지 마쳤고, 그 기록은 마지막 절에 덧붙였다.</p>
 <p><strong>결과부터</strong>: 다섯 주제 아래 열두 건 중 열한 건이 닫혔다. 열린 채로 남은 것은 API 프런트엔드 배치(#29) 하나뿐이고, 오너가 최종 배포 때 하기로 정했다. 프로덕션 최종 기준선 <code>prod-final</code> 을 SGLang 대비로 환산하면 산문 c1 94.4, 코드 c1 96.5, 코드 c4 합산 81.5, 128K 프리필 80.1, 에이전트 작업 속도 102.3 으로 다섯 항목 모두 원 목표 범위에 들었다.</p>
 <p><strong>얼마나 달라졌나</strong>를 먼저 보면 이렇다. 왼쪽이 이슈를 쓰던 2026-09-15 오전의 값(<code>fork0914</code>), 오른쪽이 2026-09-16 최종 기준선(<code>prod-final</code>)이다.</p>
-<table><thead><tr><th>주제</th><th class="r">당시</th><th class="r">지금</th><th class="r">SGLang</th></tr></thead><tbody><tr><td>1 코드 디코드 c1 스텝</td><td class="r">75.9 ms</td><td class="r"><strong>67.7 ms</strong></td><td class="r">65.4 ms</td></tr><tr><td>2 128K 콜드 프리필</td><td class="r">1,359 tok/s</td><td class="r"><strong>1,684 tok/s</strong></td><td class="r">2,102 tok/s</td></tr><tr><td>3 헤드 여유 최저</td><td class="r">4.64 GiB</td><td class="r"><strong>7.71 GiB</strong></td><td class="r">15.08 GiB</td></tr><tr><td>4 긴 프리필 뒤 짧은 요청</td><td class="r">88.9 s</td><td class="r"><strong>14.6 s</strong></td><td class="r">56.4 s</td></tr><tr><td>5 운영: 부팅 뒤 첫 8K TTFT</td><td class="r">21.0 s</td><td class="r"><strong>5.3 s</strong></td><td class="r">해당 없음</td></tr></tbody></table>
+<table><thead><tr><th>주제</th><th>당시</th><th>지금</th><th>SGLang</th></tr></thead><tbody>
+<tr><td>1 코드 디코드 c1 스텝</td><td>75.9 ms</td><td><strong>67.7 ms</strong></td><td>65.4 ms</td></tr>
+<tr><td>2 128K 콜드 프리필</td><td>1,359 tok/s</td><td><strong>1,684 tok/s</strong></td><td>2,102 tok/s</td></tr>
+<tr><td>3 헤드 여유 최저</td><td>4.64 GiB</td><td><strong>7.71 GiB</strong></td><td>15.08 GiB</td></tr>
+<tr><td>4 긴 프리필 뒤 짧은 요청</td><td>88.9 s</td><td><strong>14.6 s</strong></td><td>56.4 s</td></tr>
+<tr><td>5 운영: 부팅 뒤 첫 8K TTFT</td><td>21.0 s</td><td><strong>5.3 s</strong></td><td>해당 없음</td></tr>
+</tbody></table>
 <p>세 번째 줄에 주의가 필요하다. 헤드 여유는 코드로 만든 차이가 아니라 시작 메모리 상태가 달라서 생긴 차이이기도 하다. 값을 그대로 성과로 읽지 않는 게 맞다.</p>
 <p>숫자의 정본은 저장소 <code>.notes/</code> 아래 각 이슈의 <code>results.md</code> 다. 이 글의 모든 값은 거기서 다시 읽어 맞췄다. 주제별 대장은 <code>.notes/2026-09-16-issue-43-meta-close/plan.md</code> 에 있다.</p>
 <h2>1. 디코드 스텝 격차</h2>
 <p>같은 vLLM 코어인데 우리 스텝이 75.9 ms, T2W 기본 설정이 68.0 ms, SGLang 이 65.4 ms 였다. 스텝당 통과 토큰은 셋 다 5.82 로 같았으니 순수하게 스텝이 느린 것이었다. 세 갈래로 나눠 물었다.</p>
-<table><thead><tr><th>갈래</th><th>당시</th><th>지금</th></tr></thead><tbody><tr><td>Engram prefault 가 GPU 를 놀린다 (#37)</td><td>스텝당 GPU 유휴 5.6 ms</td><td>4.3 ms, 스텝 70.6 → 68.2 ms</td></tr><tr><td>업스트림 커널 이식 (#40)</td><td>미지</td><td>개선 0.3 %, 미채택</td></tr><tr><td>동시 2 의 증가분 (#41)</td><td>원인 미상, +27 ms</td><td>+26.4 ms 를 전부 귀속, MoE 라우팅이 75 %</td></tr></tbody></table>
+<table><thead><tr><th>갈래</th><th>당시</th><th>지금</th></tr></thead><tbody>
+<tr><td>Engram prefault 가 GPU 를 놀린다 (#37)</td><td>스텝당 GPU 유휴 5.6 ms</td><td>4.3 ms, 스텝 70.6 → 68.2 ms</td></tr>
+<tr><td>업스트림 커널 이식 (#40)</td><td>미지</td><td>개선 0.3 %, 미채택</td></tr>
+<tr><td>동시 2 의 증가분 (#41)</td><td>원인 미상, +27 ms</td><td>+26.4 ms 를 전부 귀속, MoE 라우팅이 75 %</td></tr>
+</tbody></table>
 <h3>원인은 콜드 NVMe 읽기였다</h3>
 <p>디코드 스텝마다 러너가 해시를 GPU 에서 내려받은 뒤 Engram 표 두 장을 <strong>직렬로</strong> 기다렸다. 그 표의 페이지가 디스크에서 갓 읽히는 콜드 페이지다. 샤드 상주율이 0.1 %, 표 하나가 72~96 페이지, 장치가 초당 22,000 IOPS 이니 기다림이 길 수밖에 없다. 그동안 GPU 는 스텝당 5.6 ms 를 놀았다.</p>
 <p>고친 방법은 순서를 바꾼 것이다. 레이어 1 표만 기다리고 레이어 14 표는 포워드가 도는 동안 배경에서 채운다(<code>ENGRAM_DECODE_ASYNC=1</code>, <code>ENGRAM_CHUNK_RUNS=8</code>).</p>
-<table><thead><tr><th>구성</th><th class="r">코드 c1 스텝</th><th class="r">산문 c1 스텝</th><th class="r">GPU 유휴</th></tr></thead><tbody><tr><td>기준선</td><td class="r">73.3 / 70.2 / 68.4 ms</td><td class="r">70.3 / 70.7 ms</td><td class="r">5.6 ms</td></tr><tr><td>채택</td><td class="r"><strong>68.2 / 67.0 ms</strong></td><td class="r"><strong>68.5 / 67.5 ms</strong></td><td class="r"><strong>4.3 ms</strong></td></tr></tbody></table>
+<table><thead><tr><th>구성</th><th>코드 c1 스텝</th><th>산문 c1 스텝</th><th>GPU 유휴</th></tr></thead><tbody>
+<tr><td>기준선</td><td>73.3 / 70.2 / 68.4 ms</td><td>70.3 / 70.7 ms</td><td>5.6 ms</td></tr>
+<tr><td>채택</td><td><strong>68.2 / 67.0 ms</strong></td><td><strong>68.5 / 67.5 ms</strong></td><td><strong>4.3 ms</strong></td></tr>
+</tbody></table>
 <p>수락 길이 5.82 는 그대로고 158K 니들도 콜드와 후속 턴 모두 정답이었다.</p>
 <p>표 두 장을 모두 배경으로 돌리는 모드도 만들어 봤다. 코드는 64.6 ms 로 더 빠른데 산문이 3.7 ms 느려진다. 산문에서는 레이어 1 조회가 콜드 페이지를 GPU 제자리 fault 로 읽기 때문이다. 코드는 n-gram 반복 덕에 페이지가 이미 올라와 있어 fault 가 없다. 워크로드에 따라 갈리므로 옵트인으로 남겼다.</p>
 <h3>업스트림 커널은 값이 없었다</h3>
@@ -46,12 +58,22 @@
 <p>요청이 하나에서 둘로 늘 때 우리는 27 ms 가 느는데 SGLang 은 4 ms 만 늘었다. 4 랭크 프로파일 다섯 종을 떠서 증가분 전부를 범주에 배분했다.</p>
 <p>먼저 밝혀진 것은 <strong>증가분이 두 값 사이를 오간다</strong>는 점이다. 두 스트림이 같은 토큰을 디코드하면 +7.3 ms, 다른 토큰이면 +26.4 ms 다. 같은 프롬프트로 두 요청을 보내도 대개 한 스텝씩 어긋나므로 벤치에서는 큰 쪽이 잡힌다.</p>
 <p>큰 쪽 26.4 ms 의 내역이다.</p>
-<table><thead><tr><th>범주</th><th class="r">증가분</th><th class="r">비중</th></tr></thead><tbody><tr><td>MoE 그룹 GEMM</td><td class="r">19.78 ms</td><td class="r">75 %</td></tr><tr><td>NCCL (전송 2.24, 대기 0.53)</td><td class="r">2.77 ms</td><td class="r">10 %</td></tr><tr><td>Engram 표 대기</td><td class="r">2.08 ms</td><td class="r">8 %</td></tr><tr><td>MoE 글루</td><td class="r">0.93 ms</td><td class="r">4 %</td></tr><tr><td>어텐션과 인덱서</td><td class="r">0.59 ms</td><td class="r">2 %</td></tr><tr><td>dense GEMM 과 기타 커널</td><td class="r">0.47 ms</td><td class="r">2 %</td></tr></tbody></table>
-<p>MoE 19.78 ms 중 15.42 ms 는 순수한 <strong>라우팅 몫</strong>이다. 두 토큰이 서로 다른 전문가로 가면 커널이 읽어야 할 가중치 블록이 늘어난다. 호스트 쪽은 전부 0.2 ms 미만이었다. 2026-09-14 보고서가 이 격차를 &quot;호스트 지문&quot; 으로 추정했는데 <strong>그 추정은 틀렸다.</strong></p>
+<table><thead><tr><th>범주</th><th>증가분</th><th>비중</th></tr></thead><tbody>
+<tr><td>MoE 그룹 GEMM</td><td>19.78 ms</td><td>75 %</td></tr>
+<tr><td>NCCL (전송 2.24, 대기 0.53)</td><td>2.77 ms</td><td>10 %</td></tr>
+<tr><td>Engram 표 대기</td><td>2.08 ms</td><td>8 %</td></tr>
+<tr><td>MoE 글루</td><td>0.93 ms</td><td>4 %</td></tr>
+<tr><td>어텐션과 인덱서</td><td>0.59 ms</td><td>2 %</td></tr>
+<tr><td>dense GEMM 과 기타 커널</td><td>0.47 ms</td><td>2 %</td></tr>
+</tbody></table>
+<p>MoE 19.78 ms 중 15.42 ms 는 순수한 <strong>라우팅 몫</strong>이다. 두 토큰이 서로 다른 전문가로 가면 커널이 읽어야 할 가중치 블록이 늘어난다. 호스트 쪽은 전부 0.2 ms 미만이었다. 2026-09-14 보고서가 이 격차를 "호스트 지문" 으로 추정했는데 <strong>그 추정은 틀렸다.</strong></p>
 <p>3 ms 를 넘는 몫이 MoE 라우팅 하나뿐이고, 그것은 국소 수정으로 없앨 수 있는 성질이 아니다. 그래서 후속 이슈를 만들지 않았다.</p>
 <h2>2. 프리필 격차</h2>
 <p>128K 콜드 프리필이 우리 1,359 tok/s, T2W 2,034, SGLang 2,102 였다.</p>
-<table><thead><tr><th>갈래</th><th>당시</th><th>지금</th></tr></thead><tbody><tr><td>인덱서 TP 분할 이식 (#38)</td><td>미적용</td><td>채택, S128 +22 ~ 23 %</td></tr><tr><td>프리필 커널 후속 (#17)</td><td>병목 미상</td><td>청크의 26 % 가 랭크 불균형, 그 73 % 가 Engram 조회</td></tr></tbody></table>
+<table><thead><tr><th>갈래</th><th>당시</th><th>지금</th></tr></thead><tbody>
+<tr><td>인덱서 TP 분할 이식 (#38)</td><td>미적용</td><td>채택, S128 +22 ~ 23 %</td></tr>
+<tr><td>프리필 커널 후속 (#17)</td><td>병목 미상</td><td>청크의 26 % 가 랭크 불균형, 그 73 % 가 Engram 조회</td></tr>
+</tbody></table>
 <p>지금 <code>prod-final</code> 은 S128 첫 회 1,683.7 tok/s 다. 세 회차가 1,598.9 에서 1,683.7 사이로 흔들린다. 32K 는 1,880.9 tok/s, 긴 세션 158.5K 콜드는 1,933.6 tok/s 로 SGLang 의 98 % 까지 왔다.</p>
 <h3>인덱서 분할이 가장 큰 한 방이었다</h3>
 <p>T2W 의 인덱서 프리필 TP 분할을 우리 트리로 옮겼다. 같은 빌드에서 게이트만 바꿔 잰 A/B 에서 <strong>S128 이 22.41 %, 23.11 % 늘었다.</strong> prefault 를 끄든 켜든 양쪽에서 같은 방향이었다. 32K 에서는 개선이 확인되지 않았다.</p>
@@ -65,47 +87,100 @@
 <p>여기서 방법론 문제가 드러났다. <strong>S128 회차 편차가 1,625 에서 1,942 tok/s 로 ±8 %</strong> 다. 매 회차 헤드에서 스왑과 직접 회수, 컴팩션이 일어난다. 이 잡음이 청크당 6 % 짜리 이득을 세 회 평균으로는 가릴 만큼 크다. 편차를 줄인 프로토콜로 다시 판정하는 일을 #44 에 파킹했다.</p>
 <h2>3. 이미 있는 노브 반영과 헤드 메모리 여유</h2>
 <p>노브 셋은 각각 실측 이득이 있었지만 함께 켜면 헤드 여유가 earlyoom 선 2.43 GiB 가까이 내려갈 수 있었다.</p>
-<table><thead><tr><th>갈래</th><th>당시</th><th>지금</th></tr></thead><tbody><tr><td>노브 조합 (#36)</td><td>개별 이득만 확인</td><td>두 노브 프로덕션 기본값, AG4 208.0 s</td></tr><tr><td>헤드 여유 레버 (#31)</td><td>오너 결정 대기</td><td>현상 유지로 닫음</td></tr></tbody></table>
+<table><thead><tr><th>갈래</th><th>당시</th><th>지금</th></tr></thead><tbody>
+<tr><td>노브 조합 (#36)</td><td>개별 이득만 확인</td><td>두 노브 프로덕션 기본값, AG4 208.0 s</td></tr>
+<tr><td>헤드 여유 레버 (#31)</td><td>오너 결정 대기</td><td>현상 유지로 닫음</td></tr>
+</tbody></table>
 <p>세 노브를 다 켠 구성이 총시간은 가장 짧았지만 헤드 최저가 2.66 GiB 로 내려갔다. earlyoom 선에 너무 가깝다. 하나를 뺀 조합이 답이었다.</p>
-<table><thead><tr><th>구성</th><th class="r">에이전트 4×6 총시간</th><th class="r">헤드 최저</th><th class="r">158K 후속 턴 TTFT</th></tr></thead><tbody><tr><td>2026-09-13 채택본</td><td class="r">235.6 s</td><td class="r">4.33 GiB</td><td class="r">3.13 s</td></tr><tr><td>세 노브 전부</td><td class="r">181.7 / 176.4 s</td><td class="r">2.66 GiB</td><td class="r">1.007 s</td></tr><tr><td><strong>채택 (두 노브)</strong></td><td class="r"><strong>208.0 s</strong></td><td class="r"><strong>3.67 GiB</strong></td><td class="r"><strong>0.77 s</strong></td></tr></tbody></table>
+<table><thead><tr><th>구성</th><th>에이전트 4×6 총시간</th><th>헤드 최저</th><th>158K 후속 턴 TTFT</th></tr></thead><tbody>
+<tr><td>2026-09-13 채택본</td><td>235.6 s</td><td>4.33 GiB</td><td>3.13 s</td></tr>
+<tr><td>세 노브 전부</td><td>181.7 / 176.4 s</td><td>2.66 GiB</td><td>1.007 s</td></tr>
+<tr><td><strong>채택 (두 노브)</strong></td><td><strong>208.0 s</strong></td><td><strong>3.67 GiB</strong></td><td><strong>0.77 s</strong></td></tr>
+</tbody></table>
 <p><code>SPEC_BLOCK_DROP=0</code> 과 <code>ENGRAM_RELEASE=0</code> 을 기본값으로 반영했다. 총시간 26 초를 포기하고 헤드 여유 1 GiB 를 샀다. 성능과 메모리 여유가 함께 서는 지점이 여기다.</p>
 <p>헤드 여유 자체를 늘릴 레버(#31)는 오너가 현상 유지로 정해 닫았다. 신규 부팅 뒤 493K 콜드 프리필 여유가 4.6 에서 7.1 GiB 로 흔들리는 원인은 웜업 컴팩션 때 커널이 파일 회수와 anon swap-out 중 무엇을 고르느냐였고, 프로세스가 늘어난 것은 아니었다.</p>
 <h2>4. 긴 프리필 중 다른 요청의 대기</h2>
 <p>128K 프리필이 도는 동안 뒤에 들어온 짧은 요청이 답을 받기까지 우리 88.9 초, SGLang 56.4 초가 걸렸다. 사용자가 가장 먼저 체감하는 항목이다.</p>
-<table><thead><tr><th class="r">당시</th><th class="r">지금</th></tr></thead><tbody><tr><td class="r">88.9 s</td><td class="r"><strong>14.6 s</strong> (#34 측정 회차에서는 7.0 / 8.7 s)</td></tr></tbody></table>
+<table><thead><tr><th>당시</th><th>지금</th></tr></thead><tbody>
+<tr><td>88.9 s</td><td><strong>14.6 s</strong> (#34 측정 회차에서는 7.0 / 8.7 s)</td></tr>
+</tbody></table>
 <p><code>DSPARK_SHORT_RESERVE=4096</code> 으로 짧은 요청 몫을 미리 떼어 놓는다. 총시간을 늘리지 않는 것이 조건이었고, 지켜졌다.</p>
-<table><thead><tr><th>항목</th><th>기준</th><th class="r">기준선</th><th class="r">채택 후</th></tr></thead><tbody><tr><td>짧은 요청 대기 (2 회)</td><td>15 s 이하</td><td class="r">64.50 / 68.01 s</td><td class="r"><strong>7.01 / 8.71 s</strong></td></tr><tr><td>MIXLONG 총시간</td><td>+2 % 이내</td><td class="r">265.0 s</td><td class="r">265.4 s (+0.15 %)</td></tr><tr><td>에이전트 단독 총시간</td><td>±3 %</td><td class="r">205.6 s</td><td class="r">199.3 s (−3.1 %)</td></tr><tr><td>S128 단독 프리필</td><td>불변</td><td class="r">1,666.3 tok/s</td><td class="r">1,792.2 tok/s</td></tr><tr><td>로짓 뒤집힘</td><td>0</td><td class="r">0</td><td class="r">0</td></tr></tbody></table>
+<table><thead><tr><th>항목</th><th>기준</th><th>기준선</th><th>채택 후</th></tr></thead><tbody>
+<tr><td>짧은 요청 대기 (2 회)</td><td>15 s 이하</td><td>64.50 / 68.01 s</td><td><strong>7.01 / 8.71 s</strong></td></tr>
+<tr><td>MIXLONG 총시간</td><td>+2 % 이내</td><td>265.0 s</td><td>265.4 s (+0.15 %)</td></tr>
+<tr><td>에이전트 단독 총시간</td><td>±3 %</td><td>205.6 s</td><td>199.3 s (−3.1 %)</td></tr>
+<tr><td>S128 단독 프리필</td><td>불변</td><td>1,666.3 tok/s</td><td>1,792.2 tok/s</td></tr>
+<tr><td>로짓 뒤집힘</td><td>0</td><td>0</td><td>0</td></tr>
+</tbody></table>
 <h3>첫 시도는 효과가 0 이었다</h3>
 <p>이 작업에서 기록할 값어치가 있는 것은 <strong>첫 부팅이 아무 효과가 없었다</strong>는 사실이다. 예약을 4,096 토큰 걸었는데 대기가 64.96 / 66.73 초로 기준선과 똑같았다. 한 토큰도 물리지 않았다.</p>
 <p>원인은 프리필 청크를 묶는 상한이 토큰 예산이 아니라 <strong>입력 예산에서 드래프트 슬롯을 뺀 값</strong>이었다는 것이다. dspark 드래프터가 요청마다 슬롯 4 개를 가져가고, 스케줄되는 요청은 입력 예산에서 새 토큰 수와 슬롯 수를 함께 뺀다. 프리필 청크가 4,092 토큰을 받아 입력 예산을 0 으로 만들면 대기 루프가 즉시 빠져나가 짧은 요청이 입장하지 못한다. 토큰 예산에서만 빼 봤자 상한을 고르는 <code>min()</code> 이 여전히 입력 예산 쪽을 골랐다.</p>
 <p>두 예산 모두에서 자르도록 고치자 같은 부팅 조건에서 7.01 / 8.71 초가 나왔다. 이 실수를 그대로 재현하는 단위 테스트를 남겼다.</p>
 <h2>5. 운영</h2>
 <p>프로덕션이 사람 손 없이 서 있어야 하고, 대시보드가 사실을 보여야 하고, 디스크에 쌓인 KV 가 멀쩡한지 확인할 수단이 있어야 한다.</p>
-<table><thead><tr><th>갈래</th><th>당시</th><th>지금</th></tr></thead><tbody><tr><td>하드닝 (#32)</td><td>수동 기동, 웜업 없음</td><td>영속 유닛과 워치독, 첫 8K TTFT 21.0 → 5.3 s</td></tr><tr><td>Grafana 프리필 패널 (#33)</td><td>복원을 프리필로 셈</td><td>계산 토큰 기준, 실측과 +1.2 %</td></tr><tr><td>fs 티어 CRC 검증 (#10)</td><td>수단 없음</td><td>104 만 파일 전수, 불일치 0</td></tr><tr><td>API 프런트엔드 (#29)</td><td>열림</td><td>열림, 오너가 최종 배포 때로 정함</td></tr></tbody></table>
+<table><thead><tr><th>갈래</th><th>당시</th><th>지금</th></tr></thead><tbody>
+<tr><td>하드닝 (#32)</td><td>수동 기동, 웜업 없음</td><td>영속 유닛과 워치독, 첫 8K TTFT 21.0 → 5.3 s</td></tr>
+<tr><td>Grafana 프리필 패널 (#33)</td><td>복원을 프리필로 셈</td><td>계산 토큰 기준, 실측과 +1.2 %</td></tr>
+<tr><td>fs 티어 CRC 검증 (#10)</td><td>수단 없음</td><td>104 만 파일 전수, 불일치 0</td></tr>
+<tr><td>API 프런트엔드 (#29)</td><td>열림</td><td>열림, 오너가 최종 배포 때로 정함</td></tr>
+</tbody></table>
 <h3>사람이 개입하지 않아도 서 있는다</h3>
 <p>네 노드의 <code>dsv41-serve</code> 를 사용자 systemd 영속 유닛으로 만들고(<code>Restart=always</code>, enabled), head 에 1 분 워치독 타이머와 부팅 웜업 요청을 붙였다.</p>
-<table><thead><tr><th>시나리오</th><th class="r">복구 시간</th></tr></thead><tbody><tr><td>워커 프로세스 kill</td><td class="r">241 s (health 응답까지 226 s)</td></tr><tr><td>워커 재부팅</td><td class="r">302 s</td></tr><tr><td>head 재부팅</td><td class="r">약 4 분</td></tr></tbody></table>
+<table><thead><tr><th>시나리오</th><th>복구 시간</th></tr></thead><tbody>
+<tr><td>워커 프로세스 kill</td><td>241 s (health 응답까지 226 s)</td></tr>
+<tr><td>워커 재부팅</td><td>302 s</td></tr>
+<tr><td>head 재부팅</td><td>약 4 분</td></tr>
+</tbody></table>
 <p>웜업 덕에 부팅 뒤 첫 사용자 요청(8K)의 TTFT 가 21.0 초에서 5.34 초로 줄었다. 사람이 첫 요청으로 캐시를 데워 주던 일을 시스템이 한다.</p>
 <p>검증 중에 실제 결함 두 개가 나와 그 자리에서 고쳤다. 첫째, 워커를 재부팅하면 <code>/mnt/kvdisk</code> NFS 마운트가 돌아오지 않아 랭크 3 의 디렉터리 생성이 실패하고 start limit 에 걸려 서버가 약 16 분 내려갔다. fs 티어 디렉터리를 랭크 0 에서만 만들게 고쳤다. 마운트를 부팅 때 복원할지는 오너 결정이라 #45 에 남겼다. 둘째, 생각하기 모드 요청의 첫 토큰이 다른 필드로 와서 웜업이 실패로 기록하던 것을 고쳤다.</p>
 <h3>대시보드가 프리필을 잘못 세고 있었다</h3>
 <p>Grafana 프리필 패널이 KV 복원까지 프리필 토큰으로 세고 있었다. 분자를 실제 계산 토큰 기준으로 바꿨다. 재기동도 설정 변경도 없었고 <strong>엔진 코드 변경 0</strong> 이다.</p>
-<table><thead><tr><th>확인 항목</th><th>결과</th></tr></thead><tbody><tr><td>요청당 프리필 속도 패널 대 실측</td><td>1,867.3 대 1,845.3 tok/s (+1.2 %)</td></tr><tr><td>계산 토큰 증가 대 보낸 프롬프트 토큰</td><td>95,826 = 95,826</td></tr><tr><td>정지 식</td><td>12 샘플 모두 0</td></tr><tr><td>493K 복원 때 프리필 패널</td><td>0 에서 2 tok/s</td></tr><tr><td>493K 복원 때 복원 패널</td><td>+492,928 토큰, 8,215 에서 16,430 tok/s</td></tr></tbody></table>
-<p>첫 배포 때 붙였던 설명도 틀린 것이어서 고쳤다. &quot;복원 요청은 복원 시간이 분모에 들어가 낮게 보인다&quot; 고 적었는데, 실제로는 복원 대기가 큐 시간으로 잡혀 분모에 거의 들어가지 않는다. 493K 복원 한 번에서 TTFT 8.6 초 중 0.49 초였다.</p>
+<table><thead><tr><th>확인 항목</th><th>결과</th></tr></thead><tbody>
+<tr><td>요청당 프리필 속도 패널 대 실측</td><td>1,867.3 대 1,845.3 tok/s (+1.2 %)</td></tr>
+<tr><td>계산 토큰 증가 대 보낸 프롬프트 토큰</td><td>95,826 = 95,826</td></tr>
+<tr><td>정지 식</td><td>12 샘플 모두 0</td></tr>
+<tr><td>493K 복원 때 프리필 패널</td><td>0 에서 2 tok/s</td></tr>
+<tr><td>493K 복원 때 복원 패널</td><td>+492,928 토큰, 8,215 에서 16,430 tok/s</td></tr>
+</tbody></table>
+<p>첫 배포 때 붙였던 설명도 틀린 것이어서 고쳤다. "복원 요청은 복원 시간이 분모에 들어가 낮게 보인다" 고 적었는데, 실제로는 복원 대기가 큐 시간으로 잡혀 분모에 거의 들어가지 않는다. 493K 복원 한 번에서 TTFT 8.6 초 중 0.49 초였다.</p>
 <h3>디스크의 KV 104 만 파일이 전부 멀쩡했다</h3>
 <p>fs 티어 검증 스크립트를 만들어 라이브 저장소를 전수 검사했다.</p>
-<pre><code>kvfs_verify: root=/mnt/kvdisk/kv/dsv41 files=1045649 ok=1045649
-             size_mismatch=0 no_xattr=0 crc_mismatch=0 unknown=0
-             vanished=0 skipped_tmp=0 deleted=0 secs=590.283 mib_s=169.91</code></pre>
+<p>``<code>text kvfs_verify: root=/mnt/kvdisk/kv/dsv41 files=1045649 ok=1045649 size_mismatch=0 no_xattr=0 crc_mismatch=0 unknown=0 vanished=0 skipped_tmp=0 deleted=0 secs=590.283 mib_s=169.91 </code>``</p>
 <p><strong>1,045,649 파일 전부 일치, 불일치 0, 삭제 0</strong> 이다. 약 10 분에 초당 170 MiB 로 읽었다. 스크립트는 기본이 보고 모드이고, 서버 상태가 불확실하면 삭제를 거부하며, 삭제 직전에 분류와 파일 identity 를 다시 본다. 실제 삭제는 서버가 내려간 창에서만 한다.</p>
 <h2>최종 수치</h2>
 <p>프로덕션 최종 기준선 <code>prod-final</code> 을 SGLang=100 으로 환산한 값이다.</p>
-<table><thead><tr><th>항목</th><th class="r">prod-final</th><th class="r">SGLang</th><th class="r">점수</th><th>원 목표</th></tr></thead><tbody><tr><td>산문 c1</td><td class="r">45.23 tok/s</td><td class="r">47.93</td><td class="r"><strong>94.37</strong></td><td>100 근처</td></tr><tr><td>코드 c1</td><td class="r">85.95 tok/s</td><td class="r">89.03</td><td class="r"><strong>96.54</strong></td><td>96 ~ 100</td></tr><tr><td>코드 c4 합산</td><td class="r">194.25 tok/s</td><td class="r">238.22</td><td class="r"><strong>81.54</strong></td><td>76 이상</td></tr><tr><td>128K 프리필 첫 회</td><td class="r">1,683.70 tok/s</td><td class="r">2,102.10</td><td class="r"><strong>80.10</strong></td><td>75 ~ 97</td></tr><tr><td>에이전트 작업 속도</td><td class="r">191.85 s</td><td class="r">196.25 s</td><td class="r"><strong>102.29</strong></td><td>93 ~ 100</td></tr></tbody></table>
+<table><thead><tr><th>항목</th><th>prod-final</th><th>SGLang</th><th>점수</th><th>원 목표</th></tr></thead><tbody>
+<tr><td>산문 c1</td><td>45.23 tok/s</td><td>47.93</td><td><strong>94.37</strong></td><td>100 근처</td></tr>
+<tr><td>코드 c1</td><td>85.95 tok/s</td><td>89.03</td><td><strong>96.54</strong></td><td>96 ~ 100</td></tr>
+<tr><td>코드 c4 합산</td><td>194.25 tok/s</td><td>238.22</td><td><strong>81.54</strong></td><td>76 이상</td></tr>
+<tr><td>128K 프리필 첫 회</td><td>1,683.70 tok/s</td><td>2,102.10</td><td><strong>80.10</strong></td><td>75 ~ 97</td></tr>
+<tr><td>에이전트 작업 속도</td><td>191.85 s</td><td>196.25 s</td><td><strong>102.29</strong></td><td>93 ~ 100</td></tr>
+</tbody></table>
 <p><strong>다섯 항목 모두 목표 범위에 들었다.</strong> 128K 프리필은 첫 회 기준이고 세 회 평균을 쓰면 77.95 다. 두 기준을 섞지 않는다.</p>
 <h2>오너에게 남기는 것</h2>
 <p>결정이나 처분이 필요해 그대로 둔 것들이다. 이 글에서 새로 판단하지 않았다.</p>
-<table><thead><tr><th>항목</th><th>내용</th></tr></thead><tbody><tr><td>옛 kvfs 저장소</td><td><code>~/dsv41-prep/kvfs</code>, 37 GiB, 네 노드 모두</td></tr><tr><td>f323 도커 이미지</td><td><code>dsv41-4x-spark:local</code> 과 dangling <code>&lt;none&gt;</code> <code>171c04994a8d</code>, 각 33.2 GB</td></tr><tr><td>워커 NFS fstab (#45)</td><td>워커 재부팅 때 <code>/mnt/kvdisk</code> 를 자동 복원할지</td></tr><tr><td>API 프런트엔드 (#29)</td><td>최종 배포 시점</td></tr><tr><td>Engram 조회 게이트 (#44)</td><td>편차를 줄인 프로토콜로 재판정할지</td></tr></tbody></table>
+<table><thead><tr><th>항목</th><th>내용</th></tr></thead><tbody>
+<tr><td>옛 kvfs 저장소</td><td><code>~/dsv41-prep/kvfs</code> 37 GiB(head 만, 워커는 빈 디렉터리). 09-16 09:03 오너 지시로 삭제함(마지막 절)</td></tr>
+<tr><td>f323 도커 이미지</td><td><code>dsv41-4x-spark:local</code> 과 dangling <code>171c04994a8d</code>. 09-16 09:03 오너 지시로 이미지와 빌드 캐시 32 GB 정리함(마지막 절)</td></tr>
+<tr><td>워커 NFS fstab (#45)</td><td>워커 재부팅 때 <code>/mnt/kvdisk</code> 를 자동 복원할지</td></tr>
+<tr><td>API 프런트엔드 (#29)</td><td>포크 코드 변경 2 건이 선행이라 09:03 마무리에도 넣지 않음. 별도 목표로 연다</td></tr>
+<tr><td>Engram 조회 게이트 (#44)</td><td>편차를 줄인 프로토콜로 재판정할지</td></tr>
+</tbody></table>
 <p>보류 상태인 세 건(EP=1 옵션 #16, KV 풀 블록 패딩 회수 #21, fs 티어 I/O 워커 이전 #23)은 그대로 둔다.</p>
 <h2>이번 마감에서 하지 않은 것</h2>
 <p>엔진과 배포 코드, <code>dsv41.env</code>, 오버라이드 파일, 노드 트리를 건드리지 않았다. 서버 재기동, 벤치, 테스트 실행이 없다. 노드 sync 도 하지 않았다. 변경이 <code>.notes</code> 디렉터리와 <code>.gitignore</code> 한 줄뿐이고, 노드는 <code>.notes</code> 를 받지 않는 것이 규칙이다. 삭제 명령도 없다.</p>
 <p>이슈 #43 은 본문의 현재 상태 절만 갱신하고 열어 둔다. 닫는 것은 매니저가 확인한 뒤에 한다.</p>
+<h2>덧붙임: 배포 마무리 (2026-09-16 09:03, 오너 지시)</h2>
+<p>오너가 "디스크 정리 및 배포까지 마무리, 최종 수정 버전 사용" 을 지시해 매니저가 운영 작업으로 마쳤다. 코드 변경은 없다.</p>
+<p><strong>왜 재기동이 필요했나.</strong> 실행 중이던 서버는 04:30 에 뜬 프로세스였고, 노드 트리의 마지막 sync 커밋(05:37, <code>vllm/v1/kv_offload/tiering/manager.py</code> 의 <code>@override</code> 자리 2 줄)은 그 뒤에 들어갔다. 디스크의 코드는 최종이었지만 프로세스는 아니었다. 네 노드 트리는 <code>.notes</code> 를 빼면 main caa6475829 와 차이가 0 이다.</p>
+<p><strong>디스크 정리.</strong> 삭제 전에 실경로, 열린 파일, 참조 유닛을 확인했다.</p>
+<table><thead><tr><th>대상</th><th>확인</th><th>결과</th></tr></thead><tbody>
+<tr><td>head <code>~/dsv41-prep/kvfs</code> (37 G, 옛 부팅용 저장소)</td><td>서버가 연 fd 0, 라이브 fs 티어는 <code>/mnt/kvdisk/kv/dsv41</code></td><td>삭제 15.7 s, 루트 free 73 G → 110 G</td></tr>
+<tr><td>워커 3 대 <code>~/dsv41-prep/kvfs</code></td><td>빈 디렉터리</td><td><code>rmdir</code></td></tr>
+<tr><td>f323 도커 이미지 2 개</td><td>컨테이너 0, docker 를 참조하는 유닛 0</td><td><code>docker rmi</code> 는 태그만 지웠고 32 G 는 빌드 캐시가 붙들고 있었다. <code>docker builder prune -a -f</code> 로 overlay2 87 → 2 항목, 루트 free 90 G → 122 G</td></tr>
+</tbody></table>
+<p>남긴 것: <code>~/migration-027</code> 122 M, <code>~/ds4f-logs</code> 34 M, alpine 이미지 8.7 M. 작고, #45 결정과 얽힌 스크립트가 들어 있다.</p>
+<p><strong>재기동.</strong> 요청 0 을 확인한 뒤 <code>dsv41_ctl.sh start</code> 를 knob 없이 실행했다(macOS 에서는 <code>/opt/homebrew/bin/bash</code> 로 실행해야 한다. 기본 bash 3.2 는 <code>declare -A</code> 를 모른다). 캡 4 대 active, override 0 줄, 워커 3 대와 head 가 08:59:14 ~ 08:59:57 에 다시 떴다. <code>/health</code> 200 까지 130 s, 웜업 3 요청(8K greedy TTFT 6.05 s, thinking, image) 모두 성공, 스모크 "대한민국의 수도는?" 에 "서울" (1.39 s).</p>
+<p><strong>골든룰(09:03).</strong> 네 노드 serve active, override 0 B, 캡 1989 MHz, 트리 dirty 0, Environment 빈 값. head health 200, 워치독 active, ATTENTION 0, 요청 0, MemAvailable 5.01 GiB. 이 상태가 최종 배포본이다.</p>
+<p><strong>하지 않은 것.</strong> #29 k8s 프런트엔드(포크 코드 변경 2 건 선행), #45 워커 fstab(27c4 는 마운트 없이 정상, 워커는 fs 티어를 쓰지 않음). 상세 기록은 <code>.notes/2026-09-16-issue-triage-29/plan.md</code> 7 절.</p>
 </div></body></html>
